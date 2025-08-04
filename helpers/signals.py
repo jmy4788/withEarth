@@ -17,7 +17,7 @@ import numpy as np  # 시뮬/백테스트용
 #    binance-sdk-derivatives-trading-usds-futures==1.0.0을 사용하도록 변경하세요.
 
 from .binance_client import (
-    client as _get_client,
+    _client as _get_client,
     ensure_min_notional,
     get_overview,
     get_position,
@@ -390,7 +390,6 @@ def generate_signal(symbol: str = "BTCUSDT", balance: float = 1000.0) -> Dict[st
         df_5m=df,
         extra_indicators=extra_ind,
         sentiment_score=float(last_row.get("x_sentiment", 0.0)),
-        orderbook_data=None,
         funding_rate_pct=float(data.get("funding_rate_pct", 0.0)),
         times=data.get("times"),
     )

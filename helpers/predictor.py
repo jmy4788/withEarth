@@ -1,163 +1,162 @@
+"""
+predictor.py – Google GenAI SDK inference helper (migrated to google-genai)
+"""
+
+from __future__ import annotations
+
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from google import genai
-from .utils import get_secret
+from google import genai  # 변경: from google import genai (새 SDK import)
+from google.genai import types  # 변경: types.GenerateContentConfig를 위한 import
+
+from .utils import get_secret, LOG_DIR
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.25"))
-TOP_P = float(os.getenv("GEMINI_TOP_P", "0.9"))
-TOP_K = int(os.getenv("GEMINI_TOP_K", "40"))
-MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+# Constants
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")  # 변경: 새 모델 이름으로 업데이트 (가이드 예시 참조, 필요 시 gemini-2.0-flash 등으로 변경)
+MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0.55"))
 
 SYSTEM_INSTRUCTION = (
-    "You are a trading signal generator. "
-    "Read the compact JSON payload and respond with a strict JSON object: "
-    '{"direction":"long|short|hold","prob":0..1,"support":number,"resistance":number,"reasoning":"..."} '
-    "No extra text outside JSON."
+    "You are a trading signal generator. Return ONLY a strict JSON object: "
+    '{"direction":"long|short|hold","prob":0..1,"support":number,"resistance":number,"reasoning":"..."}'
 )
 
-def _build_user_content(payload: Dict[str, Any]) -> list[dict]:
-    """
-    Return a list of 'Content' for generate_content(). **Only** 'user' role.
-    """
+# 변경: types.GenerationConfig → types.GenerateContentConfig (이름 변경)
+GEN_CFG = types.GenerateContentConfig(
+    temperature=float(os.getenv("GEMINI_TEMPERATURE", "0.25")),
+    top_p=float(os.getenv("GEMINI_TOP_P", "0.9")),
+    top_k=int(os.getenv("GEMINI_TOP_K", "40")),
+    max_output_tokens=int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024")),
+)
+
+# Lazy initialization for client (변경: 모델 대신 클라이언트 초기화)
+_client: Optional[genai.Client] = None  # 변경: 모델 대신 Client 사용
+
+def _init_client() -> Optional[genai.Client]:
+    global _client
+    if _client is None:
+        api_key = get_secret("GOOGLE_API_KEY")
+        if api_key:
+            # 변경: genai.configure(api_key=...) 대신 genai.Client(api_key=...) 사용
+            # 환경 변수 GEMINI_API_KEY를 우선 사용 가능 (가이드 추천)
+            _client = genai.Client(api_key=api_key)  # 환경 변수가 설정되어 있으면 api_key 생략 가능
+        else:
+            logger.warning("GOOGLE_API_KEY not set – predictor will always return HOLD")
+    return _client
+
+# Helpers (기존과 유사)
+def _to_content(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build [system, user] messages for genai."""
     return [
-        {
-            "role": "user",
-            "parts": [
-                {
-                    "text": (
-                        "Analyze the following JSON and output a strict JSON decision.\n\n"
-                        + json.dumps(payload, ensure_ascii=False)
-                    )
-                }
-            ],
-        }
+        {"role": "model", "parts": [{"text": SYSTEM_INSTRUCTION}]},
+        {"role": "user", "parts": [{"text": "Analyze the JSON below and respond with the required JSON only:\n\n" + json.dumps(payload, ensure_ascii=False)}]},
     ]
 
-def _extract_json(text: str) -> Dict[str, Any]:
+def _safe_json_extract(text: str) -> Dict[str, Any]:
+    """Safely extract JSON from text."""
     try:
-        # 가장 마지막 JSON 오브젝트를 파싱(모델이 앞에 텍스트를 붙였을 경우 대비)
-        start = text.rfind("{")
+        start = text.find("{")
         end = text.rfind("}")
-        if start >= 0 and end >= start:
-            return json.loads(text[start : end + 1])
-    except Exception as e:
-        logger.warning(f"JSON parse failed: {e}; raw: {text[:200]}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+    except json.JSONDecodeError as exc:
+        logger.debug(f"_safe_json_extract failed: {exc}")
     return {}
 
-def _postprocess(raw: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize the raw prediction dictionary."""
     direction = str(raw.get("direction", "hold")).lower()
-    prob = float(raw.get("prob", 0.5))
-    support = float(raw.get("support", 0.0))
-    resistance = float(raw.get("resistance", 0.0))
-    reasoning = str(raw.get("reasoning", ""))[:2000]
     if direction not in ("long", "short", "hold"):
         direction = "hold"
-    prob = max(0.0, min(1.0, prob))
+    prob = max(0.0, min(1.0, float(raw.get("prob", 0.5))))
     return {
-        "direction": direction,
+        "direction": direction if prob >= MIN_MODEL_PROB else "hold",
         "prob": prob,
-        "support": support,
-        "resistance": resistance,
-        "reasoning": reasoning,
+        "support": float(raw.get("support", 0.0)),
+        "resistance": float(raw.get("resistance", 0.0)),
+        "reasoning": str(raw.get("reasoning", ""))[:2000],
     }
 
+def _dump_payload(payload: Dict[str, Any]) -> None:
+    """Dump payload to log file."""
+    try:
+        ts = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%S%f")
+        fn = os.path.join(LOG_DIR, f"gemini_payload_{ts}.json")
+        with open(fn, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logger.debug(f"Payload dump failed: {exc}")
+
+# Main functions
 def get_gemini_prediction(
     *,
     symbol: str,
-    df_5m: Optional[pd.DataFrame],
+    df_5m: Optional[pd.DataFrame] = None,
     extra_indicators: Optional[Dict[str, Any]] = None,
     sentiment_score: float = 0.0,
-    orderbook_data: Optional[Dict[str, Any]] = None,
     funding_rate_pct: Optional[float] = None,
     times: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Build a compact payload and call Gemini 2.5 Pro **with user-role only** contents.
-    Returns normalized dict: {direction, prob, support, resistance, reasoning}.
+    Build JSON payload and call Gemini; return normalized dict.
+    On any failure → direction=hold.
     """
-    try:
-        last = (df_5m.iloc[-1].to_dict() if (df_5m is not None and not df_5m.empty) else {})
-        entry_row = {
-            "close": float(last.get("close", 0.0) or 0.0),
-            "rsi": float(last.get("RSI", 50.0) or 50.0),
-            "volatility": float(last.get("volatility", 0.0) or 0.0),
-            "sma20": float(last.get("SMA_20", 0.0) or 0.0),
-            "orderbook_imbalance": float(last.get("orderbook_imbalance", 0.0) or 0.0),
-            "orderbook_spread": float(last.get("orderbook_spread", 0.0) or 0.0),
+    hold = {"direction": "hold", "prob": 0.0, "support": 0.0, "resistance": 0.0, "reasoning": ""}
+
+    client = _init_client()  # 변경: 클라이언트 초기화 (모델 대신)
+    if client is None:
+        return hold
+
+    # Build payload (기존과 동일)
+    last_row = df_5m.iloc[-1].to_dict() if df_5m is not None and not df_5m.empty else {}
+    payload = {
+        "pair": symbol,
+        "entry_5m": {
+            "close": float(last_row.get("close", 0.0)),
+            "rsi": float(last_row.get("RSI", 50.0)),
+            "volatility": float(last_row.get("volatility", 0.0)),
+            "sma20": float(last_row.get("SMA_20", 0.0)),
             "funding_rate_pct": float(funding_rate_pct or 0.0),
             "sentiment": float(sentiment_score or 0.0),
-            "timestamp": str((times or {}).get("ohlcv") or last.get("timestamp") or ""),
-        }
+            "timestamp": str((times or {}).get("ohlcv") or last_row.get("timestamp") or ""),
+        },
+        "extra": dict(extra_indicators or {}),
+        "times": times or {},
+    }
 
-        payload = {
-            "pair": symbol,
-            "entry_5m": entry_row,
-            "extra": dict(extra_indicators or {}),
-            "times": times or {},
-            "constraints": {
-                "spread_cap_bps": float(os.getenv("PROMPT_SPREAD_CAP_BPS", "15")),
-                "slippage_cap_bps": float(os.getenv("PROMPT_SLIPPAGE_CAP_BPS", "25")),
-                "min_model_prob": float(os.getenv("MIN_MODEL_PROB", "0.55")),
-            },
-        }
+    _dump_payload(payload)
 
-        api_key = get_secret("GOOGLE_API_KEY")
-        if not api_key:
-            logger.warning("GOOGLE_API_KEY missing → hold")
-            return {"direction": "hold", "prob": 0.5, "support": 0.0, "resistance": 0.0, "reasoning": "no_api_key"}
-
-        client = genai.Client(api_key=api_key)
-        contents = _build_user_content(payload)
-
-        # **중요**: contents는 user/model만 허용. system 프롬프트는 system_instruction로 전달.
-        response = client.models.generate_content(
+    # Call GenAI (변경: model.generate_content → client.models.generate_content)
+    try:
+        contents = _to_content(payload)  # 기존 contents를 'contents' 매개변수로 사용
+        # 변경: 모델 인스턴스 대신 클라이언트 메서드 호출, config 전달
+        resp = client.models.generate_content(
             model=DEFAULT_MODEL,
-            contents=contents,
-            generation_config={
-                "temperature": TEMPERATURE,
-                "top_p": TOP_P,
-                "top_k": TOP_K,
-                "max_output_tokens": MAX_OUTPUT_TOKENS,
-            },
-            system_instruction=SYSTEM_INSTRUCTION,
+            contents=contents,  # 변경: 'contents' 키워드 사용 (기존 'contents' 매개변수)
+            config=GEN_CFG  # 변경: config=types.GenerateContentConfig
         )
-
-        text = getattr(response, "text", None) or ""
-        raw = _extract_json(text)
-        out = _postprocess(raw)
-
-        if out["prob"] < float(os.getenv("MIN_MODEL_PROB", "0.55")):
-            out["direction"] = "hold"
-        return out
-
+        txt = ""
+        if resp and resp.candidates:
+            parts = resp.candidates[0].content.parts
+            if parts and hasattr(parts[0], "text"):
+                txt = parts[0].text
+        raw = _safe_json_extract(txt)
+        return _normalize(raw)
     except Exception as exc:
-        logger.error(f"gemini_prediction error: {exc}")
-        return {"direction": "hold", "prob": 0.5, "support": 0.0, "resistance": 0.0, "reasoning": "exception"}
-
+        logger.error(f"Gemini prediction error: {exc}")
+        return hold
 
 def should_predict(df: Optional[pd.DataFrame]) -> bool:
-    """
-    간단 휴리스틱: 최근 변동성이 너무 작으면 예측 생략.
-    - df가 None이거나 비어 있으면 False.
-    - 'close'와 'volatility' 컬럼이 없으면 False.
-    - 마지막 volatility가 평균 close 대비 0.1% 미만이면 False.
-    """
+    """Skip if trailing volatility is negligible."""
     if df is None or df.empty:
         return False
-    required_cols = {"close", "volatility"}
-    if not required_cols.issubset(df.columns):
+    if not {"close", "volatility"}.issubset(df.columns):
         return False
-    mean_close = float(pd.to_numeric(df["close"], errors="coerce").dropna().mean())
-    last_vol = float(pd.to_numeric(df["volatility"], errors="coerce").dropna().iloc[-1])
-    if mean_close <= 0:
-        return False
-    return last_vol > mean_close * 0.001
-
-
+    mean_close = pd.to_numeric(df["close"], errors="coerce").mean()
+    last_vol = pd.to_numeric(df["volatility"], errors="coerce").iloc[-1]
+    return mean_close > 0 and last_vol > mean_close * 0.001

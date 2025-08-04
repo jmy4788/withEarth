@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import logging
@@ -26,7 +25,7 @@ from .utils import get_secret
 getcontext().prec = 28
 
 __all__ = [
-    "client",
+    "get_client",
     "set_leverage",
     "set_margin_type",
     "set_position_mode",
@@ -73,9 +72,28 @@ _config = ConfigurationRestAPI(
     keep_alive=True,
     compression=True,
 )
+logging.info(f"Binance config initialized: base_path={_config.base_path}, api_key_set={bool(_api_key)}")
 
-_client = DerivativesTradingUsdsFutures(config_rest_api=_config)
+# Client (lazy init 함수로 변경)
+_client: Optional[DerivativesTradingUsdsFutures] = None
 
+def get_client() -> DerivativesTradingUsdsFutures:
+    global _client
+    if _client is None:
+        try:
+            _client = DerivativesTradingUsdsFutures(config_rest_api=_config)
+            logging.info("Binance client initialized successfully.")
+            # 테스트 호출: 서버 시간으로 init 확인 (메서드 이름 수정)
+            try:
+                _client.rest_api.get_server_time()  # SDK에서 가능한 메서드 이름 (문서 기반)
+            except AttributeError:
+                logging.warning("get_server_time method not found; skipping init test.")
+            except Exception as exc:
+                logging.warning(f"Init test failed: {exc}; proceeding anyway.")
+        except Exception as exc:
+            logging.error(f"Client init error: {exc}")
+            raise
+    return _client
 
 # --- Utilities ---
 def _data(resp: Any) -> Any:
@@ -85,7 +103,6 @@ def _data(resp: Any) -> Any:
     except Exception:
         return resp
 
-
 def _try_methods(obj: Any, candidates: List[str]) -> Optional[Any]:
     """Return first callable attribute found in candidates, else None."""
     for name in candidates:
@@ -94,46 +111,35 @@ def _try_methods(obj: Any, candidates: List[str]) -> Optional[Any]:
             return fn
     return None
 
-
-def client() -> DerivativesTradingUsdsFutures:
-    return _client
-
-
 # ------- Exchange Info & Filters (cached) -------
 _symbol_filters_cache: Dict[str, Dict[str, Any]] = {}
-
 
 def _to_decimal(x) -> Decimal:
     if isinstance(x, Decimal):
         return x
     return Decimal(str(x))
 
-
 def round_to_step(value: Decimal, step: Decimal) -> Decimal:
     if step == 0:
         return value
     return (value // step) * step
 
-
 def load_symbol_filters(_: Any, symbol: str) -> Dict[str, Any]:
-    """Fetch exchange info and extract filters for `symbol` (cached).
-
-    The first arg keeps compatibility with previous signature `load_symbol_filters(um, symbol)`.
+    """
+    Fetch exchange info and extract filters for `symbol` (cached).
     """
     symbol = symbol.upper()
     if symbol in _symbol_filters_cache:
         return _symbol_filters_cache[symbol]
 
-    # Method names based on auto-generated SDK (snake_case)
     fn = _try_methods(
-        _client.rest_api,
+        get_client().rest_api,
         ["exchange_information", "exchange_info", "get_exchange_information"],
     )
     if not fn:
         raise RuntimeError("exchange_information method not found in SDK.")
 
     ex = _data(fn(symbol=symbol))
-    # exchange_information returns dict with 'symbols' list similar to REST
     if isinstance(ex, dict):
         syms = ex.get("symbols") or []
     else:
@@ -172,10 +178,8 @@ def load_symbol_filters(_: Any, symbol: str) -> Dict[str, Any]:
     _symbol_filters_cache[symbol] = filters
     return filters
 
-
 def normalize_price(price: Decimal, tick: Decimal) -> Decimal:
     return round_to_step(price, tick)
-
 
 def normalize_price_with_mode(price: Decimal, tick: Decimal, mode: str = "floor") -> Decimal:
     if tick <= 0:
@@ -185,13 +189,11 @@ def normalize_price_with_mode(price: Decimal, tick: Decimal, mode: str = "floor"
         return (q + 1) * tick
     return q * tick
 
-
 def normalize_qty(qty: Decimal, step: Decimal, min_qty: Decimal) -> Decimal:
     q = round_to_step(qty, step)
     if q < min_qty:
         q = min_qty
     return q
-
 
 def ensure_min_notional(qty: Decimal, price: Decimal, step: Decimal, min_notional: Decimal) -> Decimal:
     if min_notional <= 0:
@@ -205,12 +207,11 @@ def ensure_min_notional(qty: Decimal, price: Decimal, step: Decimal, min_notiona
         k += 1
     return k * step
 
-
 # ------- Trading params -------
 def set_leverage(symbol: str, leverage: int = 10) -> None:
     try:
         fn = _try_methods(
-            _client.rest_api,
+            get_client().rest_api,
             ["change_initial_leverage", "change_leverage", "initial_leverage"],
         )
         if not fn:
@@ -225,17 +226,17 @@ def set_leverage(symbol: str, leverage: int = 10) -> None:
         else:
             logging.error(f"Leverage set error: {exc}")
 
-
 def set_margin_type(symbol: str, margin_type: str = "ISOLATED") -> None:
     try:
-        fn = _try_methods(_client.rest_api, ["change_margin_type", "change_margin"])
+        fn = _try_methods(get_client().rest_api, ["change_margin_type", "change_margin"])
         if not fn:
             logging.warning("change_margin_type not found in SDK.")
             return
         mt = margin_type.upper()
         if mt not in ("ISOLATED", "CROSSED"):
             mt = "ISOLATED"
-        resp = fn(symbol=symbol, marginType=mt)
+        kw = {"margin_type": mt} if "margin_type" in fn.__code__.co_varnames else {"marginType": mt}
+        resp = fn(symbol=symbol, **kw)
         logging.info(f"Margin type set to {mt} for {symbol}: {_data(resp)}")
     except Exception as exc:
         msg = str(exc)
@@ -244,15 +245,17 @@ def set_margin_type(symbol: str, margin_type: str = "ISOLATED") -> None:
         else:
             logging.error(f"Margin type set error: {exc}")
 
-
 def set_position_mode(dual_side: bool = False) -> None:
     try:
-        fn = _try_methods(_client.rest_api, ["change_position_mode", "position_side_dual"])
+        fn = _try_methods(get_client().rest_api, ["change_position_mode", "position_side_dual"])
         if not fn:
             logging.warning("change_position_mode not found in SDK.")
             return
-        resp = fn(dualSidePosition=dual_side)
+        # v1.0.0 → snake_case
+        kw = {"dual_side_position": dual_side} if "dual_side_position" in fn.__code__.co_varnames else {"dualSidePosition": dual_side}
+        resp = fn(**kw)
         logging.info(f"Position mode set dual_side={dual_side}: {_data(resp)}")
+
     except Exception as exc:
         msg = str(exc)
         if any(code in msg for code in ("-4059", "-4046")):
@@ -260,11 +263,9 @@ def set_position_mode(dual_side: bool = False) -> None:
         else:
             logging.error(f"Position mode set error: {exc}")
 
-
 # ------- Orders -------
 def _gen_client_id(prefix: str = "tm") -> str:
     return f"{prefix}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
-
 
 def place_market_order(symbol: str, side: str, quantity: float, new_client_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not _api_key or not _api_secret:
@@ -273,7 +274,7 @@ def place_market_order(symbol: str, side: str, quantity: float, new_client_id: O
     try:
         if not new_client_id:
             new_client_id = _gen_client_id("mkt")
-        fn = _try_methods(_client.rest_api, ["new_order", "order", "post_order"])
+        fn = _try_methods(get_client().rest_api, ["new_order", "order", "post_order"])
         if not fn:
             raise RuntimeError("new_order method not found in SDK.")
         params: Dict[str, Any] = {
@@ -292,7 +293,6 @@ def place_market_order(symbol: str, side: str, quantity: float, new_client_id: O
         logging.error(f"Order error: {exc}")
         return None
 
-
 def place_limit_order(symbol: str, side: str, quantity: float, price: float, new_client_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not _api_key or not _api_secret:
         logging.warning("Cannot place order: missing API credentials.")
@@ -300,7 +300,7 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float, new
     try:
         if not new_client_id:
             new_client_id = _gen_client_id("lmt")
-        fn = _try_methods(_client.rest_api, ["new_order", "order", "post_order"])
+        fn = _try_methods(get_client().rest_api, ["new_order", "order", "post_order"])
         if not fn:
             raise RuntimeError("new_order method not found in SDK.")
         params: Dict[str, Any] = {
@@ -321,9 +321,8 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float, new
         logging.error(f"Order error: {exc}")
         return None
 
-
 def _cancel_order(symbol: str, order_id: Optional[Union[int, str]] = None, client_order_id: Optional[str] = None) -> Any:
-    fn = _try_methods(_client.rest_api, ["cancel_order", "delete_order"])  # DELETE /fapi/v1/order
+    fn = _try_methods(get_client().rest_api, ["cancel_order", "delete_order"])  # DELETE /fapi/v1/order
     if not fn:
         raise RuntimeError("cancel_order not found in SDK.")
     if order_id is not None:
@@ -331,7 +330,6 @@ def _cancel_order(symbol: str, order_id: Optional[Union[int, str]] = None, clien
     if client_order_id:
         return _data(fn(symbol=symbol, origClientOrderId=client_order_id))
     raise ValueError("Either order_id or client_order_id required.")
-
 
 def wait_order_filled(
     symbol: str,
@@ -342,7 +340,7 @@ def wait_order_filled(
     timeout_cancel: bool = False,
 ) -> Optional[Dict[str, Any]]:
     last = None
-    q_fn = _try_methods(_client.rest_api, ["query_order", "get_order"])
+    q_fn = _try_methods(get_client().rest_api, ["query_order", "get_order"])
     if not q_fn:
         logging.error("query_order not found in SDK.")
         return None
@@ -375,11 +373,10 @@ def wait_order_filled(
             return {"status": "CANCEL_FAILED", "reason": str(exc)}
     return last if isinstance(last, dict) else ({"__raw__": last} if last else None)
 
-
 def cancel_open_orders(symbol: str) -> bool:
     try:
         # 1) Bulk cancel
-        bulk = _try_methods(_client.rest_api, ["cancel_all_open_orders", "delete_all_open_orders"])  # DELETE /fapi/v1/allOpenOrders
+        bulk = _try_methods(get_client().rest_api, ["cancel_all_open_orders", "delete_all_open_orders"])  # DELETE /fapi/v1/allOpenOrders
         if bulk:
             try:
                 resp = _data(bulk(symbol=symbol))
@@ -390,7 +387,7 @@ def cancel_open_orders(symbol: str) -> bool:
 
         # 2) Per-order fallback
         get_open = _try_methods(
-            _client.rest_api,
+            get_client().rest_api,
             ["query_current_all_open_orders", "get_open_orders", "current_all_open_orders"],
         )
         if not get_open:
@@ -411,7 +408,6 @@ def cancel_open_orders(symbol: str) -> bool:
     except Exception as exc:
         logging.error(f"Error cancelling open orders for {symbol}: {exc}")
         return False
-
 
 def place_bracket_orders(
     symbol: str,
@@ -435,7 +431,7 @@ def place_bracket_orders(
         tp_trigger = normalize_price_with_mode(Decimal(str(target_price)), tick, tp_mode)
         sl_trigger = normalize_price_with_mode(Decimal(str(stop_price)),  tick, sl_mode)
 
-        new_order_fn = _try_methods(_client.rest_api, ["new_order", "order", "post_order"])
+        new_order_fn = _try_methods(get_client().rest_api, ["new_order", "order", "post_order"])
         if not new_order_fn:
             raise RuntimeError("new_order not found in SDK.")
 
@@ -456,58 +452,183 @@ def place_bracket_orders(
         logging.error(f"Bracket orders error: {exc}")
         return None
 
-
 # ------- Account overview -------
 def get_overview() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (balances_df, positions_df)."""
-    bal_df = pd.DataFrame()
-    pos_df = pd.DataFrame()
+    """
+    Fetch current futures balances and positions.
 
-    # balances: /fapi/v2/balance
+    The USDS‑M modular SDK introduced new method names for account and balance
+    endpoints (e.g. ``account_information_v2``, ``futures_account_balance_v3``),
+    whereas previous versions exposed simple names like ``account`` and
+    ``balance``.  Calling an undefined method on the SDK object can lead to
+    unpredictable runtime errors (e.g. ``list index out of range``).  To
+    remain compatible across versions, this function attempts a prioritized list
+    of method names for both balances and account information and falls back
+    gracefully if one fails.
+
+    Returns:
+        Tuple[pd.DataFrame, pd.DataFrame]: A tuple of (balances_df,
+        positions_df).  Both dataframes may be empty if API credentials are
+        missing or the endpoints return no data.
+    """
+    bal_df: pd.DataFrame = pd.DataFrame()
+    pos_df: pd.DataFrame = pd.DataFrame()
+
+    # -- Balance retrieval --
+    balance_methods: List[str] = [
+        "futures_account_balance_v3",
+        "futures_account_balance_v2",
+        "futures_account_balance",
+        "balance",
+        "account_balance_v3",
+        "account_balance_v2",
+    ]
     try:
-        bal_fn = _try_methods(_client.rest_api, ["balance", "futures_account_balance", "account_balance_v2"])
+        bal_fn = _try_methods(get_client().rest_api, balance_methods)
         if bal_fn:
-            bal_raw = _data(bal_fn())
-            if isinstance(bal_raw, list):
-                bal_df = pd.json_normalize(bal_raw)
-            elif isinstance(bal_raw, dict):
-                bal_df = pd.json_normalize(bal_raw.get("balances") or [])  # fallback structure
+            raw = _data(bal_fn())
+            # Normalize list of objects (dicts or model instances)
+            if isinstance(raw, list):
+                records: List[Dict[str, Any]] = []
+                for item in raw:
+                    if isinstance(item, dict):
+                        records.append(item)
+                    elif hasattr(item, "to_dict") and callable(getattr(item, "to_dict", None)):
+                        try:
+                            records.append(item.to_dict())
+                        except Exception:
+                            pass
+                    elif hasattr(item, "__dict__"):
+                        # Filter out private attributes
+                        d = {
+                            k: v
+                            for k, v in vars(item).items()
+                            if not k.startswith("_")
+                        }
+                        records.append(d)
+                if records:
+                    bal_df = pd.json_normalize(records)
+            elif isinstance(raw, dict):
+                # Some responses wrap data inside a 'data' field
+                data_section = raw.get("data")
+                if isinstance(data_section, list):
+                    records: List[Dict[str, Any]] = []
+                    for item in data_section:
+                        if isinstance(item, dict):
+                            records.append(item)
+                        elif hasattr(item, "to_dict") and callable(getattr(item, "to_dict", None)):
+                            try:
+                                records.append(item.to_dict())
+                            except Exception:
+                                pass
+                        elif hasattr(item, "__dict__"):
+                            d = {
+                                k: v
+                                for k, v in vars(item).items()
+                                if not k.startswith("_")
+                            }
+                            records.append(d)
+                    if records:
+                        bal_df = pd.json_normalize(records)
+                else:
+                    balances = raw.get("balances") or raw.get("assets") or []
+                    if isinstance(balances, list):
+                        records: List[Dict[str, Any]] = []
+                        for item in balances:
+                            if isinstance(item, dict):
+                                records.append(item)
+                            elif hasattr(item, "to_dict") and callable(getattr(item, "to_dict", None)):
+                                try:
+                                    records.append(item.to_dict())
+                                except Exception:
+                                    pass
+                            elif hasattr(item, "__dict__"):
+                                d = {
+                                    k: v
+                                    for k, v in vars(item).items()
+                                    if not k.startswith("_")
+                                }
+                                records.append(d)
+                        if records:
+                            bal_df = pd.json_normalize(records)
     except Exception as exc:
         logging.error(f"Error fetching balances: {exc}")
 
-    # positions: account or position information v2/v3
+    # -- Position retrieval --
+    account_methods: List[str] = [
+        "account_information_v3",
+        "account_information_v2",
+        "account_information",
+        "account_v3",
+        "account_v2",
+        "account",
+    ]
     try:
-        acct_fn = _try_methods(_client.rest_api, ["account", "account_v2", "account_v3"])
+        acct_fn = _try_methods(get_client().rest_api, account_methods)
         if acct_fn:
             acct_raw = _data(acct_fn())
+            # Account information may be a model instance with to_dict
+            if hasattr(acct_raw, "to_dict") and callable(getattr(acct_raw, "to_dict", None)):
+                try:
+                    acct_raw = acct_raw.to_dict()
+                except Exception:
+                    pass
+            elif not isinstance(acct_raw, dict) and hasattr(acct_raw, "__dict__"):
+                acct_raw = {
+                    k: v for k, v in vars(acct_raw).items() if not k.startswith("_")
+                }
             if isinstance(acct_raw, dict):
-                pos_data = acct_raw.get("positions") or acct_raw.get("positionRisk") or []
-                pos_df = pd.json_normalize(pos_data)
-        if pos_df.empty:
-            pos_fn = _try_methods(_client.rest_api, ["position_information_v3", "position_information_v2", "position_information"])
-            if pos_fn:
-                pos_raw = _data(pos_fn())
-                if isinstance(pos_raw, list):
-                    pos_df = pd.json_normalize(pos_raw)
+                pos_data = (
+                    acct_raw.get("positions")
+                    or acct_raw.get("positionRisk")
+                    or acct_raw.get("positionsInformation")
+                    or acct_raw.get("data")
+                    or []
+                )
+                # Normalize list of position objects
+                if isinstance(pos_data, list):
+                    records: List[Dict[str, Any]] = []
+                    for item in pos_data:
+                        if isinstance(item, dict):
+                            records.append(item)
+                        elif hasattr(item, "to_dict") and callable(getattr(item, "to_dict", None)):
+                            try:
+                                records.append(item.to_dict())
+                            except Exception:
+                                pass
+                        elif hasattr(item, "__dict__"):
+                            records.append({
+                                k: v for k, v in vars(item).items() if not k.startswith("_")
+                            })
+                    if records:
+                        pos_df = pd.json_normalize(records)
+        # NOTE: We intentionally avoid calling position_information_* methods here.
+        # In some SDK versions these endpoints may throw internal errors such as
+        # "list index out of range" when invoked without a symbol.  Account
+        # information already provides position details, so we skip the extra
+        # position_information calls to improve stability.
     except Exception as exc:
         logging.error(f"Error fetching positions: {exc}")
 
-    if not pos_df.empty and "positionAmt" in pos_df.columns:
-        pos_df["positionAmt"] = pd.to_numeric(pos_df.get("positionAmt"), errors="coerce").fillna(0)
-        pos_df = pos_df[pos_df["positionAmt"] != 0]
+    # -- Post-processing --
+    try:
+        if not pos_df.empty and "positionAmt" in pos_df.columns:
+            pos_df["positionAmt"] = pd.to_numeric(pos_df.get("positionAmt"), errors="coerce").fillna(0)
+            pos_df = pos_df[pos_df["positionAmt"] != 0]
 
-    need_cols = {"unrealizedProfit", "entryPrice", "positionAmt"}
-    if not pos_df.empty and need_cols.issubset(set(pos_df.columns)):
-        upnl = pd.to_numeric(pos_df["unrealizedProfit"], errors="coerce").fillna(0)
-        entry = pd.to_numeric(pos_df["entryPrice"], errors="coerce").fillna(0)
-        qty = pos_df["positionAmt"].abs()
-        denom = (entry * qty).replace(0, pd.NA).fillna(1e-9)
-        pos_df["roe_pct"] = (upnl / denom) * 100
-    else:
-        pos_df["roe_pct"] = 0.0
+        needed = {"unrealizedProfit", "entryPrice", "positionAmt"}
+        if not pos_df.empty and needed.issubset(set(pos_df.columns)):
+            upnl = pd.to_numeric(pos_df["unrealizedProfit"], errors="coerce").fillna(0)
+            entry = pd.to_numeric(pos_df["entryPrice"], errors="coerce").fillna(0)
+            qty = pos_df["positionAmt"].abs()
+            denom = (entry * qty).replace(0, pd.NA).fillna(1e-9)
+            pos_df["roe_pct"] = (upnl / denom) * 100
+        else:
+            pos_df["roe_pct"] = 0.0
+    except Exception as exc:
+        logging.error(f"Post-processing positions failed: {exc}")
 
     return bal_df, pos_df
-
 
 def get_position(symbol: str) -> Optional[Dict[str, Any]]:
     _, positions = get_overview()
@@ -517,7 +638,6 @@ def get_position(symbol: str) -> Optional[Dict[str, Any]]:
     if pos.empty:
         return None
     return pos.iloc[0].to_dict()
-
 
 def build_entry_and_brackets(
     symbol: str, side: str, quantity: float, target_price: float, stop_price: float
