@@ -309,9 +309,8 @@ def fetch_funding_rate(symbol: str) -> float:
 
 def fetch_orderbook(
     symbol: str = "BTCUSDT",
-    *,
-    limit: int = 50,
-    retries: Tuple[int, ...] = (1, 3, 5),
+    *, limit: int = 50,
+    retries: Tuple[int, ...] = (1, 3, 5, 10, 20),  # 재시도 증가 및 백오프
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch the current order-book snapshot for ``symbol``.
@@ -322,14 +321,29 @@ def fetch_orderbook(
         try:
             resp = client.rest_api.order_book(symbol=sym, limit=limit)
             raw = resp.data() if hasattr(resp, "data") else resp
-            if raw and isinstance(raw, dict) and "bids" in raw and "asks" in raw:
+            
+            # 새: 모델 객체 처리 (to_dict() 또는 vars()로 dict 변환)
+            if hasattr(raw, "to_dict"):
+                try:
+                    raw = raw.to_dict()
+                except Exception as exc:
+                    logging.warning(f"[orderbook] to_dict failed for {sym}: {exc}")
+            
+            # 또는 직접 bids/asks 접근 (모델 속성일 경우)
+            elif hasattr(raw, "bids") and hasattr(raw, "asks"):
+                # bids/asks가 리스트면 그대로 사용, 아니면 변환
+                bids = [(item.root[0], item.root[1]) for item in raw.bids] if isinstance(raw.bids, list) else []
+                asks = [(item.root[0], item.root[1]) for item in raw.asks] if isinstance(raw.asks, list) else []
+                raw = {"bids": bids, "asks": asks}  # dict로 재구성
+            
+            if isinstance(raw, dict) and "bids" in raw and "asks" in raw:
+                if not raw["bids"] or not raw["asks"]:
+                    logging.warning(f"[orderbook] Empty bids/asks for {sym} - raw={raw}")
                 return raw
-        except AttributeError as exc:
-            logging.error(f"[orderbook] AttributeError: {exc}. Check client init in binance_client.py")
-            return None  # 재시도 중단
+            else:
+                logging.warning(f"[orderbook] Invalid response format for {sym} - raw={raw}")
         except Exception as exc:
-            logging.error(f"[orderbook] attempt {attempt}: {exc}")
-        sleep(delay)
+            logging.error(f"[orderbook] Fetch error for {sym}: {exc} (attempt {attempt})")
     return None
 
 
