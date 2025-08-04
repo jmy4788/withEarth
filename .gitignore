@@ -1,0 +1,37 @@
+# Python 가상환경
+venv/
+.venv/
+env/
+ENV/
+
+# Python 빌드/패키지 산출물
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Python 바이트코드/캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 로그 및 런타임 산출물
+logs/
+*.log
+*.csv
+
+# OS/에디터/IDE 관련
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 로컬 설정 및 비밀
+.env
+*.env*
+*.local
+
+# 기타 빌드 시스템
+/setup.cfg

@@ -1,0 +1,5 @@
+cron:
+  - description: "Auto trade every 240 minutes"
+    url: /tasks/trader
+    schedule: every 240 minutes
+    timezone: Asia/Seoul

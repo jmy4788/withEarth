@@ -1,0 +1,63 @@
+# This file specifies files that are *not* uploaded to Google Cloud
+# using gcloud. It follows the same syntax as .gitignore, with the addition of
+# "#!include" directives (which insert the entries of the given .gitignore-style
+# file at that point).
+#
+# For more information, run:
+#   $ gcloud topic gcloudignore
+#
+.gcloudignore
+# If you would like to upload your .git directory, .gitignore file or files
+# from your .gitignore file, remove the corresponding line
+# below:
+.git
+.gitignore
+
+# Python pycache:
+__pycache__/
+# Ignored by the build system
+/setup.cfg
+
+# .gcloudignore — App Engine에 업로드하지 않을 파일/폴더 목록
+# 참고: .gcloudignore 문법은 .gitignore와 동일
+# Docs: https://cloud.google.com/sdk/gcloud/reference/topic/gcloudignore
+
+# --- Python 가상환경/빌드 산출물 ---
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# 바이트코드/캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- 로그/런타임 산출물 (영구 저장은 GCS 사용 중) ---
+logs/
+*.log
+*.csv
+
+# --- OS/IDE/도구 ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# --- VCS ---
+.git/
+.gitignore
+.gitattributes
+.svn/
+.hg/
+
+# --- 로컬 설정/비밀(Secret Manager 사용) ---
+.env
+*.env*
+*.local
