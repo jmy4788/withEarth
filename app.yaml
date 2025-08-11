@@ -1,3 +1,4 @@
+# 변경 없음
 runtime: python312
 entrypoint: gunicorn -b :$PORT app:server
 
@@ -7,13 +8,13 @@ automatic_scaling:
 
 env_variables:
   GUNICORN_CMD_ARGS: "--timeout 180 --graceful-timeout 30 --worker-class gthread --threads 4 --keep-alive 5"
-  EXECUTE_TRADES: "true"         # 실거래 전환 시 "true"
+  EXECUTE_TRADES: "true" # 실거래 전환 시 "true"
   TZ: "Asia/Seoul"
-  GCS_BUCKET: "tothemoon-v2-logs-vaulted-scholar-466013-r5-seoul"     # ⬅️ 추가 (영구 저장용 버킷)
-  GCS_PREFIX: "trading_bot"       # ⬅️ 선택(기본값), 버킷 내 경로 prefix
+  GCS_BUCKET: "tothemoon-v2-logs-vaulted-scholar-466013-r5-seoul" #  ⬅️  추가 (영구 저장용 버킷)
+  GCS_PREFIX: "trading_bot" #  ⬅️  선택(기본값), 버킷 내 경로 prefix
   ENTRY_TIMEOUT_SEC: "12"
   USE_MTF_RAW: "true"
-  USE_CHART_IMAGES: "false"   # 처음엔 off로 검증 → 이후 true
+  USE_CHART_IMAGES: "false" # 처음엔 off로 검증 → 이후 true
   MTF_LAYOUT: "5m:500,1h:200,4h:200,1d:200"
   PROMPT_SPREAD_CAP_BPS: "15"
   PROMPT_SLIPPAGE_CAP_BPS: "5"
@@ -23,5 +24,5 @@ vpc_access_connector:
   egress_setting: all-traffic
 
 handlers:
-  - url: /.*
-    script: auto
+- url: /.*
+  script: auto

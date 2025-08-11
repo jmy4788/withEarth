@@ -1,3 +1,4 @@
+# 변경 없음: 호환성 유지.
 # helpers/utils.py
 from __future__ import annotations
 
@@ -14,8 +15,8 @@ from dotenv import load_dotenv
 
 # google.cloud.*는 배포 환경에서만 필수
 try:
-    from google.cloud import secretmanager, storage  # type: ignore
-except Exception:  # 로컬 개발에서 미설치 가능
+    from google.cloud import secretmanager, storage # type: ignore
+except Exception: # 로컬 개발에서 미설치 가능
     secretmanager = None
     storage = None
 
@@ -33,7 +34,7 @@ if IS_SERVERLESS:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s",
-        handlers=[logging.StreamHandler()]  # stdout
+        handlers=[logging.StreamHandler()] # stdout
     )
     # File logging (best-effort)
     try:
@@ -54,8 +55,8 @@ else:
 
 # --- Global Utilities ---
 TZ = os.getenv("TZ", "UTC")
-GCS_BUCKET = os.getenv("GCS_BUCKET")  # ex) my-bucket
-GCS_PREFIX = os.getenv("GCS_PREFIX", "trading_bot")  # ex) trading_bot
+GCS_BUCKET = os.getenv("GCS_BUCKET") # ex) my-bucket
+GCS_PREFIX = os.getenv("GCS_PREFIX", "trading_bot") # ex) trading_bot
 
 def _now_tz() -> datetime:
     """Return current time in configured timezone."""
@@ -73,8 +74,8 @@ def _detect_project_id() -> Optional[str]:
 
 def get_secret(secret_name: str) -> Optional[str]:
     """
-    1) env 우선
-    2) 서버리스 환경이면 Secret Manager 사용
+    1. env 우선
+    2. 서버리스 환경이면 Secret Manager 사용
     """
     env_val = os.getenv(secret_name)
     if env_val:
@@ -97,7 +98,7 @@ def get_secret(secret_name: str) -> Optional[str]:
         return None
 
 # ----------------------------
-#        GCS Utilities
+# GCS Utilities
 # ----------------------------
 def gcs_enabled() -> bool:
     """
@@ -119,7 +120,7 @@ def _gcs_client() -> Optional["storage.Client"]:
     if not gcs_enabled():
         return None
     try:
-        return storage.Client()  # type: ignore
+        return storage.Client() # type: ignore
     except Exception as e:
         logging.warning(f"GCS client init failed: {e}")
         return None
@@ -132,20 +133,19 @@ def _gcs_blob_path(kind: str, ts: Optional[datetime] = None) -> str:
     ts = ts or _now_tz()
     yyyymm = ts.strftime("%Y%m")
     dd = ts.strftime("%d")
-    epoch = int(ts.timestamp() * 1_000_000)  # microsecond-level
+    epoch = int(ts.timestamp() * 1_000_000) # microsecond-level
     return f"{GCS_PREFIX}/{kind}/{yyyymm}/{dd}/{kind}-{epoch}.csv"
 
 def gcs_append_csv_row(kind: str, headers: List[str], row: dict) -> None:
     """
     GCS에 '1행짜리 CSV'를 개별 객체로 업로드.
-    - GCS는 append가 불가하므로, 일 단위/시간 단위로 작은 파일을 쌓고
-      조회 시 병합해서 읽는 방식으로 처리.
+    - GCS는 append가 불가하므로, 일 단위/시간 단위로 작은 파일을 쌓고 조회 시 병합해서 읽는 방식으로 처리.
     """
     client = _gcs_client()
     if not client:
         return
     try:
-        bucket = client.bucket(GCS_BUCKET)  # type: ignore
+        bucket = client.bucket(GCS_BUCKET) # type: ignore
         blob = bucket.blob(_gcs_blob_path(kind))
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=headers)
@@ -159,19 +159,19 @@ def gcs_append_csv_row(kind: str, headers: List[str], row: dict) -> None:
 
 def gcs_read_recent_csvs(kind: str, max_files: int = 30) -> Optional[str]:
     """
-    GCS에 쌓인 '작은 CSV 파일들'을 최신순 최대 max_files 만큼 내려받아
-    로컬 임시 파일 하나로 병합 후 그 경로를 반환.
+    GCS에 쌓인 '작은 CSV 파일들'을 최신순 최대 max_files 만큼 내려받아 로컬 임시 파일 하나로 병합 후 그 경로를 반환.
     pandas가 읽을 수 있는 단일 CSV 경로를 돌려주는 것이 목표.
     """
     client = _gcs_client()
     if not client:
         return None
     try:
-        bucket = client.bucket(GCS_BUCKET)  # type: ignore
+        bucket = client.bucket(GCS_BUCKET) # type: ignore
         prefix = f"{GCS_PREFIX}/{kind}/"
         blobs = list(bucket.list_blobs(prefix=prefix))
         if not blobs:
             return None
+
         # 최신 객체 우선
         blobs.sort(key=lambda b: b.updated or _now_tz(), reverse=True)
         blobs = blobs[:max_files]

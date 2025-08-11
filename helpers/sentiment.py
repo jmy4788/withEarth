@@ -1,5 +1,5 @@
+# 변경: 피드백 적용 없음 (이미 XAI Grok 기반, Gemini 아님). 호환성 유지.
 """Fetch and analyse sentiment for a given query using x.ai Grok 4."""
-
 from __future__ import annotations
 
 import json
@@ -27,13 +27,15 @@ RETRIES = 3
 # 간단한 메모리 캐시
 CACHE: Dict[str, Dict[str, Any]] = {}
 
-
 def _post(payload: Dict[str, Any]) -> dict:
     for i in range(RETRIES):
         try:
             start = time.time()
             response = requests.post(
-                XAI_URL, headers=HEADERS, json=payload, timeout=TIMEOUT
+                XAI_URL,
+                headers=HEADERS,
+                json=payload,
+                timeout=TIMEOUT
             )
             if response.status_code in (429, 500, 502, 503):
                 time.sleep(2**i)
@@ -45,9 +47,8 @@ def _post(payload: Dict[str, Any]) -> dict:
             logging.warning(f"[xAI] timeout {i + 1}/{RETRIES}")
         except Exception as exc:
             logging.error(f"[xAI] error: {exc}")
-            break
+        break
     raise RuntimeError("xAI retries exhausted")
-
 
 def fetch_and_analyze_x_sentiment(
     query: str = "BTCUSDT sentiment",
@@ -81,7 +82,7 @@ def fetch_and_analyze_x_sentiment(
             "mode": "on",
             "sources": [{"type": "x"}],
             "max_search_results": limit,
-            "from_date": today,  # 날짜만 사용
+            "from_date": today, # 날짜만 사용
             "return_citations": False,
             "live_search_timeout_ms": 40000,
         },
