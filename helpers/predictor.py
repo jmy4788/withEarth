@@ -23,10 +23,11 @@ except Exception:  # pragma: no cover
 # Config & Constants
 # =====================
 # Default to a stable model; env can override
-_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
 TEMPERATURE: float = float(os.getenv("G_TEMPERATURE", "0.0"))
 # Give the model enough room; you can raise via env to 768/1024 if needed
 MAX_TOKENS: int = int(os.getenv("G_MAX_TOKENS", "512"))
+HORIZON_MIN = int(os.getenv("HORIZON_MIN", "60"))
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -217,6 +218,7 @@ def _round_floats(obj: Any, ndigits: int = 6) -> Any:
 def _minimize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "pair": payload.get("pair") or payload.get("symbol") or "",
+        "horizon_min": int(os.getenv("HORIZON_MIN", "60")),
     }
     e5 = payload.get("entry_5m") or {}
     if isinstance(e5, dict):
@@ -299,12 +301,14 @@ def get_gemini_prediction(payload: Dict[str, Any], symbol: Optional[str] = None)
 
     # Prompt designed to minimize HOLD bias but still allow when noisy/flat
     system_note = (
-        "You are an ultra-concise crypto futures signaler. Use ONLY the provided numeric features. "
-        "Choose LONG or SHORT when there is directional evidence; otherwise HOLD."
+        f"You are an ultra-concise crypto futures signaler. Use ONLY the provided numeric features. "
+        f"Decide direction specifically for the NEXT {HORIZON_MIN} minutes (the job re-runs ~every {HORIZON_MIN} minutes). "
+        "Choose LONG or SHORT only if there is directional evidence for that horizon; otherwise HOLD."
     )
     user_rule = (
         "Return ONLY one JSON object with keys: direction, prob, support, resistance, reasoning.\n"
         "direction ∈ {long, short, hold}; prob is 0..1.\n"
+        "Calibrate your decision to the stated horizon; if the expected move within that time is unlikely, output hold.\n"
         "If any field is unknown, still output all keys with defaults (prob≈0.5, support=0, resistance=0)."
     )
 

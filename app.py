@@ -54,33 +54,67 @@ except Exception:
 # -----------------------------
 server = Flask(__name__)
 
+def _ensure_dir_writable(pref: str) -> str:
+    try:
+        os.makedirs(pref, exist_ok=True)
+        test_path = os.path.join(pref, '.write_test')
+        with open(test_path, 'w', encoding='utf-8') as f:
+            f.write('ok')
+        os.remove(test_path)
+        return pref
+    except OSError:
+        pass
+    # GAE Standard: only /tmp writable
+    fallback = "/tmp/trading_bot"
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
 
 def setup_logging() -> logging.Logger:
     log_dir = os.getenv("LOG_DIR", "logs")
-    os.makedirs(log_dir, exist_ok=True)
+    log_dir = _ensure_dir_writable(log_dir)
     log_path = os.path.join(log_dir, "bot.log")
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    # Avoid duplicate handlers when reloaded
-    if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    # Avoid duplicated handlers on reload
+    have_file = any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
+    have_stream = any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+
+    if not have_file:
         fh = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
         fh.setLevel(logging.INFO)
-        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+        formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+        fh.setFormatter(formatter)
         logger.addHandler(fh)
 
-    if not any(h.__class__.__name__ == "StreamHandler" for h in logger.handlers):
+    if not have_stream:
         sh = logging.StreamHandler()
         sh.setLevel(logging.INFO)
-        sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+        formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+        sh.setFormatter(formatter)
         logger.addHandler(sh)
 
-    logging.info("Logging initialized. -> %s", log_path)
+    # Optional: Cloud Logging handler (best-effort)
+    try:
+        from google.cloud.logging_v2.handlers import CloudLoggingHandler  # type: ignore
+        import google.cloud.logging as gcp_logging  # type: ignore
+
+        client = gcp_logging.Client()
+        clh = CloudLoggingHandler(client, name="withEarth_V0")
+        clh.setLevel(logging.INFO)
+        logger.addHandler(clh)
+        logger.info("Cloud Logging handler attached")
+    except Exception as e:
+        logger.info("Cloud Logging handler not attached: %s", e)
+
+    logger.info("Logging to %s", log_path)
     return logger
 
 
 logger = setup_logging()
+
 server.logger.handlers = []
 server.logger.propagate = True
 

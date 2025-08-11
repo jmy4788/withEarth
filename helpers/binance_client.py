@@ -138,7 +138,6 @@ def round_to_step(value: Decimal, step: Decimal) -> Decimal:
     q = (value / step).to_integral_value(rounding=ROUND_DOWN)
     return q * step
 
-
 def load_symbol_filters(symbol: str) -> Dict[str, Any]:
     """Return {tickSize, stepSize, minQty, maxQty, minNotional, raw} with cache."""
     symbol = symbol.upper()
@@ -146,23 +145,61 @@ def load_symbol_filters(symbol: str) -> Dict[str, Any]:
         return _symbol_filters_cache[symbol]
 
     client = _get_client()
-    # exchange_information covers filters
     resp = _call(client.rest_api, ["exchange_information", "exchangeInformation"])  # SDK naming guard
     data = resp.data() if hasattr(resp, "data") else resp
-    # data.symbols is usually a list of dicts
-    symbols = getattr(data, "symbols", None) or data.get("symbols", [])
-    sym = next((s for s in symbols if (s.get("symbol") or s.get("symbolName")) == symbol), None)
-    if not sym:
+
+    def to_dict(obj):
+        if isinstance(obj, dict):
+            return obj
+        if hasattr(obj, "model_dump"):  # pydantic v2
+            return obj.model_dump()
+        if hasattr(obj, "dict"):        # pydantic v1
+            return obj.dict()
+        return obj  # 마지막 수단: 원본 그대로
+
+    def val(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    D = to_dict(data)
+    symbols = D.get("symbols")
+    if symbols is None and hasattr(data, "symbols"):
+        symbols = getattr(data, "symbols")
+
+    if not symbols:
+        raise ValueError("exchange information returned no symbols")
+
+    found = None
+    for s in symbols:
+        sd = to_dict(s)
+        name = sd.get("symbol") or sd.get("symbolName") or val(s, "symbol") or val(s, "symbolName")
+        if name == symbol:
+            found = s
+            break
+    if found is None:
         raise ValueError(f"Symbol {symbol} not found in exchange info")
 
-    filters_list = sym.get("filters", [])
-    fmap = {f.get("filterType"): f for f in filters_list}
+    f_list = to_dict(found).get("filters")
+    if f_list is None and hasattr(found, "filters"):
+        f_list = getattr(found, "filters") or []
 
-    tick = _to_decimal((fmap.get("PRICE_FILTER") or {}).get("tickSize", "0.01"))
-    step = _to_decimal((fmap.get("LOT_SIZE") or {}).get("stepSize", "0.001"))
-    min_qty = _to_decimal((fmap.get("LOT_SIZE") or {}).get("minQty", "0.0"))
-    max_qty = _to_decimal((fmap.get("LOT_SIZE") or {}).get("maxQty", "0.0"))
-    min_notional = _to_decimal((fmap.get("NOTIONAL") or {}).get("notional", "5"))
+    fmap: Dict[str, Any] = {}
+    for f in (f_list or []):
+        fd = to_dict(f)
+        ftype = fd.get("filterType") or val(f, "filterType")
+        if ftype:
+            fmap[ftype] = fd
+
+    price_f = fmap.get("PRICE_FILTER") or {}
+    lot_f   = fmap.get("LOT_SIZE") or {}
+    not_f   = fmap.get("NOTIONAL") or {}
+
+    tick = _to_decimal(price_f.get("tickSize") or val(price_f, "tickSize", "0.01"))
+    step = _to_decimal(lot_f.get("stepSize")   or val(lot_f,   "stepSize", "0.001"))
+    min_qty = _to_decimal(lot_f.get("minQty")  or val(lot_f,   "minQty",   "0.0"))
+    max_qty = _to_decimal(lot_f.get("maxQty")  or val(lot_f,   "maxQty",   "0.0"))
+    min_notional = _to_decimal(not_f.get("notional") or val(not_f, "notional", "5"))
 
     result = {
         "tickSize": tick,
@@ -170,10 +207,11 @@ def load_symbol_filters(symbol: str) -> Dict[str, Any]:
         "minQty": min_qty,
         "maxQty": max_qty,
         "minNotional": min_notional,
-        "raw": sym,
+        "raw": to_dict(found),
     }
     _symbol_filters_cache[symbol] = result
     return result
+
 
 
 def ensure_min_notional(symbol: str, qty: float, price: float, filters: Optional[Dict[str, Any]] = None) -> float:

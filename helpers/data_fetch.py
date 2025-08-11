@@ -250,43 +250,66 @@ def compute_orderbook_stats(ob: Optional[Dict[str, Any]]) -> Dict[str, float]:
         logging.error("compute_orderbook_stats error: %s", e)
         return {"imbalance": 0.0, "spread": 0.0}
 
-def fetch_funding_rate(symbol: str) -> float:
-    """Return last funding rate (%) using SDK→REST fallback. Returns percent value."""
-    # 1) SDK try
-    try:
-        client = _get_client() if _get_client else None
-        if client is not None:
-            try:
-                resp = _call(client.rest_api, ["funding_rate", "fundingRate"], symbol=symbol.upper(), limit=1)
-            except Exception:
-                resp = _call(client.rest_api, ["funding_rate_history", "fundingRateHistory"], symbol=symbol.upper(), limit=1)
-            if hasattr(resp, "data"):
-                resp = resp.data()
-            x = resp[0] if isinstance(resp, list) and resp else resp
-            if isinstance(x, dict):
-                for k in ("fundingRate", "funding_rate", "lastFundingRate", "r"):
-                    if k in x and x[k] not in (None, ""):
-                        return float(x[k]) * 100.0
-            if isinstance(x, list) and x and len(x) >= 2:
-                return float(x[1]) * 100.0
-    except Exception as e:
-        logging.warning("fetch_funding_rate SDK failed: %s err=%s", symbol, e)
+# --- funding rate fetch (robust) ---
+import os, logging, requests
 
-    # 2) REST fallback
-    if requests is None:
-        return 0.0
+def fetch_funding_rate(symbol: str, limit: int = 1) -> float | None:
+    """
+    Returns latest funding rate (float, e.g. 0.0001 for 0.01%) or None if unavailable.
+    Priority: SDK MarketDataRestAPI -> REST /fapi/v1/fundingRate
+    """
+    rate = None
+
+    # 1) Try SDK (MarketDataRestAPI)
     try:
-        url = _rest_base().rstrip("/") + "/fapi/v1/fundingRate"
-        r = requests.get(url, params={"symbol": symbol.upper(), "limit": 1}, timeout=10)
-        r.raise_for_status()
-        arr = r.json()
-        if isinstance(arr, list) and arr:
-            fr = arr[-1].get("fundingRate")
-            if fr not in (None, ""):
-                return float(fr) * 100.0
+        from binance.clients.derivatives_trading_usds_futures import ConfigurationRestAPI
+        # 일부 버전은 다음 경로를 사용합니다:
+        # from binance.clients.derivatives_trading_usds_futures.rest_api.market_data import MarketDataRestAPI
+        # 경로가 다를 경우를 대비한 2중 시도
+        try:
+            from binance.clients.derivatives_trading_usds_futures.rest_api.market_data import MarketDataRestAPI
+        except Exception:
+            from binance.clients.derivatives_trading_usds_futures.rest_api.market_data_rest_api import MarketDataRestAPI  # 다른 네이밍 후보
+
+        cfg = ConfigurationRestAPI()
+        cfg.use_testnet = os.getenv("BINANCE_FUTURES_TESTNET", "false").lower() == "true"
+        md = MarketDataRestAPI(cfg)
+
+        # 메서드 후보 캡처 (버전별 다름)
+        if hasattr(md, "funding_rate_history"):
+            resp = md.funding_rate_history(symbol=symbol, limit=limit)
+        elif hasattr(md, "get_funding_rate_history"):
+            resp = md.get_funding_rate_history(symbol=symbol, limit=limit)
+        else:
+            raise AttributeError("MarketDataRestAPI has no funding rate method")
+
+        items = resp if isinstance(resp, list) else resp.get("data") or resp.get("list") or []
+        if items:
+            rate = float(items[-1].get("fundingRate"))
+            logging.info(f"fetch_funding_rate SDK ok: {symbol} rate={rate}")
     except Exception as e:
-        logging.error("fetch_funding_rate REST failed: %s err=%s", symbol, e)
-    return 0.0
+        logging.warning(f"fetch_funding_rate SDK failed: {symbol} err={e}")
+
+    # 2) Fallback to REST
+    if rate is None:
+        use_testnet = os.getenv("BINANCE_USE_TESTNET", "false").lower() == "true"
+        base = os.getenv("BINANCE_FAPI_TESTNET_BASE", "https://testnet.binancefuture.com") if use_testnet \
+            else os.getenv("BINANCE_FAPI_BASE", "https://fapi.binance.com")
+        url = f"{base}/fapi/v1/fundingRate"
+        timeout_s = int(os.getenv("BINANCE_HTTP_TIMEOUT_MS", "10000")) / 1000.0
+        try:
+            r = requests.get(url, params={"symbol": symbol, "limit": limit}, timeout=timeout_s)
+            r.raise_for_status()
+            data = r.json()
+            if data:
+                rate = float(data[-1]["fundingRate"])
+                logging.info(f"fetch_funding_rate REST ok: {symbol} rate={rate}")
+            else:
+                logging.warning(f"fetch_funding_rate REST empty: {symbol}")
+        except Exception as re:
+            logging.warning(f"fetch_funding_rate REST failed: {symbol} err={re}")
+
+    return rate
 
 # ----------------------------------------------------------------------------
 # Indicators

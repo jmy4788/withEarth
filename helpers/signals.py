@@ -97,7 +97,7 @@ POSITION_MODE = os.getenv("POSITION_MODE", "ONEWAY").upper()
 MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "2.0"))
 ENTRY_MAX_RETRIES = int(os.getenv("ENTRY_MAX_RETRIES", "2"))
 RISK_USDT = float(os.getenv("RISK_USDT", "100"))
-
+HORIZON_MIN = int(os.getenv("HORIZON_MIN", "60"))
 # --------------
 # Data classes
 # --------------
@@ -242,6 +242,7 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
         "relative_volume": float(compute_relative_volume(ohlcv)) if _df_ok(ohlcv) else 1.0,
         "trend_filter": trend,
     }
+    payload["horizon_min"] = HORIZON_MIN
     return payload, ohlcv, ob
 
 
@@ -304,8 +305,15 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
     # Mid price & ATR for levels
     mid = _mid_from_orderbook(ob)  # payload dict엔 orderbook을 넣지 않으므로 ob 사용
     entry = float(mid if mid is not None else payload["entry_5m"].get("close", 0.0))
-    atr5 = float(payload["extra"].get("ATR_5m", 0.0))
-    tp, sl = _propose_levels(direction, entry, atr5, payload.get("sr_levels", {}))
+    ex = payload.get("extra", {}) if isinstance(payload.get("extra"), dict) else {}
+    atr5 = float(ex.get("ATR_5m", 0.0))
+    atr1h = float(ex.get("ATR_1h", 0.0))
+
+    # 5분봉 → HORIZON_MIN 분으로의 √시간 스케일 (대략적 변동성 시간 스케일링)
+    scale = max(1.0, (HORIZON_MIN / 5.0) ** 0.5)
+    atr_for_horizon = atr1h if (HORIZON_MIN >= 45 and atr1h > 0) else (atr5 * scale)
+
+    tp, sl = _propose_levels(direction, entry, atr_for_horizon, payload.get("sr_levels", {}))
     ok_rr, rr = _risk_ok(entry, tp, sl)
 
     return {
@@ -401,9 +409,10 @@ def manage_trade(symbol: str, sig: Optional[Dict[str, Any]] = None) -> Dict[str,
 
         side = "BUY" if direction == "long" else "SELL"
         # 위험금액 기반 수량 산정 (이미 계산된 risk_scalar 재사용)
+# 위험금액 기반 수량 산정 (헬퍼 재사용)
         risk_scalar = float(sig.get("risk_scalar", 1.0))
-        notional = max(1.0, RISK_USDT * risk_scalar)
-        qty = ensure_min_notional(symbol, entry, notional)
+        qty = _size_from_balance(symbol, entry, risk_scalar)
+
 
         order_res = place_bracket_orders(
             symbol,
