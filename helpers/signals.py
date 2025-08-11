@@ -94,9 +94,9 @@ ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.0"))
 DEFAULT_LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 POSITION_MODE = os.getenv("POSITION_MODE", "ONEWAY").upper()
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "7.0"))
+MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "2.0"))
 ENTRY_MAX_RETRIES = int(os.getenv("ENTRY_MAX_RETRIES", "2"))
-RISK_USDT = float(os.getenv("RISK_USDT", "10"))
+RISK_USDT = float(os.getenv("RISK_USDT", "100"))
 
 # --------------
 # Data classes

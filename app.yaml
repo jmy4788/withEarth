@@ -7,9 +7,13 @@ automatic_scaling:
   max_instances: 2
 
 env_variables:
-  GUNICORN_CMD_ARGS: "--timeout 180 --graceful-timeout 30 --worker-class gthread --threads 4 --keep-alive 5"
-  EXECUTE_TRADES: "true" # 실거래 전환 시 "true"
+  GAE_ENV: "standard"           # localdev 대신 배포에선 standard 권장
   TZ: "Asia/Seoul"
+  MODEL_BALANCE: "1000"
+  MIN_PROB: "0.65"
+  EXECUTE_TRADES: "true"        # 실거래: true / 드라이런: false
+  GEMINI_MODEL: "gemini-2.5-flash-lite"
+  GUNICORN_CMD_ARGS: "--timeout 180 --graceful-timeout 30 --worker-class gthread --threads 4 --keep-alive 5"
   GCS_BUCKET: "tothemoon-v2-logs-vaulted-scholar-466013-r5-seoul" #  ⬅️  추가 (영구 저장용 버킷)
   GCS_PREFIX: "trading_bot" #  ⬅️  선택(기본값), 버킷 내 경로 prefix
   ENTRY_TIMEOUT_SEC: "12"
@@ -18,7 +22,6 @@ env_variables:
   MTF_LAYOUT: "5m:500,1h:200,4h:200,1d:200"
   PROMPT_SPREAD_CAP_BPS: "15"
   PROMPT_SLIPPAGE_CAP_BPS: "5"
-  MIN_MODEL_PROB: "0.65"
 vpc_access_connector:
   name: projects/vaulted-scholar-466013-r5/locations/asia-northeast3/connectors/appengine-conn2
   egress_setting: all-traffic
