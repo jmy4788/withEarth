@@ -347,91 +347,91 @@ def _size_from_balance(symbol: str, entry: float, risk_scalar: float) -> float:
         qty = float(qty)
     return max(qty, 0.0)
 
-
-def manage_trade(symbol: str) -> Dict[str, Any]:
-    """End-to-end: cancel → mode/margin/leverage → signal → place orders.
-    Returns a dict summarizing what happened.
+def manage_trade(symbol: str, sig: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    # 0) Housekeeping
+    Reuse already-built signal to avoid rebuilding payload.
+    - If sig is None, it falls back to generate_signal(symbol).
+    - Places orders only when direction in {long, short} and risk_ok=True.
+    """
     try:
+        if sig is None:
+            sig = generate_signal(symbol)
+
+        direction = str(sig.get("direction", "hold")).lower()
+        prob = float(sig.get("prob", 0.5))
+        entry = float(sig.get("entry", 0.0))
+        tp = float(sig.get("tp", 0.0))
+        sl = float(sig.get("sl", 0.0))
+        risk_ok = bool(sig.get("risk_ok", False))
+        rr = float(sig.get("rr", 0.0))
+        preview = sig.get("payload_preview", {})
+        reason = sig.get("reason") or sig.get("reasoning", "")
+
+        # 거래 조건 미충족 → 그대로 요약만 반환 (payload 재계산 금지)
+        if direction not in ("long", "short") or not risk_ok or entry <= 0 or tp <= 0 or sl <= 0:
+            return {
+                "symbol": symbol,
+                "action": "hold",
+                "direction": direction,
+                "entry": entry,
+                "tp": tp,
+                "sl": sl,
+                "prob": prob,
+                "risk_ok": False,
+                "rr": rr,
+                "reason": reason if reason else "no_trade_conditions",
+                "payload_preview": preview,
+            }
+
+        # ---- 여기부터 실제 주문 (필요 시만) ----
+        try:
+            set_position_mode(POSITION_MODE)
+        except Exception as e:
+            logging.warning("set_position_mode: %s", e)
+        try:
+            set_margin_type(symbol, MARGIN_TYPE)
+        except Exception as e:
+            logging.warning("set_margin_type: %s", e)
+        try:
+            set_leverage(symbol, DEFAULT_LEVERAGE)
+        except Exception as e:
+            logging.warning("set_leverage: %s", e)
+
         cancel_open_orders(symbol)
-    except Exception as e:
-        logging.info("bulk-cancel failed (ignored): %s", e)
 
-    try:
-        set_position_mode(POSITION_MODE)  # idempotent on most SDKs
-    except Exception as e:
-        logging.info("position mode set error: %s", e)
+        side = "BUY" if direction == "long" else "SELL"
+        # 위험금액 기반 수량 산정 (이미 계산된 risk_scalar 재사용)
+        risk_scalar = float(sig.get("risk_scalar", 1.0))
+        notional = max(1.0, RISK_USDT * risk_scalar)
+        qty = ensure_min_notional(symbol, entry, notional)
 
-    try:
-        set_margin_type(symbol, MARGIN_TYPE)
-    except Exception as e:
-        logging.info("margin type set error: %s", e)
+        order_res = place_bracket_orders(
+            symbol,
+            side=side,
+            qty=qty,
+            entry_price=entry,
+            take_profit=tp,
+            stop_loss=sl
+        )
 
-    try:
-        set_leverage(symbol, DEFAULT_LEVERAGE)
-    except Exception as e:
-        logging.info("leverage set error: %s", e)
-
-    # 1) Build signal
-    sig = generate_signal(symbol)
-    if sig.get("direction") == "hold":
-        return {"symbol": symbol, "action": "hold", **sig}
-    if sig.get("prob", 0.0) < MIN_PROB or not sig.get("risk_ok", False):
-        return {"symbol": symbol, "action": "hold", "reason": "thresholds", **sig}
-
-    # 2) Spread check
-    ok_spread, spread_bps, ob = _guard_spread(symbol)
-    if not ok_spread:
-        return {"symbol": symbol, "action": "hold", "reason": f"spread>{MAX_SPREAD_BPS}bps", **sig, "spread_bps": spread_bps}
-
-    # 3) Sizing
-    entry = float(sig["entry"])
-    qty = _size_from_balance(symbol, entry, float(sig.get("risk_scalar", 0.3)))
-    if qty <= 0:
-        return {"symbol": symbol, "action": "hold", "reason": "no_size", **sig}
-
-    side = "BUY" if sig["direction"] == "long" else "SELL"
-
-    # 4) Place entry + brackets
-    try:
-        entry_order, bracket_order = None, None
-        entry_order = place_market_order(symbol, side, qty)
-        bracket_order = place_bracket_orders(symbol, side, qty, float(sig["tp"]), float(sig["sl"]))
-        res = {
+        return {
             "symbol": symbol,
-            "action": "enter",
-            "qty": qty,
+            "action": direction,
+            "direction": direction,
             "entry": entry,
-            "tp": float(sig["tp"]),
-            "sl": float(sig["sl"]),
-            "prob": float(sig["prob"]),
-            "risk_scalar": float(sig.get("risk_scalar", 0.3)),
-            "entry_order": entry_order,
-            "bracket_order": bracket_order,
+            "tp": tp,
+            "sl": sl,
+            "prob": prob,
+            "risk_ok": True,
+            "rr": rr,
+            "payload_preview": preview,  # 재사용
+            "order": order_res,
         }
+
     except Exception as e:
-        logging.exception("entry/brackets failed: %s", e)
-        return {"symbol": symbol, "action": "error", "error": str(e), **sig}
+        logging.exception("manage_trade failed for %s", symbol)
+        return {"symbol": symbol, "error": str(e)}
 
-    # 5) Persist lightweight trade log
-    try:
-        row = {
-            "ts": pd.Timestamp.utcnow().isoformat(),
-            "symbol": symbol,
-            "side": side,
-            "qty": qty,
-            "entry": entry,
-            "tp": float(sig["tp"]),
-            "sl": float(sig["sl"]),
-            "prob": float(sig["prob"]),
-            "rr": float(sig.get("rr", 0.0)),
-        }
-        gcs_append_csv_row("trades", row)  # will write locally if GCS disabled
-    except Exception:
-        pass
-
-    return res
 
 
 __all__ = [
