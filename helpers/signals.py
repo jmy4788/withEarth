@@ -98,6 +98,12 @@ MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "2.0"))
 ENTRY_MAX_RETRIES = int(os.getenv("ENTRY_MAX_RETRIES", "2"))
 RISK_USDT = float(os.getenv("RISK_USDT", "100"))
 HORIZON_MIN = int(os.getenv("HORIZON_MIN", "60"))
+ENTRY_MODE = os.getenv("ENTRY_MODE", "LIMIT").upper()  # MARKET | LIMIT
+LIMIT_TTL_SEC = int(os.getenv("LIMIT_TTL_SEC", "15"))   # 한 주문당 대기 시간
+LIMIT_POLL_SEC = float(os.getenv("LIMIT_POLL_SEC", "1.0"))
+LIMIT_MAX_REPRICES = int(os.getenv("LIMIT_MAX_REPRICES", "3"))
+LIMIT_MAX_SLIPPAGE_BPS = float(os.getenv("LIMIT_MAX_SLIPPAGE_BPS", "2.0"))  # entry 대비 허용 슬리피지 상한(bps)
+
 # --------------
 # Data classes
 # --------------
@@ -169,7 +175,93 @@ def _sr_levels(df: pd.DataFrame) -> Dict[str, float]:
         return {"recent_high": float(sr.get("recent_high", 0.0)), "recent_low": float(sr.get("recent_low", 0.0))}
     except Exception:
         return {"recent_high": 0.0, "recent_low": 0.0}
+    
+def _best_quotes(symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    """Return (best_bid, best_ask)."""
+    try:
+        ob = fetch_orderbook(symbol, limit=5)
+        if ob and ob.get("bids") and ob.get("asks"):
+            bid = float(ob["bids"][0][0])
+            ask = float(ob["asks"][0][0])
+            return bid, ask
+    except Exception:
+        pass
+    return None, None
 
+def _limit_price_for_side(symbol: str, side: str, desired_entry: float) -> Optional[float]:
+    """현재 호가와 슬리피지 예산을 고려해 리밋 가격 산출."""
+    bid, ask = _best_quotes(symbol)
+    if bid is None or ask is None:
+        return None
+    budget = LIMIT_MAX_SLIPPAGE_BPS / 1e4
+    if side.upper() == "BUY":
+        # 롱: bid 기준으로 시작, 너무 높게 쫓지 않도록 desired_entry*(1+budget) 상한
+        raw = min(ask, max(bid, desired_entry * (1.0 - 0.0000)))  # desired_entry 아래로는 굳이 낮추지 않음
+        capped = min(raw, desired_entry * (1.0 + budget))
+        return normalize_price_with_mode(symbol, capped)
+    else:
+        # 숏: ask 기준으로 시작, 너무 낮게 던지지 않도록 desired_entry*(1-budget) 하한
+        raw = max(bid, min(ask, desired_entry * (1.0 + 0.0000)))
+        capped = max(raw, desired_entry * (1.0 - budget))
+        return normalize_price_with_mode(symbol, capped)
+
+def _position_qty_after_fill(symbol: str, side: str) -> float:
+    """체결 후 포지션 수량(절대값)을 읽어온다. 없으면 0."""
+    p = get_position(symbol) or {}
+    amt = float(p.get("positionAmt") or p.get("positionAmount") or 0.0)
+    # ONEWAY 기준: 롱>0, 숏<0
+    if side.upper() == "BUY" and amt > 0:
+        return abs(amt)
+    if side.upper() == "SELL" and amt < 0:
+        return abs(amt)
+    return 0.0
+
+def _enter_limit_then_brackets(symbol: str, side: str, qty: float, desired_entry: float, tp: float, sl: float) -> Dict[str, Any]:
+    """
+    1) 최우선호가 기반 리밋 제출 (GTC)
+    2) TTL 동안 폴링하며 포지션 증가 감지
+    3) 미체결이면 재호가(최대 LIMIT_MAX_REPRICES 회)
+    4) 체결 시 reduce-only TP/SL 제출
+    """
+    attempt = 0
+    last_order = None
+    filled_qty = 0.0
+    while attempt <= LIMIT_MAX_REPRICES:
+        attempt += 1
+        price = _limit_price_for_side(symbol, side, desired_entry)
+        if price is None or price <= 0:
+            raise RuntimeError("orderbook unavailable for limit entry")
+
+        # 기존 미체결 리밋은 정리(간단화)
+        try:
+            cancel_open_orders(symbol)
+        except Exception as e:
+            logging.info("cancel_open_orders(%s) failed (non-fatal): %s", symbol, e)
+
+        # 리밋 제출
+        last_order = place_limit_order(symbol, side, qty, price, time_in_force="GTC", reduce_only=False)
+
+        # 폴링하며 체결 감시
+        deadline = time.time() + LIMIT_TTL_SEC
+        while time.time() < deadline:
+            time.sleep(LIMIT_POLL_SEC)
+            filled_qty = _position_qty_after_fill(symbol, side)
+            if filled_qty > 0:
+                # 체결 확인 → 브래킷(RO) 생성
+                br = place_bracket_orders(symbol, side, filled_qty, take_profit=tp, stop_loss=sl)
+                return {"entry_order": last_order, "brackets": br, "filled_qty": filled_qty, "entry_price": price}
+        # TTL 내 미체결 → 다음 시도(재호가)
+    # 모든 시도 실패
+    raise TimeoutError(f"limit entry not filled within TTL×reprices (ttl={LIMIT_TTL_SEC}s, n={LIMIT_MAX_REPRICES})")
+
+def _latest_asof(df: pd.DataFrame, ref_ts: pd.Timestamp) -> pd.Series:
+    """ref_ts(5m 마지막 '닫힌' 봉 기준) 이전/동일 시각 중 가장 최근 1행만 반환."""
+    if df is None or df.empty: 
+        return pd.Series(dtype="float64")
+    d = df[df["timestamp"] <= ref_ts]
+    if d.empty:
+        return pd.Series(dtype="float64")
+    return d.iloc[-1]
 
 # -----------------------------
 # Re-export account overview
@@ -315,6 +407,12 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
 
     tp, sl = _propose_levels(direction, entry, atr_for_horizon, payload.get("sr_levels", {}))
     ok_rr, rr = _risk_ok(entry, tp, sl)
+    # Conditionally relax RR if the model is confident
+    relax_th = float(os.getenv("HIGH_PROB_RELAX_RR", "0.70"))     # 확률 임계
+    relax_rr = float(os.getenv("RR_MIN_HIGH_PROB", "1.05"))       # 높은 확률일 때 허용 RR
+    if not ok_rr and prob >= relax_th:
+        ok_rr = rr >= relax_rr
+    # === end paste ===
 
     return {
         "symbol": symbol,
@@ -357,9 +455,9 @@ def _size_from_balance(symbol: str, entry: float, risk_scalar: float) -> float:
 
 def manage_trade(symbol: str, sig: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Reuse already-built signal to avoid rebuilding payload.
-    - If sig is None, it falls back to generate_signal(symbol).
-    - Places orders only when direction in {long, short} and risk_ok=True.
+    - sig 없으면 generate_signal(symbol) 사용
+    - 조건 통과 시 ENTRY_MODE에 따라 MARKET or LIMIT 진입
+    - LIMIT은 체결 모니터링 후 reduce-only TP/SL 자동 세팅
     """
     try:
         if sig is None:
@@ -375,7 +473,7 @@ def manage_trade(symbol: str, sig: Optional[Dict[str, Any]] = None) -> Dict[str,
         preview = sig.get("payload_preview", {})
         reason = sig.get("reason") or sig.get("reasoning", "")
 
-        # 거래 조건 미충족 → 그대로 요약만 반환 (payload 재계산 금지)
+        # 거래 조건 미충족 → 요약만 반환
         if direction not in ("long", "short") or not risk_ok or entry <= 0 or tp <= 0 or sl <= 0:
             return {
                 "symbol": symbol,
@@ -391,38 +489,40 @@ def manage_trade(symbol: str, sig: Optional[Dict[str, Any]] = None) -> Dict[str,
                 "payload_preview": preview,
             }
 
-        # ---- 여기부터 실제 주문 (필요 시만) ----
-        try:
-            set_position_mode(POSITION_MODE)
-        except Exception as e:
-            logging.warning("set_position_mode: %s", e)
-        try:
-            set_margin_type(symbol, MARGIN_TYPE)
-        except Exception as e:
-            logging.warning("set_margin_type: %s", e)
-        try:
-            set_leverage(symbol, DEFAULT_LEVERAGE)
-        except Exception as e:
-            logging.warning("set_leverage: %s", e)
+        # 계정 설정
+        try: set_position_mode(POSITION_MODE)
+        except Exception as e: logging.warning("set_position_mode: %s", e)
+        try: set_margin_type(symbol, MARGIN_TYPE)
+        except Exception as e: logging.warning("set_margin_type: %s", e)
+        try: set_leverage(symbol, DEFAULT_LEVERAGE)
+        except Exception as e: logging.warning("set_leverage: %s", e)
 
-        cancel_open_orders(symbol)
-
-        side = "BUY" if direction == "long" else "SELL"
-        # 위험금액 기반 수량 산정 (이미 계산된 risk_scalar 재사용)
-# 위험금액 기반 수량 산정 (헬퍼 재사용)
+        # 위험금액 기반 수량
         risk_scalar = float(sig.get("risk_scalar", 1.0))
         qty = _size_from_balance(symbol, entry, risk_scalar)
 
+        side = "BUY" if direction == "long" else "SELL"
 
-        order_res = place_bracket_orders(
-            symbol,
-            side=side,
-            qty=qty,
-            entry_price=entry,
-            take_profit=tp,
-            stop_loss=sl
-        )
+        if ENTRY_MODE == "MARKET":
+            # 마켓 → 진입 + 브래킷 (SDK 래퍼 제공)
+            entry_res, br_res = build_entry_and_brackets(symbol, side, qty, tp, sl)  # entry_price 인자 없음
+            return {
+                "symbol": symbol,
+                "action": direction,
+                "direction": direction,
+                "entry": entry,
+                "tp": tp,
+                "sl": sl,
+                "prob": prob,
+                "risk_ok": True,
+                "rr": rr,
+                "payload_preview": preview,
+                "order": {"entry": entry_res, "brackets": br_res},
+                "mode": "MARKET",
+            }
 
+        # LIMIT 모드
+        exec_res = _enter_limit_then_brackets(symbol, side, qty, entry, tp, sl)
         return {
             "symbol": symbol,
             "action": direction,
@@ -433,16 +533,15 @@ def manage_trade(symbol: str, sig: Optional[Dict[str, Any]] = None) -> Dict[str,
             "prob": prob,
             "risk_ok": True,
             "rr": rr,
-            "payload_preview": preview,  # 재사용
-            "order": order_res,
+            "payload_preview": preview,
+            "order": exec_res,
+            "mode": "LIMIT",
         }
 
     except Exception as e:
         logging.exception("manage_trade failed for %s", symbol)
         return {"symbol": symbol, "error": str(e)}
-
-
-
+    
 __all__ = [
     "get_overview",
     "generate_signal",

@@ -45,6 +45,40 @@ def _rest_base() -> str:
 # ----------------------------------------------------------------------------
 # Small utilities
 # ----------------------------------------------------------------------------
+
+# --- Partial-bar guard -------------------------------------------------------
+_INTERVAL_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800, "12h": 43200,
+    "1d": 86400, "3d": 259200, "1w": 604800
+}
+
+def _trim_to_closed(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """
+    Drop the *in-progress* last candle if its close time is in the future.
+    Assumes df has a 'timestamp' column of bar open times (ascending).
+    """
+    if df is None or df.empty or "timestamp" not in df.columns:
+        return df
+    secs = _INTERVAL_SECONDS.get(str(interval).lower())
+    if not secs:
+        return df  # unknown interval → do nothing
+
+    ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    if ts.isna().all():
+        return df
+
+    last_open = ts.iloc[-1]
+    now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+    last_close = last_open + pd.to_timedelta(secs, unit="s")
+
+    # If the last bar hasn't closed yet, drop it.
+    if last_close > now_utc:
+        return df.iloc[:-1].copy()
+    return df
+
+
+
 def _is_df(x) -> bool:
     return isinstance(x, pd.DataFrame) and not x.empty
 
@@ -160,7 +194,7 @@ def fetch_ohlcv(symbol: str, interval: str = "5m", limit: int = 600) -> Optional
             df = _from_sdk_klines(resp)
             if df is not None and not df.empty:
                 logging.info("fetch_ohlcv SDK ok: %s %s rows=%d", symbol, interval, len(df))
-                return df
+                return _trim_to_closed(df, interval)
             logging.warning("fetch_ohlcv SDK empty: %s %s", symbol, interval)
     except Exception as e:
         logging.warning("fetch_ohlcv SDK failed: %s %s err=%s", symbol, interval, e)
@@ -178,7 +212,7 @@ def fetch_ohlcv(symbol: str, interval: str = "5m", limit: int = 600) -> Optional
         df = _from_sdk_klines(data)
         if df is not None and not df.empty:
             logging.info("fetch_ohlcv REST ok: %s %s rows=%d", symbol, interval, len(df))
-            return df
+            return _trim_to_closed(df, interval)
         logging.error("fetch_ohlcv REST empty: %s %s", symbol, interval)
     except Exception as e:
         logging.error("fetch_ohlcv REST failed: %s %s err=%s", symbol, interval, e)
@@ -410,6 +444,7 @@ def fetch_data(symbol: str, tf_entry: str = "5m", include_orderbook: bool = True
 
     # daily frame for trend filter
     df_day = fetch_ohlcv(symbol, interval="1d", limit=300)
+    df_day = _trim_to_closed(df_day, "1d")
     if not _is_df(df_day):
         df_day = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
@@ -436,6 +471,7 @@ def fetch_mtf_raw(symbol: str, tfs: Optional[List[str]] = None, limit_by_tf: Opt
         try:
             lim = int(limits.get(tf, lim_default))
             df = fetch_ohlcv(symbol, interval=tf, limit=lim)
+            df = _trim_to_closed(df, tf)
             if not _is_df(df):
                 out[tf] = pd.DataFrame()
             else:

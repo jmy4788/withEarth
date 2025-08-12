@@ -17,6 +17,7 @@ env_variables:
   GCS_BUCKET: "tothemoon-v2-logs-vaulted-scholar-466013-r5-seoul" #  ⬅️  추가 (영구 저장용 버킷)
   GCS_PREFIX: "trading_bot" #  ⬅️  선택(기본값), 버킷 내 경로 prefix
   ENTRY_TIMEOUT_SEC: "12"
+  ENTRY_MODE: "LIMIT"
   USE_MTF_RAW: "true"
   USE_CHART_IMAGES: "false" # 처음엔 off로 검증 → 이후 true
   MTF_LAYOUT: "5m:500,1h:200,4h:200,1d:200"
