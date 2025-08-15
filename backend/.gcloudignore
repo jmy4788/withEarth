@@ -1,0 +1,46 @@
+# .gcloudignore — App Engine upload exclude list (backend/)
+# Docs: https://cloud.google.com/sdk/gcloud/reference/topic/gcloudignore
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Python environment / build
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs / runtime artifacts (we don't ship these)
+logs/
+logs/*.log
+logs/*.csv
+**/payloads/
+**/trades.csv
+
+# Local config / secrets
+.env
+*.env
+*.local
+
+# Node junk (just in case)
+node_modules/
+dist/
+build/
+
+# Misc
+*.log
+/setup.cfg
