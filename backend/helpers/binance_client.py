@@ -32,7 +32,7 @@ import pandas as pd
 
 # ---- Optional utils integration ------------------------------------------------
 try:  # 프로젝트 utils 우선 사용
-    from .utils import get_secret  # type: ignore
+    from .utils import get_secret, log_event  # type: ignore
 except Exception:  # pragma: no cover
     def get_secret(name: str) -> Optional[str]:  # 최소 폴백
         return os.getenv(name)
@@ -435,7 +435,6 @@ def _quantize_qty(symbol: str, qty: float, at_price: float) -> float:
     f = load_symbol_filters(symbol)
     return ensure_min_notional(symbol, qty, price=at_price, filters=f)
 
-
 def place_market_order(symbol: str, side: str, quantity: float, reduce_only: bool = False) -> Dict[str, Any]:
     """
     마켓 주문(BUY/SELL).
@@ -446,7 +445,7 @@ def place_market_order(symbol: str, side: str, quantity: float, reduce_only: boo
     side = side.upper()
     ps = _position_side()
 
-    # 수량 정규화 (실시장가 기반)
+    # 수량 정규화
     try:
         ref = _last_price(symbol)
     except Exception:
@@ -471,9 +470,22 @@ def place_market_order(symbol: str, side: str, quantity: float, reduce_only: boo
         "reduce_only": bool(reduce_only),
         "position_side": ps,
     }
+
+    # INFO: 주문 요청
+    log_event("binance.order.request", **payload)
+
     try:
         resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
-        return resp.data() if hasattr(resp, "data") else resp
+        data = resp.data() if hasattr(resp, "data") else resp
+        # INFO: 주문 응답
+        log_event("binance.order.response",
+                  symbol=symbol, side=side, type="MARKET",
+                  orderId=(data.get("orderId") if isinstance(data, dict) else None),
+                  status=(data.get("status") if isinstance(data, dict) else None),
+                  price=(data.get("avgPrice") or data.get("price") if isinstance(data, dict) else None),
+                  qty=(data.get("executedQty") or data.get("origQty") if isinstance(data, dict) else None),
+                  raw=data)
+        return data
     except Exception as e:
         logger.error("place_market_order error: %s", e)
         raise
@@ -508,13 +520,26 @@ def place_limit_order(
         "reduce_only": bool(reduce_only),
         "position_side": ps,
     }
+
+    # INFO: 주문 요청
+    log_event("binance.order.request", **payload)
     try:
         resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
-        return resp.data() if hasattr(resp, "data") else resp
-    except Exception as e:
+        data = resp.data() if hasattr(resp, "data") else resp
+        # INFO: 주문 응답
+        log_event("binance.order.response",
+                    symbol=symbol, side=side, type="LIMIT",
+                    orderId=(data.get("orderId") if isinstance(data, dict) else None),
+                    status=(data.get("status") if isinstance(data, dict) else None),
+                    price=(data.get("price") if isinstance(data, dict) else None),
+                    qty=(data.get("executedQty") or data.get("origQty") if isinstance(data, dict) else None),
+                    raw=data)
+        return data
+    except Exception as e: # <-- 이 부분이 `try`와 동일한 수준으로 들여쓰기되었습니다.
         logger.error("place_limit_order error: %s", e)
         raise
 # helpers/binance_client.py
+
 def place_bracket_orders(
     symbol: str,
     side: str,            # 엔트리 방향 (BUY=롱, SELL=숏)
@@ -524,69 +549,75 @@ def place_bracket_orders(
 ) -> Dict[str, Any]:
     """
     엔트리 직후 브래킷(리듀스온리) 생성.
-      - TP: TAKE_PROFIT (LIMIT)  ← 기존 TAKE_PROFIT_MARKET에서 변경
-      - SL: STOP_MARKET (권장: 미충족 위험 줄이기)
-    주의: reduce_only=True, position_side=BOTH(원웨이) 유지.
+      - TP: TAKE_PROFIT (LIMIT)
+      - SL: STOP_MARKET
     """
     client = _get_client()
     side = side.upper()
     opp = "SELL" if side == "BUY" else "BUY"
     ps = _position_side()
 
-    # 가격을 거래소 tickSize에 맞게 정규화
     tp_price = normalize_price_with_mode(symbol, float(take_profit))
     sl_price = normalize_price_with_mode(symbol, float(stop_loss))
 
-    # 수량을 stepSize/minNotional에 맞게 보정(보수적으로 TP 가격 기준)
     f = load_symbol_filters(symbol)
     qty_q = ensure_min_notional(symbol, float(quantity), price=tp_price, filters=f)
 
     out: Dict[str, Any] = {"take_profit": None, "stop_loss": None}
 
-    # --- TAKE_PROFIT (LIMIT) ---
-    # Futures의 LIMIT형 TP는 price(발주시점 지정가) + stop_price(트리거)가 모두 필요합니다.
-    # working_type을 MARK_PRICE로 주면 마크가격 기준으로 트리거됩니다(지원 환경에서만 적용).
+    # TAKE_PROFIT (LIMIT) — 트리거 + 지정가
+    tp_payload = {
+        "symbol": symbol,
+        "side": opp,  # 포지션 축소
+        "type": "TAKE_PROFIT",
+        "time_in_force": "GTC",
+        "price": str(tp_price),
+        "quantity": str(qty_q),
+        "stop_price": str(tp_price),
+        "working_type": "MARK_PRICE",
+        "reduce_only": True,
+        "position_side": ps,
+    }
+    log_event("binance.order.request", **tp_payload)
     try:
-        tp_payload = {
-            "symbol": symbol,
-            "side": opp,
-            "type": "TAKE_PROFIT",          # ★ LIMIT TP
-            "time_in_force": "GTC",
-            "price": str(tp_price),         # 체결을 시도할 지정가
-            "stop_price": str(tp_price),    # 트리거 가격(=TP 레벨과 동일하게 세팅)
-            "quantity": str(qty_q),
-            "reduce_only": True,
-            "position_side": ps,
-            # 선택 필드(지원되는 SDK/엔드포인트에서만 유효)
-            "working_type": "MARK_PRICE",
-            "price_protect": True,
-        }
         tp_resp = _call(client.rest_api, ["new_order", "newOrder"], **tp_payload)
-        out["take_profit"] = tp_resp.data() if hasattr(tp_resp, "data") else tp_resp
+        tp_data = tp_resp.data() if hasattr(tp_resp, "data") else tp_resp
+        log_event("binance.order.response",
+                  symbol=symbol, side=opp, type="TAKE_PROFIT",
+                  orderId=(tp_data.get("orderId") if isinstance(tp_data, dict) else None),
+                  status=(tp_data.get("status") if isinstance(tp_data, dict) else None),
+                  price=tp_payload["price"], qty=tp_payload["quantity"],
+                  raw=tp_data)
+        out["take_profit"] = tp_data
     except Exception as e:
-        logger.info("TP LIMIT failed: %s", e)
+        logger.info("place_bracket_orders TP failed: %s", e)
 
-    # --- STOP_MARKET ---
+    # STOP_MARKET
+    sl_payload = {
+        "symbol": symbol,
+        "side": opp,
+        "type": "STOP_MARKET",
+        "stop_price": str(sl_price),
+        "working_type": "MARK_PRICE",
+        "quantity": str(qty_q),
+        "reduce_only": True,
+        "position_side": ps,
+    }
+    log_event("binance.order.request", **sl_payload)
     try:
-        sl_payload = {
-            "symbol": symbol,
-            "side": opp,
-            "type": "STOP_MARKET",
-            "stop_price": str(sl_price),
-            "quantity": str(qty_q),
-            "reduce_only": True,
-            "position_side": ps,
-            "working_type": "MARK_PRICE",
-            "price_protect": True,
-        }
         sl_resp = _call(client.rest_api, ["new_order", "newOrder"], **sl_payload)
-        out["stop_loss"] = sl_resp.data() if hasattr(sl_resp, "data") else sl_resp
+        sl_data = sl_resp.data() if hasattr(sl_resp, "data") else sl_resp
+        log_event("binance.order.response",
+                  symbol=symbol, side=opp, type="STOP_MARKET",
+                  orderId=(sl_data.get("orderId") if isinstance(sl_data, dict) else None),
+                  status=(sl_data.get("status") if isinstance(sl_data, dict) else None),
+                  price=None, qty=sl_payload["quantity"],
+                  raw=sl_data)
+        out["stop_loss"] = sl_data
     except Exception as e:
-        logger.info("SL MARKET failed: %s", e)
+        logger.info("place_bracket_orders SL failed: %s", e)
 
     return out
-
-
 
 def build_entry_and_brackets(
     symbol: str,

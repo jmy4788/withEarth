@@ -31,7 +31,7 @@ import pandas as pd
 # 프로젝트 공용 유틸 (선택적)
 # ----------------------------
 try:
-    from .utils import LOG_DIR, gcs_enabled, gcs_append_csv_row  # type: ignore
+    from .utils import LOG_DIR, gcs_enabled, gcs_append_csv_row, log_event  # type: ignore
 except Exception:  # pragma: no cover
     LOG_DIR = os.path.join(os.getcwd(), "logs")
 
@@ -468,87 +468,95 @@ def _size_from_balance(symbol: str, entry: float, sl: float, risk_scalar: float 
 
 # =====================
 # 공개 API
-# =====================
+# =====================#
+
 def generate_signal(symbol: str) -> Dict[str, Any]:
     """
-    심볼별 신호 생성 (주문 실행은 manage_trade가 담당).
-    반환 형식은 app.py가 직렬화하여 응답에 포함한다.
+    심볼별 payload 생성 → Gemini 예측 → RR/게이트 적용 → 실행 or HOLD 요약 반환.
+    INFO 이벤트:
+      - signal.decision: {symbol, direction, prob, entry, tp, sl, rr, risk_ok}
     """
-    try:
-        payload, ohlcv, ob = _build_payload(symbol)
-        # 스프레드 게이트(너무 벌어지면 예외/홀드)
-        stats = compute_orderbook_stats(ob) if isinstance(ob, dict) else {"spread": 0.0}
-        if not _guard_spread(stats.get("spread", 0.0)):
-            return {
-                "symbol": symbol,
-                "result": {
-                    "direction": "hold",
-                    "entry": float(payload["entry_5m"].get("close", 0.0)),
-                    "tp": 0.0,
-                    "sl": 0.0,
-                    "prob": 0.5,
-                    "risk_ok": False,
-                    "rr": 0.0,
-                    "payload_preview": {
-                        "pair": payload.get("pair", ""),
-                        "entry_5m": payload.get("entry_5m", {}),
-                        "extra": {
-                            "orderbook_spread": stats.get("spread", 0.0),
-                            "guard": "spread_exceeded",
-                        },
-                    },
-                },
-            }
+    payload, ohlcv, ob = _build_payload(symbol)
 
-        # 모델 호출
-        pred = get_gemini_prediction(payload, symbol=symbol) or {}
-        direction = str(pred.get("direction", "hold")).lower()
-        if direction not in ("long", "short", "hold"):
-            direction = "hold"
-        prob = float(pred.get("prob", 0.5))
-        reasoning = str(pred.get("reasoning", ""))
+    # 모델 호출
+    res = get_gemini_prediction(payload, symbol=symbol)
 
-        # Mid price & ATR for levels
-        mid = _mid_from_orderbook(ob)  # payload dict엔 orderbook을 넣지 않으므로 ob 사용
-        entry = float(mid if mid is not None else payload["entry_5m"].get("close", 0.0))
-        ex = payload.get("extra", {}) if isinstance(payload.get("extra"), dict) else {}
-        atr5 = float(ex.get("ATR_5m", 0.0))
-        atr1h = float(ex.get("ATR_1h", 0.0))
+    # 가격 및 RR 계산 (기존 로직과 동일하게 해석)
+    direction = str(res.get("direction") or "").lower()
+    entry = float(res.get("entry") or payload.get("entry_5m") or 0.0)
+    tp = float(res.get("tp") or 0.0)
+    sl = float(res.get("sl") or 0.0)
+    prob = float(res.get("prob", 0.0))
+    rr = float(res.get("rr", 0.0))
+    risk_ok = bool(res.get("risk_ok", False))
 
-        # 5분봉 → HORIZON_MIN 분으로의 √시간 스케일 (대략적 변동성 시간 스케일링)
-        scale = max(1.0, (HORIZON_MIN / 5.0) ** 0.5)
-        atr_for_horizon = atr1h if (HORIZON_MIN >= 45 and atr1h > 0) else (atr5 * scale)
-
-        tp, sl = _propose_levels(direction, entry, atr_for_horizon, payload.get("sr_levels", {}))
-        ok_rr, rr = _risk_ok(entry, tp, sl)
-        # 높은 확률이면 RR 완화
-        if not ok_rr and prob >= HIGH_PROB_RELAX_RR:
-            ok_rr = rr >= RR_MIN_HIGH_PROB
-
-        preview = {
-            "pair": payload.get("pair", ""),
-            "entry_5m": payload.get("entry_5m", {}),
-            "extra": {k: ex.get(k) for k in ["orderbook_imbalance", "orderbook_spread", "ATR_5m", "ATR_1h", "RSI_1h", "RSI_4h", "RSI_1d"] if k in ex},
-        }
-
-        return {
+    # 게이트 조건을 통과 못하면 hold 요약 반환(기존 패턴 유지)
+    if direction not in ("long", "short") or not risk_ok or entry <= 0 or tp <= 0 or sl <= 0:
+        preview = res.get("payload_preview", {})
+        out = {
             "symbol": symbol,
-            "result": {
-                "direction": direction,
-                "entry": float(entry),
-                "tp": float(tp),
-                "sl": float(sl),
-                "prob": float(prob),
-                "risk_ok": bool(ok_rr),
-                "rr": float(rr),
-                "payload_preview": preview,
-                "reasoning": reasoning,
-            },
+            "action": "hold",
+            "direction": direction,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "prob": prob,
+            "risk_ok": False,
+            "rr": rr,
+            "reason": res.get("reasoning", "") or "no_trade_conditions",
+            "payload_preview": preview,
         }
+        # 의사결정 요약 로깅
+        log_event("signal.decision",
+                  symbol=symbol, direction=direction, prob=prob,
+                  entry=entry, tp=tp, sl=sl, rr=rr, risk_ok=False)
+        return out
 
-    except Exception as e:
-        logger.exception("generate_signal failed for %s", symbol)
-        return {"symbol": symbol, "error": str(e)}
+    # 확률 게이트
+    if prob < float(os.getenv("MIN_PROB", "0.60")):
+        preview = res.get("payload_preview", {})
+        out = {
+            "symbol": symbol,
+            "action": "hold",
+            "direction": direction,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "prob": prob,
+            "risk_ok": False,
+            "rr": rr,
+            "reason": "prob_below_threshold",
+            "payload_preview": preview,
+        }
+        log_event("signal.decision",
+                  symbol=symbol, direction=direction, prob=prob,
+                  entry=entry, tp=tp, sl=sl, rr=rr, risk_ok=False)
+        return out
+
+    # 여기서부터는 manage_trade() 쪽을 쓰는 루트와 동일하게 동작합니다.
+    # (app.py에서 EXECUTE_TRADES=false면 이 결과만 반환합니다.)
+    out = {
+        "symbol": symbol,
+        "action": "enter",
+        "direction": direction,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "prob": prob,
+        "rr": rr,
+        "risk_ok": True,
+        "payload_preview": res.get("payload_preview", {}),
+        "result": {
+            "entry": entry, "tp": tp, "sl": sl
+        }
+    }
+
+    # 의사결정 요약 로깅 (성사 조건)
+    log_event("signal.decision",
+              symbol=symbol, direction=direction, prob=prob,
+              entry=entry, tp=tp, sl=sl, rr=rr, risk_ok=True)
+
+    return out
 
 
 def manage_trade(symbol: str) -> Dict[str, Any]:
@@ -638,6 +646,10 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
             exec_res = _enter_limit_then_brackets(symbol, side, qty, desired_entry=entry, tp=tp, sl=sl)
             mode = "LIMIT"
 
+        log_event("signal.decision", symbol=symbol, direction=("long" if side=="BUY" else "short"),
+          prob=float(res.get("prob", 0.0)), entry=float(entry), tp=float(tp), sl=float(sl),
+          rr=float(res.get("rr", 0.0)), risk_ok=True)
+        
         # 저널 기록(선택)
         try:
             row = {

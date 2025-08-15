@@ -15,7 +15,7 @@ helpers/utils.py — refactor (2025-08-12, KST)
   - gcs_enabled() -> bool
   - gcs_append_csv_row(dataset: str, headers: list[str], row: dict) -> None
 """
-
+import json
 import csv
 import logging
 import os
@@ -216,6 +216,18 @@ def gcs_append_csv_row(dataset: str, headers: List[str], row: dict) -> None:
     except Exception as e:
         logging.info(f"gcs_append_csv_row failed: {e}")
 
+def log_event(event: str, **fields) -> None:
+    """
+    Cloud Logging에서 보기 편하도록 JSON 문자열로 INFO 레벨 로그를 남깁니다.
+    - 표준 출력으로 흘러가므로 GAE에서 자동 수집됩니다.
+    - 민감정보(API 키 등)는 포함하지 않습니다.
+    """
+    try:
+        logging.getLogger("event").info(
+            json.dumps({"event": event, **fields}, ensure_ascii=False, default=str)
+        )
+    except Exception as e:
+        logging.getLogger(__name__).info("log_event failed: %s", e)
 
 __all__ = [
     "LOG_DIR",
