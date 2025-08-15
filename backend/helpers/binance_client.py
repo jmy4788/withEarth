@@ -636,23 +636,109 @@ def build_entry_and_brackets(
 # Position helpers
 # ==================
 def get_position(symbol: str) -> Optional[Dict[str, Any]]:
-    """현재 심볼 포지션 1개(있는 경우)만 리턴. 없으면 None."""
+    """
+    현재 심볼 포지션 1개(있는 경우)만 dict로 반환.
+    - 모듈형 SDK의 타이핑된 응답(PositionInformationV3Response 등)과
+      기존 dict/list 응답을 모두 안전하게 처리.
+    """
     client = _get_client()
     try:
-        pos = _call(
+        resp = _call(
             client.rest_api,
             ["position_information_v3", "position_information_v2", "position_information", "position_risk"],
             symbol=symbol,
         )
-        pdata = pos.data() if hasattr(pos, "data") else pos
-        items = getattr(pdata, "positions", None) or (pdata if isinstance(pdata, list) else pdata.get("positions", []))
+        items = _positions_from_response(resp)
+        sym_up = symbol.upper()
         for p in items or []:
-            if p.get("symbol") == symbol:
-                return p
+            d = _as_plain_dict(p)
+            # symbol 키가 다를 가능성까지 방어
+            sym = (
+                d.get("symbol")
+                or d.get("s")
+                or getattr(p, "symbol", None)
+                or getattr(p, "pair", None)
+            )
+            if str(sym).upper() == sym_up:
+                return d
         return None
     except Exception as e:
+        # 반복 호출 루프에서 소음이 크다면 DEBUG로 낮추는 것도 고려
         logger.info("get_position failed: %s", e)
         return None
+    
+def _as_plain_dict(obj: Any) -> Dict[str, Any]:
+    """
+    SDK의 타이핑된 객체를 dict로 최대한 안전하게 변환.
+    - dict면 그대로 반환
+    - to_dict/as_dict/model_dump 있으면 호출
+    - __dict__ 사용 (private 제외)
+    - 마지막으로 dir()로 공개 속성 스냅샷
+    """
+    if isinstance(obj, dict):
+        return obj
+    for attr in ("to_dict", "as_dict"):
+        if hasattr(obj, attr):
+            try:
+                d = getattr(obj, attr)()
+                if isinstance(d, dict):
+                    return d
+            except Exception:
+                pass
+    if hasattr(obj, "model_dump"):  # pydantic v2 호환
+        try:
+            d = obj.model_dump()
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+    if hasattr(obj, "__dict__"):
+        try:
+            return {k: v for k, v in obj.__dict__.items() if not str(k).startswith("_")}
+        except Exception:
+            pass
+    # 최후의 수단: 공개 속성 나열
+    out: Dict[str, Any] = {}
+    try:
+        for k in dir(obj):
+            if k.startswith("_"):
+                continue
+            try:
+                v = getattr(obj, k)
+            except Exception:
+                continue
+            if callable(v):
+                continue
+            out[k] = v
+    except Exception:
+        pass
+    return out
+
+def _positions_from_response(resp: Any) -> List[Any]:
+    """
+    모듈형 SDK/REST 응답을 모두 수용:
+      - resp.data()가 객체/리스트/딕셔너리일 수 있음
+      - .positions 속성, {"positions": [...]} 형태, 리스트 직접 반환 모두 처리
+    """
+    data = resp.data() if hasattr(resp, "data") else resp
+    # 1) 객체 속성
+    if hasattr(data, "positions"):
+        try:
+            items = getattr(data, "positions")
+            if isinstance(items, (list, tuple)):
+                return list(items)
+        except Exception:
+            pass
+    # 2) 딕셔너리
+    if isinstance(data, dict):
+        items = data.get("positions")
+        if isinstance(items, list):
+            return items
+    # 3) 리스트 바로
+    if isinstance(data, list):
+        return data
+    # 4) 단일 객체가 올 수도 있음
+    return [data]
 
 
 __all__ = [

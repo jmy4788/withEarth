@@ -47,6 +47,22 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # =====================
+# Client bootstrap
+# =====================
+def _get_client() -> Optional["genai.Client"]:
+    if not _GENAI_OK:
+        return None
+    api_key = get_secret("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        logger.warning("GOOGLE_API_KEY not configured.")
+        return None
+    try:
+        return genai.Client(api_key=api_key)
+    except Exception as e:
+        logger.info("genai.Client init failed: %s", e)
+        return None
+
+# =====================
 # Debug helpers
 # =====================
 def _mk_debug_dir() -> str:
@@ -104,21 +120,6 @@ def _response_schema() -> "types.Schema":
         required=["direction", "prob"],
     )
 
-# =====================
-# Client bootstrap
-# =====================
-def _get_client() -> Optional["genai.Client"]:
-    if not _GENAI_OK:
-        return None
-    api_key = get_secret("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        logger.warning("GOOGLE_API_KEY not configured.")
-        return None
-    try:
-        return genai.Client(api_key=api_key)
-    except Exception as e:
-        logger.info("genai.Client init failed: %s", e)
-        return None
 
 # =====================
 # Response parsing utils
@@ -329,94 +330,98 @@ def _sanitize_decision(d: Dict[str, Any]) -> Dict[str, Any]:
 # Public API
 # =====================
 # --- predictor.py: top imports 주변에 추가 ---
-
-def get_gemini_prediction(payload: Dict[str, Any], symbol: Optional[str] = None) -> Dict[str, Any]:
+def get_gemini_prediction(payload: Dict[str, Any], symbol: str = "") -> Dict[str, Any]:
     """
-    payload -> Gemini 구조화 예측(JSON) 호출.
-    INFO 레벨로 아래 이벤트를 남긴다:
-      - gemini.request: {symbol, model, payload_hint, payload_preview}
-      - gemini.response: {symbol, prob, direction, support?, resistance?, entry?}
+    구조화 JSON 의사결정 반환.
+    - 우선 스키마 강제 호출(_cfg_json_schema)
+    - 실패 시 JSON/plain → 텍스트 후 수선 순으로 폴백
+    - Cloud Logging에 gemini.request / gemini.response 요약을 INFO로 남김
     """
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    api_key = os.getenv("GOOGLE_API_KEY") or ""
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY missing")
-
-    client = genai.Client(api_key=api_key)
-
-    # 요청 payload 파일 덤프(전문), Cloud Logging에는 요약만
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    date_dir = os.path.join(str(LOG_DIR), "payloads", ts[:8])
+    # 요청 요약 로그 (민감정보/대용량 방지)
     try:
-        os.makedirs(date_dir, exist_ok=True)
-    except Exception:
-        pass
-    try:
-        with open(os.path.join(date_dir, f"{ts}_{(symbol or payload.get('pair','UNK')).upper()}_request.json"), "w", encoding="utf-8") as f:
-            json.dump({"model": model, "payload": payload}, f, ensure_ascii=False, indent=2, default=str)
-    except Exception:
-        pass
-
-    # Cloud Logging 요약: payload_preview만 (민감정보/대용량 방지)
-    preview = {
-        "pair": payload.get("pair"),
-        "entry_5m": payload.get("entry_5m"),
-        "mtf_keys": sorted([k for k in (payload.get("extra") or {}).keys()])[:8],
-    }
-    log_event("gemini.request",
-              symbol=(symbol or payload.get("pair")),
-              model=model,
-              payload_hint="payloads/YYYYMMDD/*_request.json",
-              payload_preview=preview)
-
-    # 요청 구성 (기존 코드 패턴 유지; dict+JSON 직렬 사용)
-    contents = [
-        {
-            "role": "user",
-            "parts": [
-                {"mime_type": "application/json", "text": json.dumps(payload, ensure_ascii=False)}
-            ],
+        preview = {
+            "pair": payload.get("pair"),
+            "entry_5m": payload.get("entry_5m"),
+            "mtf_keys": sorted(list((payload.get("extra") or {}).keys()))[:8],
         }
-    ]
-    genconf = {
-        "temperature": float(os.getenv("G_TEMPERATURE", "0.0")),
-        "max_output_tokens": int(os.getenv("G_MAX_TOKENS", "512")),
-        "response_mime_type": "application/json",
-        # response_schema는 기존 코드 정의(객체 스키마) 사용
-        "response_schema": RESPONSE_SCHEMA,  # <- 기존 전역/상단 정의 사용
-        "system_instruction": SYSTEM_INSTRUCTION,  # <- 기존 전역/상단 정의 사용
-    }
-
-    try:
-        resp = client.models.generate_content(
-            model=model,
-            contents=contents,
-            generation_config=genconf,  # predictor 기존 스타일과 호환
+        log_event(
+            "gemini.request",
+            symbol=(symbol or payload.get("pair")),
+            model=MODEL,
+            payload_hint="payloads/YYYYMMDD/*_request.json",
+            payload_preview=preview,
         )
-        raw = resp.text if hasattr(resp, "text") else (resp.candidates[0].content.parts[0].text if getattr(resp, "candidates", None) else "{}")
-        data = json.loads(raw or "{}")
-    except Exception as e:
-        logger.info("gemini call failed: %s", e)
-        data = {}
-
-    # sanitize & RR 계산 등 기존 후처리
-    decision = _sanitize_decision(data)
-    try:
-        with open(os.path.join(date_dir, f"{ts}_{(symbol or payload.get('pair','UNK')).upper()}_decision.json"), "w", encoding="utf-8") as f:
-            json.dump(decision, f, ensure_ascii=False, indent=2, default=str)
     except Exception:
         pass
 
-    # Cloud Logging: 응답 요약
-    log_event(
-        "gemini.response",
-        symbol=(symbol or payload.get("pair")),
-        direction=decision.get("direction"),
-        prob=float(decision.get("prob", 0.0)),
-        support=decision.get("support"),
-        resistance=decision.get("resistance"),
-        entry=payload.get("entry_5m"),
-    )
+    # 디버그 덤프(파일): 전체 payload는 여기로
+    _dump_debug(f"{symbol or 'unknown'}_payload", {"payload": payload, "model": MODEL})
+
+    client = _get_client()
+    if client is None:
+        decision = {"direction": "hold", "prob": 0.5, "reasoning": "client_unavailable"}
+        _dump_debug(f"{symbol or 'unknown'}_decision", decision)
+        # 응답 요약 로그
+        log_event(
+            "gemini.response",
+            symbol=(symbol or payload.get("pair")),
+            direction=decision.get("direction"),
+            prob=float(decision.get("prob", 0.0)),
+            support=None,
+            resistance=None,
+            entry=(payload.get("entry_5m") or {}).get("close"),
+        )
+        return decision
+
+    # 1) 스키마 강제 호출
+    d: Dict[str, Any] = {}
+    try:
+        d = _generate_with_schema(client, payload)  # 내부에서 config=_cfg_json_schema() 사용
+    except Exception as e:
+        logging.getLogger(__name__).info("schema gen failed: %s", e)
+
+    # 2) JSON/plain 폴백
+    if not d:
+        try:
+            d = _generate_json_plain(client, payload)  # config=_cfg_json_plain()
+        except Exception as e:
+            logging.getLogger(__name__).info("json/plain gen failed: %s", e)
+
+    # 3) 텍스트+파서 폴백
+    if not d:
+        try:
+            mini = (
+                "Return ONLY one JSON object with keys: direction, prob, support, resistance, reasoning.\n"
+                "direction ∈ {long, short, hold}; prob ∈ [0,1].\n"
+                f"DATA: {json.dumps(payload, ensure_ascii=False)}"
+            )
+            d = _generate_text_then_parse(client, mini)  # config=_cfg_text_plain()
+        except Exception as e:
+            logging.getLogger(__name__).info("text/plain gen failed: %s", e)
+
+    # 4) 모델로 수선
+    if not isinstance(d, dict) or "direction" not in d or "prob" not in d:
+        try:
+            d = _repair_via_model(client, d if isinstance(d, dict) else {"raw": str(d)})
+        except Exception as e:
+            logging.getLogger(__name__).info("repair failed: %s", e)
+
+    decision = _sanitize_decision(d)
+    _dump_debug(f"{symbol or 'unknown'}_decision", decision)
+
+    # 응답 요약 로그
+    try:
+        log_event(
+            "gemini.response",
+            symbol=(symbol or payload.get("pair")),
+            direction=decision.get("direction"),
+            prob=float(decision.get("prob", 0.0)),
+            support=decision.get("support"),
+            resistance=decision.get("resistance"),
+            entry=(payload.get("entry_5m") or {}).get("close"),
+        )
+    except Exception:
+        pass
 
     return decision
 

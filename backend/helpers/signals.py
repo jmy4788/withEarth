@@ -483,7 +483,7 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
 
     # 가격 및 RR 계산 (기존 로직과 동일하게 해석)
     direction = str(res.get("direction") or "").lower()
-    entry = float(res.get("entry") or payload.get("entry_5m") or 0.0)
+    entry = float(res.get("entry") or (payload.get("entry_5m") or {}).get("close") or 0.0)
     tp = float(res.get("tp") or 0.0)
     sl = float(res.get("sl") or 0.0)
     prob = float(res.get("prob", 0.0))
