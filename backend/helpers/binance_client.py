@@ -470,7 +470,8 @@ def place_market_order(symbol: str, side: str, quantity: float, reduce_only: boo
     log_event("binance.order.request", **payload)
     try:
         resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
-        data = resp.data() if hasattr(resp, "data") else resp
+        raw = resp.data() if hasattr(resp, "data") else resp
+        data = _to_plain(raw)
         log_event("binance.order.response",
                   symbol=symbol, side=side, type="MARKET",
                   orderId=(data.get("orderId") if isinstance(data, dict) else None),
@@ -478,7 +479,7 @@ def place_market_order(symbol: str, side: str, quantity: float, reduce_only: boo
                   price=(data.get("avgPrice") or data.get("price") if isinstance(data, dict) else None),
                   qty=(data.get("executedQty") or data.get("origQty") if isinstance(data, dict) else None),
                   raw=data)
-        return data
+        return data if isinstance(data, dict) else {"raw": data}
     except Exception as e:
         logger.error("place_market_order error: %s", e)
         raise
@@ -505,7 +506,8 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float, tim
     log_event("binance.order.request", **payload)
     try:
         resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
-        data = resp.data() if hasattr(resp, "data") else resp
+        raw = resp.data() if hasattr(resp, "data") else resp
+        data = _to_plain(raw)
         log_event("binance.order.response",
                   symbol=symbol, side=side, type="LIMIT",
                   orderId=(data.get("orderId") if isinstance(data, dict) else None),
@@ -513,7 +515,7 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float, tim
                   price=(data.get("price") if isinstance(data, dict) else None),
                   qty=(data.get("executedQty") or data.get("origQty") if isinstance(data, dict) else None),
                   raw=data)
-        return data
+        return data if isinstance(data, dict) else {"raw": data}
     except Exception as e:
         logger.error("place_limit_order error: %s", e)
         if _LIMIT_FAILOVER_TO_MARKET:
@@ -522,7 +524,6 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float, tim
         raise
 
 def place_take_profit(symbol: str, opp_side: str, quantity: float, tp_price: float, order_type: str = "LIMIT") -> Dict[str, Any]:
-    """TP: LIMIT → TAKE_PROFIT(price+stop_price), MARKET → TAKE_PROFIT_MARKET(stop_price)"""
     client = _get_client()
     ps = _position_side()
     order_type = (order_type or _TP_ORDER_TYPE).upper()
@@ -554,7 +555,9 @@ def place_take_profit(symbol: str, opp_side: str, quantity: float, tp_price: flo
         }
     log_event("binance.order.request", **tp_payload)
     resp = _call(client.rest_api, ["new_order", "newOrder"], **tp_payload)
-    return resp.data() if hasattr(resp, "data") else resp
+    raw = resp.data() if hasattr(resp, "data") else resp
+    data = _to_plain(raw)
+    return data if isinstance(data, dict) else {"raw": data}
 
 def place_stop_market(symbol: str, opp_side: str, quantity: float, sl_price: float) -> Dict[str, Any]:
     client = _get_client()
@@ -571,7 +574,9 @@ def place_stop_market(symbol: str, opp_side: str, quantity: float, sl_price: flo
     }
     log_event("binance.order.request", **sl_payload)
     sl_resp = _call(client.rest_api, ["new_order", "newOrder"], **sl_payload)
-    return sl_resp.data() if hasattr(sl_resp, "data") else sl_resp
+    raw = sl_resp.data() if hasattr(sl_resp, "data") else sl_resp
+    data = _to_plain(raw)
+    return data if isinstance(data, dict) else {"raw": data}
 
 def place_bracket_orders(symbol: str, side: str, quantity: float, take_profit: float, stop_loss: float) -> Dict[str, Any]:
     """엔트리 직후 브래킷(RO) 생성: TP(LIMIT|MARKET), SL(STOP_MARKET)"""
@@ -587,23 +592,25 @@ def place_bracket_orders(symbol: str, side: str, quantity: float, take_profit: f
     out: Dict[str, Any] = {"take_profit": None, "stop_loss": None}
     try:
         tp_data = place_take_profit(symbol, opp, qty_q, tp_price, order_type=_TP_ORDER_TYPE)
+        tp_plain = _to_plain(tp_data)
         log_event("binance.order.response",
                   symbol=symbol, side=opp, type=("TAKE_PROFIT_MARKET" if _TP_ORDER_TYPE=="MARKET" else "TAKE_PROFIT"),
-                  orderId=(tp_data.get("orderId") if isinstance(tp_data, dict) else None),
-                  status=(tp_data.get("status") if isinstance(tp_data, dict) else None),
-                  price=tp_price, qty=qty_q, raw=tp_data)
-        out["take_profit"] = tp_data
+                  orderId=(tp_plain.get("orderId") if isinstance(tp_plain, dict) else None),
+                  status=(tp_plain.get("status") if isinstance(tp_plain, dict) else None),
+                  price=tp_price, qty=qty_q, raw=tp_plain)
+        out["take_profit"] = tp_plain if isinstance(tp_plain, dict) else {"raw": tp_plain}
     except Exception as e:
         logger.info("place_bracket_orders TP failed: %s", e)
 
     try:
         sl_data = place_stop_market(symbol, opp, qty_q, sl_price)
+        sl_plain = _to_plain(sl_data)
         log_event("binance.order.response",
                   symbol=symbol, side=opp, type="STOP_MARKET",
-                  orderId=(sl_data.get("orderId") if isinstance(sl_data, dict) else None),
-                  status=(sl_data.get("status") if isinstance(sl_data, dict) else None),
-                  price=None, qty=qty_q, raw=sl_data)
-        out["stop_loss"] = sl_data
+                  orderId=(sl_plain.get("orderId") if isinstance(sl_plain, dict) else None),
+                  status=(sl_plain.get("status") if isinstance(sl_plain, dict) else None),
+                  price=None, qty=qty_q, raw=sl_plain)
+        out["stop_loss"] = sl_plain if isinstance(sl_plain, dict) else {"raw": sl_plain}
     except Exception as e:
         logger.info("place_bracket_orders SL failed: %s", e)
 
@@ -612,7 +619,8 @@ def place_bracket_orders(symbol: str, side: str, quantity: float, take_profit: f
 def build_entry_and_brackets(symbol: str, side: str, quantity: float, target_price: float, stop_price: float) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     entry = place_market_order(symbol, side, quantity)
     bracket = place_bracket_orders(symbol, side, quantity, target_price, stop_price)
-    return entry, bracket
+    return (_to_plain(entry) if entry is not None else None,
+            _to_plain(bracket) if bracket is not None else None)
 
 # ==================
 # Readbacks
@@ -689,6 +697,27 @@ def _as_plain_dict(obj: Any) -> Dict[str, Any]:
     except Exception:
         pass
     return out
+
+def _to_plain(obj):
+    """Binance SDK 응답 객체(Pydantic 등)를 JSON-가능한 순수 구조로 재귀 변환"""
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(x) for x in obj]
+    # pydantic BaseModel 호환
+    for attr in ("model_dump", "dict"):
+        if hasattr(obj, attr):
+            try:
+                return _to_plain(getattr(obj, attr)())
+            except Exception:
+                pass
+    # 일반 객체
+    if hasattr(obj, "__dict__"):
+        try:
+            return {k: _to_plain(v) for k, v in obj.__dict__.items() if not str(k).startswith("_")}
+        except Exception:
+            pass
+    return obj
 
 def _positions_from_response(resp: Any) -> List[Any]:
     data = resp.data() if hasattr(resp, "data") else resp

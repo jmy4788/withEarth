@@ -152,15 +152,43 @@ except Exception as e:
 # -----------------------------
 # Utilities
 # -----------------------------
+def _plainify(o):
+    """모든 객체를 JSON-가능한 구조로 재귀 변환"""
+    if isinstance(o, dict):
+        return {k: _plainify(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_plainify(x) for x in o]
+    # pydantic BaseModel 호환
+    for attr in ("model_dump", "dict"):
+        if hasattr(o, attr):
+            try:
+                return _plainify(getattr(o, attr)())
+            except Exception:
+                pass
+    # dataclass
+    try:
+        from dataclasses import is_dataclass, asdict
+        if is_dataclass(o):
+            return _plainify(asdict(o))
+    except Exception:
+        pass
+    # 일반 객체
+    if hasattr(o, "__dict__"):
+        try:
+            return {k: _plainify(v) for k, v in o.__dict__.items() if not str(k).startswith("_")}
+        except Exception:
+            pass
+    return o
+
 def _json_ok(**kwargs):
     resp = {"status": "ok"}
     resp.update(kwargs)
-    return jsonify(resp)
+    return jsonify(_plainify(resp))
 
 def _json_err(msg: str, **kwargs):
     resp = {"status": "error", "message": msg}
     resp.update(kwargs)
-    return jsonify(resp), 400
+    return jsonify(_plainify(resp)), 400
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
