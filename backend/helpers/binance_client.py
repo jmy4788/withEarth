@@ -1,44 +1,38 @@
 from __future__ import annotations
-
 """
-helpers/binance_client.py – refactor #2 (2025-08-12, KST)
+helpers/binance_client.py – refactor #3 (2025-08-18, KST)
 
 Target SDK: binance-sdk-derivatives-trading-usds-futures==1.0.0
 Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info
-Repo path for this SDK family: binance-connector-python/clients/derivatives_trading_usds_futures
 
-이 모듈은 USDⓈ-M Futures 모듈형 SDK를 래핑합니다.
-
-핵심 기능
-- 프로덕션/테스트넷 스위치 및 타임아웃/재시도/백오프 설정
+핵심
+- 모듈형 SDK 래핑(호출명 가드)
 - 심볼 필터 기반 가격/수량 정규화(tickSize/stepSize/minNotional)
-- 계정 설정(포지션 모드/마진 타입/레버리지) 및 전체취소
-- 마켓/리밋/브래킷(RO TP/SL) 주문 유틸
-- 대시보드용 오버뷰(잔고/포지션) 조회
-
-디자인 메모
-- 모듈형 SDK는 자동생성 특성상 버전에 따라 메서드명이 달라질 수 있습니다.
-  _call()에서 복수 후보를 시도해 1.0.0~1.x 사이 호환성을 높였습니다.
-- 반환값은 JSON 직렬화 가능한 dict/list 위주로 통일했습니다(특히 get_overview()).
+- 계정 설정(포지션 모드/마진/레버리지)
+- 주문: MARKET/LIMIT/브래킷(TP=LIMIT|MARKET, SL=STOP_MARKET)
+- **부분 취소**: 개별 주문 취소(cancel_order), 타입별 일괄 취소(cancel_orders_by_type)
+- **tickSize 엄격화**: 사이드별 라운딩 + Decimal.quantize(문자열 자리 고정)
+- 리밋 실패 시(옵션) 마켓 폴백을 위한 보조
 """
 
 import logging
 import os
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 # ---- Optional utils integration ------------------------------------------------
-try:  # 프로젝트 utils 우선 사용
+try:
     from .utils import get_secret, log_event  # type: ignore
 except Exception:  # pragma: no cover
     def get_secret(name: str) -> Optional[str]:  # 최소 폴백
         return os.getenv(name)
+    def log_event(*args, **kwargs):
+        pass
 
 # ---- Binance SDK (modular) -----------------------------------------------------
-# pip install binance-sdk-derivatives-trading-usds-futures==1.0.0
 from binance_common.configuration import ConfigurationRestAPI
 from binance_common.constants import (
     DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL,
@@ -48,12 +42,11 @@ from binance_sdk_derivatives_trading_usds_futures.derivatives_trading_usds_futur
     DerivativesTradingUsdsFutures,
 )
 
-# --------------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # =============================
-# Client bootstrap & utilities
+# Env
 # =============================
 _api_key = get_secret("BINANCE_API_KEY") or os.getenv("BINANCE_API_KEY")
 _api_secret = get_secret("BINANCE_API_SECRET") or os.getenv("BINANCE_API_SECRET")
@@ -66,10 +59,14 @@ _BASE_PATH = (
     if _USE_TESTNET
     else DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
 )
-
 _TIMEOUT_MS = int(os.getenv("BINANCE_HTTP_TIMEOUT_MS", "10000"))
 _RETRIES = int(os.getenv("BINANCE_HTTP_RETRIES", "3"))
 _BACKOFF_MS = int(os.getenv("BINANCE_HTTP_BACKOFF_MS", "1000"))
+
+# TP order type (LIMIT | MARKET)
+_TP_ORDER_TYPE = os.getenv("TP_ORDER_TYPE", "LIMIT").strip().upper()
+# limit error fallback to market
+_LIMIT_FAILOVER_TO_MARKET = str(os.getenv("LIMIT_FAILOVER_TO_MARKET", "true")).lower() in ("1", "true", "yes")
 
 _config = ConfigurationRestAPI(
     api_key=_api_key or "",
@@ -83,21 +80,18 @@ _client: Optional[DerivativesTradingUsdsFutures] = None
 
 
 def _get_client() -> DerivativesTradingUsdsFutures:
-    """내부 전용: 싱글톤 클라이언트 생성/반환."""
     global _client
     if _client is None:
         _client = DerivativesTradingUsdsFutures(config_rest_api=_config)
         logger.info(
             "Binance config initialized: base_path=%s, api_key_set=%s",
-            _BASE_PATH,
-            bool(_api_key),
+            _BASE_PATH, bool(_api_key),
         )
         logger.info("Binance client initialized successfully.")
     return _client
 
 
 def get_client() -> DerivativesTradingUsdsFutures:
-    """외부용 액세서(예: data_fetch에서 사용)."""
     return _get_client()
 
 
@@ -105,73 +99,52 @@ def get_client() -> DerivativesTradingUsdsFutures:
 # Call helpers
 # ===============
 def _pick(obj: Any, names: List[str]) -> Optional[Any]:
-    """여러 후보 메서드명 중 사용 가능한 첫 번째를 선택."""
     for n in names:
         fn = getattr(obj, n, None)
         if callable(fn):
             return fn
     return None
 
-
 def _call(obj: Any, cand_names: List[str], /, **kwargs):
-    """_pick으로 찾은 메서드를 호출. 실패 시 AttributeError."""
     fn = _pick(obj, cand_names)
     if not fn:
         raise AttributeError(f"None of {cand_names} available on {type(obj).__name__}")
     return fn(**kwargs)
-
-def get_open_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-    client = _get_client()
-    try:
-        if symbol:
-            r = _call(client.rest_api, ["open_orders", "openOrders"], symbol=symbol)
-        else:
-            r = _call(client.rest_api, ["open_orders", "openOrders"])
-        data = r.data() if hasattr(r, "data") else r
-        if isinstance(data, list):
-            return data
-        return data.get("orders", []) if isinstance(data, dict) else []
-    except Exception as e:
-        logger.error("get_open_orders error: %s", e)
-        return []
-
-
 
 # ==================================
 # Exchange info + symbol filter util
 # ==================================
 _symbol_filters_cache: Dict[str, Dict[str, Any]] = {}
 
-
 def _to_decimal(x: Any) -> Decimal:
     return x if isinstance(x, Decimal) else Decimal(str(x))
 
-
 def round_to_step(value: Decimal, step: Decimal) -> Decimal:
-    """Binance 규칙상 올림 금지 → step 배수로 내림."""
     if step <= 0:
         return value
     q = (value / step).to_integral_value(rounding=ROUND_DOWN)
     return q * step
 
+def round_up_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    q = (value / step).to_integral_value(rounding=ROUND_UP)
+    return q * step
 
 def load_symbol_filters(symbol: str) -> Dict[str, Any]:
-    """심볼 필터 로딩: {tickSize, stepSize, minQty, maxQty, minNotional, raw} (캐시 포함)."""
+    """심볼 필터: {tickSize, stepSize, minQty, maxQty, minNotional, raw}"""
     symbol = symbol.upper()
     if symbol in _symbol_filters_cache:
         return _symbol_filters_cache[symbol]
 
     client = _get_client()
-    resp = _call(client.rest_api, ["exchange_information", "exchangeInformation"])  # SDK naming guard
+    resp = _call(client.rest_api, ["exchange_information", "exchangeInformation"])
     data = resp.data() if hasattr(resp, "data") else resp
 
     def to_dict(obj):
-        if isinstance(obj, dict):
-            return obj
-        if hasattr(obj, "model_dump"):  # pydantic v2
-            return obj.model_dump()
-        if hasattr(obj, "dict"):        # pydantic v1
-            return obj.dict()
+        if isinstance(obj, dict): return obj
+        if hasattr(obj, "model_dump"): return obj.model_dump()
+        if hasattr(obj, "dict"): return obj.dict()
         return obj
 
     def val(obj, key, default=None):
@@ -195,7 +168,6 @@ def load_symbol_filters(symbol: str) -> Dict[str, Any]:
         raise ValueError(f"Symbol {symbol} not found in exchange info")
 
     f_list = to_dict(found).get("filters") or getattr(found, "filters", []) or []
-
     fmap: Dict[str, Any] = {}
     for f in (f_list or []):
         fd = to_dict(f)
@@ -224,9 +196,15 @@ def load_symbol_filters(symbol: str) -> Dict[str, Any]:
     _symbol_filters_cache[symbol] = result
     return result
 
+def _format_to_tick_str(symbol: str, price: float) -> str:
+    """Decimal.quantize로 tick 자리 고정 문자열 반환"""
+    f = load_symbol_filters(symbol)
+    tick: Decimal = f["tickSize"]
+    p = _to_decimal(price).quantize(tick, rounding=ROUND_DOWN)
+    # 문자열 끝 0/소수점 유지(서버 파싱에 안전)
+    return format(p, 'f')
 
 def ensure_min_notional(symbol: str, qty: float, price: float, filters: Optional[Dict[str, Any]] = None) -> float:
-    """최소 명목가치(minNotional)와 수량 스텝(stepSize)을 만족하도록 수량을 보정."""
     filters = filters or load_symbol_filters(symbol)
     step: Decimal = filters["stepSize"]
     min_notional: Decimal = filters["minNotional"]
@@ -239,13 +217,22 @@ def ensure_min_notional(symbol: str, qty: float, price: float, filters: Optional
         q = round_to_step(need, step)
     return float(max(q, step))
 
-
 def normalize_price_with_mode(symbol: str, price: float) -> float:
-    """tickSize에 맞춰 가격을 내림 정규화."""
+    """(호환) tickSize 내림"""
     filters = load_symbol_filters(symbol)
     tick: Decimal = filters["tickSize"]
     return float(round_to_step(_to_decimal(price), tick))
 
+def normalize_price_for_side(symbol: str, price: float, side: str) -> float:
+    """BUY는 내림(더 보수적), SELL은 올림(증분 미충족 방지)"""
+    filters = load_symbol_filters(symbol)
+    tick: Decimal = filters["tickSize"]
+    v = _to_decimal(price)
+    if str(side).upper() == "SELL":
+        vq = round_up_to_step(v, tick)
+    else:
+        vq = round_to_step(v, tick)
+    return float(vq)
 
 # ==========================
 # Account & overview helpers
@@ -256,18 +243,8 @@ def _df_safe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
 def get_overview() -> Dict[str, List[Dict[str, Any]]]:
-    """
-    대시보드용 오버뷰를 반환합니다(JSON 직렬화 가능).
-    {
-      "balances": [{"asset":"USDT","balance":123.4,"unrealizedPnL":0.0}, ...],
-      "positions": [{"symbol":"BTCUSDT","positionAmt":0.01,"entryPrice":..., ...}, ...]
-    }
-    """
     client = _get_client()
-
-    # balances
     balances: List[Dict[str, Any]] = []
     try:
         acct = _call(
@@ -293,7 +270,6 @@ def get_overview() -> Dict[str, List[Dict[str, Any]]]:
     except Exception as e:
         logger.info("overview balances fetch failed: %s", e)
 
-    # positions
     positions: List[Dict[str, Any]] = []
     try:
         pos = _call(
@@ -326,12 +302,10 @@ def get_overview() -> Dict[str, List[Dict[str, Any]]]:
 
     return {"balances": balances, "positions": positions}
 
-
 # ==================
 # Account mutators
 # ==================
 def cancel_open_orders(symbol: str) -> Dict[str, Any]:
-    """DELETE /fapi/v1/allOpenOrders — 심볼 내 미체결 전량 취소."""
     client = _get_client()
     resp = _call(client.rest_api, ["cancel_all_open_orders", "cancelAllOpenOrders"], symbol=symbol)
     data = resp.data() if hasattr(resp, "data") else resp
@@ -340,9 +314,44 @@ def cancel_open_orders(symbol: str) -> Dict[str, Any]:
     logger.info("Bulk-cancel %s: code=%s msg=%r additional_properties=%s", symbol, code or "", msg, getattr(resp, "additional_properties", {}))
     return data if isinstance(data, dict) else {"code": code, "msg": msg}
 
+def cancel_order(symbol: str, order_id: Optional[int] = None, orig_client_order_id: Optional[str] = None) -> Dict[str, Any]:
+    """개별 주문 취소"""
+    client = _get_client()
+    kwargs: Dict[str, Any] = {"symbol": symbol}
+    if order_id is not None:
+        kwargs["order_id"] = int(order_id)
+    if orig_client_order_id:
+        kwargs["orig_client_order_id"] = orig_client_order_id
+    try:
+        resp = _call(client.rest_api,
+                     ["cancel_order", "cancelOrder", "cancel_specific_order", "cancelSpecificOrder"],
+                     **kwargs)
+        data = resp.data() if hasattr(resp, "data") else resp
+        return data if isinstance(data, dict) else {"raw": data}
+    except Exception as e:
+        logger.info("cancel_order failed for %s: %s", symbol, e)
+        return {}
+
+def cancel_orders_by_type(symbol: str, types: List[str]) -> int:
+    """열린 주문 중 특정 타입(TAKE_PROFIT, STOP, STOP_MARKET 등)만 취소"""
+    typesU = {t.upper() for t in types}
+    cnt = 0
+    try:
+        orders = get_open_orders(symbol)
+    except Exception:
+        orders = []
+    for o in orders or []:
+        t = str((o.get("type") if isinstance(o, dict) else getattr(o, "type", "")) or "").upper()
+        oid = o.get("orderId") if isinstance(o, dict) else getattr(o, "orderId", None)
+        if t in typesU and oid is not None:
+            try:
+                cancel_order(symbol, order_id=int(oid))
+                cnt += 1
+            except Exception:
+                pass
+    return cnt
 
 def set_position_mode(mode: str = "ONEWAY") -> None:
-    """POST /fapi/v1/positionSide/dual — dualSidePosition=true → HEDGE, false → ONEWAY."""
     client = _get_client()
     mode = (mode or "").upper()
     dual = True if mode == "HEDGE" else False
@@ -354,47 +363,39 @@ def set_position_mode(mode: str = "ONEWAY") -> None:
         )
         logger.info("Position mode set to %s", mode)
     except Exception as e:
-        logger.error("Position mode set error: %s", getattr(e, "message", str(e)))
-
+        msg = str(getattr(e, "message", str(e)))
+        if "no need to change" in msg.lower():
+            logger.info("Position mode already %s", mode)
+        else:
+            logger.error("Position mode set error: %s", msg)
 
 def set_margin_type(symbol: str, margin_type: str = "ISOLATED") -> None:
-    """POST /fapi/v1/marginType — 심볼별 교차/격리."""
     client = _get_client()
     mt = (margin_type or "").upper()
     try:
         _call(client.rest_api, ["change_margin_type", "changeMarginType"], symbol=symbol, margin_type=mt)
         logger.info("Margin type set to %s for %s", mt, symbol)
     except Exception as e:
-        logger.error("Margin type set error: %s", getattr(e, "message", str(e)))
-
+        msg = str(getattr(e, "message", str(e)))
+        if "no need to change" in msg.lower():
+            logger.info("Margin type already %s for %s", mt, symbol)
+        else:
+            logger.error("Margin type set error: %s", msg)
 
 def set_leverage(symbol: str, leverage: int) -> None:
-    """POST /fapi/v1/leverage — 심볼별 레버리지."""
     client = _get_client()
     try:
-        resp = _call(
-            client.rest_api,
-            ["change_initial_leverage", "changeInitialLeverage"],
-            symbol=symbol,
-            leverage=int(leverage),
-        )
+        resp = _call(client.rest_api, ["change_initial_leverage", "changeInitialLeverage"], symbol=symbol, leverage=int(leverage))
         data = resp.data() if hasattr(resp, "data") else resp
         logger.info("Leverage set to %sx for %s: %s", leverage, symbol, data)
     except Exception as e:
         logger.error("Leverage set error: %s", getattr(e, "message", str(e)))
 
-
 # ==================
 # Order placement
 # ==================
 def _position_side() -> str:
-    """
-    포지션 사이드 파라미터.
-    - ONEWAY 모드에선 생략 가능하지만 BOTH 사용이 무난.
-    - HEDGE 모드에서는 BUY/SELL 구분하여 LONG/SHORT 지정할 수도 있음(여기선 BOTH 유지).
-    """
     return os.getenv("POSITION_SIDE", "BOTH").upper()
-
 
 def _last_price(symbol: str) -> float:
     client = _get_client()
@@ -429,23 +430,19 @@ def _last_price(symbol: str) -> float:
         pass
     return 0.0
 
+def get_last_price(symbol: str) -> float:
+    """외부 공개"""
+    return _last_price(symbol)
 
 def _quantize_qty(symbol: str, qty: float, at_price: float) -> float:
-    """수량을 stepSize 및 minNotional에 맞춰 보정."""
     f = load_symbol_filters(symbol)
     return ensure_min_notional(symbol, qty, price=at_price, filters=f)
 
 def place_market_order(symbol: str, side: str, quantity: float, reduce_only: bool = False) -> Dict[str, Any]:
-    """
-    마켓 주문(BUY/SELL).
-    - reduce_only: True면 청산 전용
-    - position_side=BOTH (원웨이)
-    """
     client = _get_client()
     side = side.upper()
     ps = _position_side()
 
-    # 수량 정규화
     try:
         ref = _last_price(symbol)
     except Exception:
@@ -470,14 +467,10 @@ def place_market_order(symbol: str, side: str, quantity: float, reduce_only: boo
         "reduce_only": bool(reduce_only),
         "position_side": ps,
     }
-
-    # INFO: 주문 요청
     log_event("binance.order.request", **payload)
-
     try:
         resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
         data = resp.data() if hasattr(resp, "data") else resp
-        # INFO: 주문 응답
         log_event("binance.order.response",
                   symbol=symbol, side=side, type="MARKET",
                   orderId=(data.get("orderId") if isinstance(data, dict) else None),
@@ -490,24 +483,12 @@ def place_market_order(symbol: str, side: str, quantity: float, reduce_only: boo
         logger.error("place_market_order error: %s", e)
         raise
 
-def place_limit_order(
-    symbol: str,
-    side: str,
-    quantity: float,
-    price: float,
-    time_in_force: str = "GTC",
-    reduce_only: bool = False,
-) -> Dict[str, Any]:
-    """
-    리밋 주문.
-    - 가격 tickSize 내림 정규화
-    - 수량 stepSize/minNotional 충족
-    """
+def place_limit_order(symbol: str, side: str, quantity: float, price: float, time_in_force: str = "GTC", reduce_only: bool = False) -> Dict[str, Any]:
     client = _get_client()
     side = side.upper()
     ps = _position_side()
 
-    px = normalize_price_with_mode(symbol, price)
+    px = normalize_price_for_side(symbol, price, side)
     q = _quantize_qty(symbol, quantity, at_price=px)
 
     payload = {
@@ -515,166 +496,164 @@ def place_limit_order(
         "side": side,
         "type": "LIMIT",
         "time_in_force": time_in_force,
-        "price": str(px),
+        "price": _format_to_tick_str(symbol, px),
         "quantity": str(q),
         "reduce_only": bool(reduce_only),
         "position_side": ps,
     }
 
-    # INFO: 주문 요청
     log_event("binance.order.request", **payload)
     try:
         resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
         data = resp.data() if hasattr(resp, "data") else resp
-        # INFO: 주문 응답
         log_event("binance.order.response",
-                    symbol=symbol, side=side, type="LIMIT",
-                    orderId=(data.get("orderId") if isinstance(data, dict) else None),
-                    status=(data.get("status") if isinstance(data, dict) else None),
-                    price=(data.get("price") if isinstance(data, dict) else None),
-                    qty=(data.get("executedQty") or data.get("origQty") if isinstance(data, dict) else None),
-                    raw=data)
+                  symbol=symbol, side=side, type="LIMIT",
+                  orderId=(data.get("orderId") if isinstance(data, dict) else None),
+                  status=(data.get("status") if isinstance(data, dict) else None),
+                  price=(data.get("price") if isinstance(data, dict) else None),
+                  qty=(data.get("executedQty") or data.get("origQty") if isinstance(data, dict) else None),
+                  raw=data)
         return data
-    except Exception as e: # <-- 이 부분이 `try`와 동일한 수준으로 들여쓰기되었습니다.
-        logger.error("place_limit_order error: %s", e)
-        raise
-# helpers/binance_client.py
-
-def place_bracket_orders(
-    symbol: str,
-    side: str,            # 엔트리 방향 (BUY=롱, SELL=숏)
-    quantity: float,      # 체결 수량(신규 포지션 수량)
-    take_profit: float,   # TP 레벨(가격)
-    stop_loss: float,     # SL 레벨(가격)
-) -> Dict[str, Any]:
-    """
-    엔트리 직후 브래킷(리듀스온리) 생성.
-      - TP: TAKE_PROFIT (LIMIT)
-      - SL: STOP_MARKET
-    """
-    client = _get_client()
-    side = side.upper()
-    opp = "SELL" if side == "BUY" else "BUY"
-    ps = _position_side()
-
-    tp_price = normalize_price_with_mode(symbol, float(take_profit))
-    sl_price = normalize_price_with_mode(symbol, float(stop_loss))
-
-    f = load_symbol_filters(symbol)
-    qty_q = ensure_min_notional(symbol, float(quantity), price=tp_price, filters=f)
-
-    out: Dict[str, Any] = {"take_profit": None, "stop_loss": None}
-
-    # TAKE_PROFIT (LIMIT) — 트리거 + 지정가
-    tp_payload = {
-        "symbol": symbol,
-        "side": opp,  # 포지션 축소
-        "type": "TAKE_PROFIT",
-        "time_in_force": "GTC",
-        "price": str(tp_price),
-        "quantity": str(qty_q),
-        "stop_price": str(tp_price),
-        "working_type": "MARK_PRICE",
-        "reduce_only": True,
-        "position_side": ps,
-    }
-    log_event("binance.order.request", **tp_payload)
-    try:
-        tp_resp = _call(client.rest_api, ["new_order", "newOrder"], **tp_payload)
-        tp_data = tp_resp.data() if hasattr(tp_resp, "data") else tp_resp
-        log_event("binance.order.response",
-                  symbol=symbol, side=opp, type="TAKE_PROFIT",
-                  orderId=(tp_data.get("orderId") if isinstance(tp_data, dict) else None),
-                  status=(tp_data.get("status") if isinstance(tp_data, dict) else None),
-                  price=tp_payload["price"], qty=tp_payload["quantity"],
-                  raw=tp_data)
-        out["take_profit"] = tp_data
     except Exception as e:
-        logger.info("place_bracket_orders TP failed: %s", e)
+        logger.error("place_limit_order error: %s", e)
+        if _LIMIT_FAILOVER_TO_MARKET:
+            logger.info("Falling back to MARKET due to limit error for %s: %s", symbol, e)
+            return place_market_order(symbol, side, quantity, reduce_only=reduce_only)
+        raise
 
-    # STOP_MARKET
+def place_take_profit(symbol: str, opp_side: str, quantity: float, tp_price: float, order_type: str = "LIMIT") -> Dict[str, Any]:
+    """TP: LIMIT → TAKE_PROFIT(price+stop_price), MARKET → TAKE_PROFIT_MARKET(stop_price)"""
+    client = _get_client()
+    ps = _position_side()
+    order_type = (order_type or _TP_ORDER_TYPE).upper()
+
+    if order_type == "MARKET":
+        tp_payload = {
+            "symbol": symbol,
+            "side": opp_side,
+            "type": "TAKE_PROFIT_MARKET",
+            "stop_price": _format_to_tick_str(symbol, tp_price),
+            "working_type": "MARK_PRICE",
+            "quantity": str(quantity),
+            "reduce_only": True,
+            "position_side": ps,
+        }
+    else:
+        tp_p = normalize_price_for_side(symbol, tp_price, opp_side)
+        tp_payload = {
+            "symbol": symbol,
+            "side": opp_side,
+            "type": "TAKE_PROFIT",
+            "time_in_force": "GTC",
+            "price": _format_to_tick_str(symbol, tp_p),
+            "quantity": str(quantity),
+            "stop_price": _format_to_tick_str(symbol, tp_p),
+            "working_type": "MARK_PRICE",
+            "reduce_only": True,
+            "position_side": ps,
+        }
+    log_event("binance.order.request", **tp_payload)
+    resp = _call(client.rest_api, ["new_order", "newOrder"], **tp_payload)
+    return resp.data() if hasattr(resp, "data") else resp
+
+def place_stop_market(symbol: str, opp_side: str, quantity: float, sl_price: float) -> Dict[str, Any]:
+    client = _get_client()
+    ps = _position_side()
     sl_payload = {
         "symbol": symbol,
-        "side": opp,
+        "side": opp_side,
         "type": "STOP_MARKET",
-        "stop_price": str(sl_price),
+        "stop_price": _format_to_tick_str(symbol, sl_price),
         "working_type": "MARK_PRICE",
-        "quantity": str(qty_q),
+        "quantity": str(quantity),
         "reduce_only": True,
         "position_side": ps,
     }
     log_event("binance.order.request", **sl_payload)
+    sl_resp = _call(client.rest_api, ["new_order", "newOrder"], **sl_payload)
+    return sl_resp.data() if hasattr(sl_resp, "data") else sl_resp
+
+def place_bracket_orders(symbol: str, side: str, quantity: float, take_profit: float, stop_loss: float) -> Dict[str, Any]:
+    """엔트리 직후 브래킷(RO) 생성: TP(LIMIT|MARKET), SL(STOP_MARKET)"""
+    side = side.upper()
+    opp = "SELL" if side == "BUY" else "BUY"
+
+    tp_price = float(take_profit)
+    sl_price = float(stop_loss)
+
+    f = load_symbol_filters(symbol)
+    qty_q = ensure_min_notional(symbol, float(quantity), price=max(tp_price, sl_price), filters=f)
+
+    out: Dict[str, Any] = {"take_profit": None, "stop_loss": None}
     try:
-        sl_resp = _call(client.rest_api, ["new_order", "newOrder"], **sl_payload)
-        sl_data = sl_resp.data() if hasattr(sl_resp, "data") else sl_resp
+        tp_data = place_take_profit(symbol, opp, qty_q, tp_price, order_type=_TP_ORDER_TYPE)
+        log_event("binance.order.response",
+                  symbol=symbol, side=opp, type=("TAKE_PROFIT_MARKET" if _TP_ORDER_TYPE=="MARKET" else "TAKE_PROFIT"),
+                  orderId=(tp_data.get("orderId") if isinstance(tp_data, dict) else None),
+                  status=(tp_data.get("status") if isinstance(tp_data, dict) else None),
+                  price=tp_price, qty=qty_q, raw=tp_data)
+        out["take_profit"] = tp_data
+    except Exception as e:
+        logger.info("place_bracket_orders TP failed: %s", e)
+
+    try:
+        sl_data = place_stop_market(symbol, opp, qty_q, sl_price)
         log_event("binance.order.response",
                   symbol=symbol, side=opp, type="STOP_MARKET",
                   orderId=(sl_data.get("orderId") if isinstance(sl_data, dict) else None),
                   status=(sl_data.get("status") if isinstance(sl_data, dict) else None),
-                  price=None, qty=sl_payload["quantity"],
-                  raw=sl_data)
+                  price=None, qty=qty_q, raw=sl_data)
         out["stop_loss"] = sl_data
     except Exception as e:
         logger.info("place_bracket_orders SL failed: %s", e)
 
     return out
 
-def build_entry_and_brackets(
-    symbol: str,
-    side: str,
-    quantity: float,
-    target_price: float,
-    stop_price: float,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """(호환 유지) 마켓 진입 → 브래킷(RO) 생성 일괄 호출."""
+def build_entry_and_brackets(symbol: str, side: str, quantity: float, target_price: float, stop_price: float) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     entry = place_market_order(symbol, side, quantity)
     bracket = place_bracket_orders(symbol, side, quantity, target_price, stop_price)
     return entry, bracket
 
-
 # ==================
-# Position helpers
+# Readbacks
 # ==================
-def get_position(symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    현재 심볼 포지션 1개(있는 경우)만 dict로 반환.
-    - 모듈형 SDK의 타이핑된 응답(PositionInformationV3Response 등)과
-      기존 dict/list 응답을 모두 안전하게 처리.
-    """
+def get_open_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    """현재 미체결 주문 나열(타입 정규화 없음)"""
     client = _get_client()
     try:
-        resp = _call(
-            client.rest_api,
-            ["position_information_v3", "position_information_v2", "position_information", "position_risk"],
-            symbol=symbol,
-        )
-        items = _positions_from_response(resp)
-        sym_up = symbol.upper()
-        for p in items or []:
-            d = _as_plain_dict(p)
-            # symbol 키가 다를 가능성까지 방어
-            sym = (
-                d.get("symbol")
-                or d.get("s")
-                or getattr(p, "symbol", None)
-                or getattr(p, "pair", None)
-            )
-            if str(sym).upper() == sym_up:
-                return d
-        return None
+        cand_names = [
+            "open_orders", "openOrders", "allOpenOrders", "get_open_orders", "getAllOpenOrders",
+            "current_all_open_orders", "query_current_all_open_orders",
+            "currentAllOpenOrders", "queryCurrentAllOpenOrders",
+            "current_open_orders", "query_current_open_orders",
+            "currentOpenOrders", "queryCurrentOpenOrders",
+        ]
+        fn = _pick(client.rest_api, cand_names)
+        if not fn:
+            candidates = [n for n in dir(client.rest_api)
+                          if ("order" in n.lower() and "open" in n.lower() and callable(getattr(client.rest_api, n)))]
+            fn = getattr(client.rest_api, candidates[0], None) if candidates else None
+            if not fn:
+                raise AttributeError("No method for open orders")
+
+        r = fn(symbol=symbol) if symbol else fn()
+        data = r.data() if hasattr(r, "data") else r
+
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if "orders" in data and isinstance(data["orders"], list):
+                return data["orders"]
+            return [data]
+        if hasattr(data, "__iter__"):
+            return list(data)
+
+        return [_as_plain_dict(data)]
     except Exception as e:
-        # 반복 호출 루프에서 소음이 크다면 DEBUG로 낮추는 것도 고려
-        logger.info("get_position failed: %s", e)
-        return None
-    
+        logger.error(f"get_open_orders failed: {e}")
+        return []
+
 def _as_plain_dict(obj: Any) -> Dict[str, Any]:
-    """
-    SDK의 타이핑된 객체를 dict로 최대한 안전하게 변환.
-    - dict면 그대로 반환
-    - to_dict/as_dict/model_dump 있으면 호출
-    - __dict__ 사용 (private 제외)
-    - 마지막으로 dir()로 공개 속성 스냅샷
-    """
     if isinstance(obj, dict):
         return obj
     for attr in ("to_dict", "as_dict"):
@@ -685,7 +664,7 @@ def _as_plain_dict(obj: Any) -> Dict[str, Any]:
                     return d
             except Exception:
                 pass
-    if hasattr(obj, "model_dump"):  # pydantic v2 호환
+    if hasattr(obj, "model_dump"):
         try:
             d = obj.model_dump()
             if isinstance(d, dict):
@@ -697,31 +676,22 @@ def _as_plain_dict(obj: Any) -> Dict[str, Any]:
             return {k: v for k, v in obj.__dict__.items() if not str(k).startswith("_")}
         except Exception:
             pass
-    # 최후의 수단: 공개 속성 나열
     out: Dict[str, Any] = {}
     try:
         for k in dir(obj):
-            if k.startswith("_"):
-                continue
+            if k.startswith("_"): continue
             try:
                 v = getattr(obj, k)
             except Exception:
                 continue
-            if callable(v):
-                continue
+            if callable(v): continue
             out[k] = v
     except Exception:
         pass
     return out
 
 def _positions_from_response(resp: Any) -> List[Any]:
-    """
-    모듈형 SDK/REST 응답을 모두 수용:
-      - resp.data()가 객체/리스트/딕셔너리일 수 있음
-      - .positions 속성, {"positions": [...]} 형태, 리스트 직접 반환 모두 처리
-    """
     data = resp.data() if hasattr(resp, "data") else resp
-    # 1) 객체 속성
     if hasattr(data, "positions"):
         try:
             items = getattr(data, "positions")
@@ -729,17 +699,65 @@ def _positions_from_response(resp: Any) -> List[Any]:
                 return list(items)
         except Exception:
             pass
-    # 2) 딕셔너리
     if isinstance(data, dict):
         items = data.get("positions")
         if isinstance(items, list):
             return items
-    # 3) 리스트 바로
     if isinstance(data, list):
         return data
-    # 4) 단일 객체가 올 수도 있음
     return [data]
 
+def get_position(symbol: str) -> Optional[Dict[str, Any]]:
+    """심볼 포지션 단건 반환. 심볼 호출 실패→전체 조회 후 필터링."""
+    client = _get_client()
+    sym_up = (symbol or "").upper()
+
+    def _try_call(with_symbol: bool):
+        return _call(
+            client.rest_api,
+            ["position_information_v3", "position_information_v2", "position_information", "position_risk"],
+            **({"symbol": symbol} if with_symbol else {})
+        )
+
+    try:
+        resp = _try_call(with_symbol=True)
+        items = _positions_from_response(resp)
+    except Exception as e1:
+        logger.info("get_position first call failed (with symbol): %s", e1)
+        try:
+            resp = _try_call(with_symbol=False)
+            items = _positions_from_response(resp)
+        except Exception as e2:
+            logger.info("get_position second call failed (without symbol): %s", e2)
+            return None
+
+    for p in items or []:
+        d = _as_plain_dict(p)
+        sym = (d.get("symbol") or d.get("s") or getattr(p, "symbol", None) or getattr(p, "pair", None) or "")
+        if str(sym).upper() == sym_up:
+            try:
+                amt = float(d.get("positionAmt") or d.get("positionAmount") or 0.0)
+                if abs(amt) < 1e-12:
+                    continue
+            except Exception:
+                pass
+            return d
+    return None
+
+# ==================
+# SL 교체 유틸
+# ==================
+def replace_stop_loss_to_price(symbol: str, is_long: bool, quantity: float, new_stop_price: float) -> Dict[str, Any]:
+    """
+    기존 STOP/STOP_MARKET만 취소 후, 지정 가격으로 STOP_MARKET 재배치.
+    TP는 유지.
+    """
+    try:
+        cancel_orders_by_type(symbol, ["STOP", "STOP_MARKET"])
+    except Exception:
+        pass
+    opp = "SELL" if is_long else "BUY"
+    return place_stop_market(symbol, opp, quantity, new_stop_price)
 
 __all__ = [
     "get_client",
@@ -749,16 +767,24 @@ __all__ = [
     "load_symbol_filters",
     "ensure_min_notional",
     "normalize_price_with_mode",
+    "normalize_price_for_side",
+    "get_last_price",
     # account mutators
     "cancel_open_orders",
+    "cancel_order",
+    "cancel_orders_by_type",
     "set_position_mode",
     "set_margin_type",
     "set_leverage",
     # orders
     "place_market_order",
     "place_limit_order",
+    "place_take_profit",
+    "place_stop_market",
     "place_bracket_orders",
     "build_entry_and_brackets",
-    # readbacks
+    # readbacks & updates
+    "get_open_orders",
     "get_position",
+    "replace_stop_loss_to_price",
 ]

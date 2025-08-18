@@ -1,6 +1,6 @@
 # 변경: 빈도 4h → 1h (every 60 minutes)
 cron:
-- description: "Auto trade every 60 minutes"
+- description: "Auto trade every 5m minutes"
   url: /tasks/trader
-  schedule: every 60 minutes
+  schedule: every 5 minutes
   timezone: Asia/Seoul

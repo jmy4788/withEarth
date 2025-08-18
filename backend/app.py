@@ -89,27 +89,26 @@ def _ensure_dir_writable(pref: str) -> str:
 
 LOG_DIR = _ensure_dir_writable(LOG_DIR_ENV)
 LOG_PATH = str(Path(LOG_DIR) / "bot.log")
+# app.py — FIX setup_logging() to return a logger and use it safely
 
 def setup_logging() -> logging.Logger:
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    # avoid duplicate handlers on reload
-    have_file = any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
-    have_stream = any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
-    if not have_file:
-        fh = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
-        logger.addHandler(fh)
-    if not have_stream:
-        sh = logging.StreamHandler(sys.stdout)
-        sh.setLevel(logging.INFO)
-        sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
-        logger.addHandler(sh)
-    return logger
+    logging.getLogger().handlers.clear()
+    logging.basicConfig(level=level, format=fmt)
 
-logger = setup_logging()
+    # 모듈 개별 로거 레벨
+    logging.getLogger("helpers.signals").setLevel(level)
+    logging.getLogger("helpers.predictor").setLevel(level)
+
+    # 반환: 현재 모듈 로거
+    return logging.getLogger(__name__)
+
+# 호출부
+logger = setup_logging()  # 이제 logger는 유효
+
 
 app = Flask(__name__)
 # compat alias (some older deployments import server)
@@ -129,7 +128,7 @@ if CORS is not None:
 # Imports from helpers
 # -----------------------------
 try:
-    from helpers.signals import generate_signal, manage_trade, get_overview as sig_get_overview  # type: ignore
+    from helpers.signals import generate_signal, manage_trade, get_overview as sig_get_overview, maintain_positions  # type: ignore
 except Exception as e:
     logger.exception("Failed to import helpers.signals: %s", e)
     # Soft stubs for development without full environment
@@ -303,12 +302,18 @@ def tasks_trader():
 
     for sym in symbols:
         try:
+            # Triple-barrier/time cleanup before entering new trades
+            maint = None
+            try:
+                maint = maintain_positions(sym)
+            except Exception:
+                maint = {"action": "none"}
             if EXECUTE_TRADES:
                 out = manage_trade(sym)
-                results.append({"symbol": sym, "result": out})
+                results.append({"symbol": sym, "maintenance": maint, "result": out})
             else:
                 sig = generate_signal(sym)
-                results.append({"symbol": sym, "result": sig.get("result") or sig})
+                results.append({"symbol": sym, "maintenance": maint, "result": sig.get("result") or sig})
         except Exception as e:
             if debug:
                 results.append({"symbol": sym, "error": repr(e)})

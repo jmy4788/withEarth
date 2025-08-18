@@ -183,11 +183,6 @@ def gcs_append_csv_row(dataset: str, headers: List[str], row: dict) -> None:
     - 'append'를 GCS에서 원자적으로 하기 어렵기 때문에,
       작은 CSV 파일을 꾸준히 쌓는 방식(리플레이/수집 파이프라인에 유리).
     - 업로드 경로: {GCS_PREFIX}/{dataset}/YYYYMMDD/{HHMMSS}_{rand}.csv
-
-    예)
-        headers = ["timestamp","symbol","side","qty","entry","tp","sl","exit","pnl","status","id"]
-        row = {...}
-        gcs_append_csv_row("trades", headers, row)
     """
     if not gcs_enabled():
         return
@@ -235,4 +230,5 @@ __all__ = [
     "setup_file_logger",
     "gcs_enabled",
     "gcs_append_csv_row",
+    "log_event",
 ]

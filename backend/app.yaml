@@ -1,28 +1,72 @@
-# 변경 없음
 runtime: python312
 entrypoint: gunicorn -b :$PORT app:server
+
+# 메모리 여유 필요 시 풀어주세요 (옵션)
+# instance_class: F2
 
 automatic_scaling:
   min_instances: 1
   max_instances: 2
 
 env_variables:
-  GAE_ENV: "standard"           # localdev 대신 배포에선 standard 권장
+  # 런타임/로깅
+  GAE_ENV: "standard"
   TZ: "Asia/Seoul"
-  MODEL_BALANCE: "1000"
-  MIN_PROB: "0.65"
-  EXECUTE_TRADES: "true"        # 실거래: true / 드라이런: false
-  GEMINI_MODEL: "gemini-2.5-flash-lite"
+  LOG_LEVEL: "INFO"
   GUNICORN_CMD_ARGS: "--timeout 180 --graceful-timeout 30 --worker-class gthread --threads 4 --keep-alive 5"
-  GCS_BUCKET: "tothemoon-v2-logs-vaulted-scholar-466013-r5-seoul" #  ⬅️  추가 (영구 저장용 버킷)
-  GCS_PREFIX: "trading_bot" #  ⬅️  선택(기본값), 버킷 내 경로 prefix
-  ENTRY_TIMEOUT_SEC: "12"
-  ENTRY_MODE: "LIMIT"
-  USE_MTF_RAW: "true"
-  USE_CHART_IMAGES: "false" # 처음엔 off로 검증 → 이후 true
-  MTF_LAYOUT: "5m:500,1h:200,4h:200,1d:200"
-  PROMPT_SPREAD_CAP_BPS: "15"
-  PROMPT_SLIPPAGE_CAP_BPS: "5"
+
+  # 실행/심볼
+  EXECUTE_TRADES: "true"              # 실거래 on/off
+  SYMBOLS: "BTCUSDT,ETHUSDT"
+
+  # 모델
+  GEMINI_MODEL: "gemini-2.5-flash-lite"
+
+  # 로그/스냅샷 저장(GCS)
+  GCS_BUCKET: "tothemoon-v2-logs-vaulted-scholar-466013-r5-seoul"
+  GCS_PREFIX: "trading_bot"
+
+  # ---------- 리스크/게이팅 ----------
+  MIN_PROB: "0.60"                    # 초기 0.55~0.60 권장
+  PROB_RELAX_THRESHOLD: "0.75"        # 확률 높으면 RR 완화
+  RR_MIN: "1.15"
+  RR_MIN_HIGH_PROB: "1.05"
+  MAX_SPREAD_BPS: "4.0"               # 야간/주말 체결성 고려
+  HORIZON_MIN: "30"                   # 5m 전략: 20~30 권장
+  TIME_BARRIER_ENABLED: "true"
+
+  # ---------- 집행/주문 ----------
+  ENTRY_MODE: "LIMIT"                 # LIMIT + TTL 재호가 + (오류시) MARKT 폴백
+  LIMIT_TTL_SEC: "15"
+  LIMIT_POLL_SEC: "1.0"
+  LIMIT_MAX_REPRICES: "3"
+  LIMIT_MAX_SLIPPAGE_BPS: "5"
+  LIMIT_FAILOVER_TO_MARKET: "true"    # 리밋 주문 오류 시 MARKET 폴백 (binance_client)
+  TP_ORDER_TYPE: "MARKET"             # TAKE_PROFIT_MARKET (A/B 용)
+
+  # ---------- BE 트레일링 ----------
+  BE_TRAILING_ENABLED: "true"
+  BE_TRIGGER_R_MULT: "1.0"            # 1R 달성 시
+  BE_OFFSET_TICKS: "1"
+
+  # ---------- 포지션/사이징 ----------
+  RISK_USDT: "100"
+  LEVERAGE: "5"                       # signals.py는 LEVERAGE 키를 읽습니다
+  MARGIN_TYPE: "ISOLATED"
+  POSITION_MODE: "ONEWAY"
+  MIN_VOL_FRAC: "0.0005"              # should_predict 게이트
+
+  # ---------- 네트워킹/타임아웃 ----------
+  BINANCE_HTTP_TIMEOUT_MS: "10000"
+  BINANCE_HTTP_RETRIES: "3"
+  BINANCE_HTTP_BACKOFF_MS: "1000"
+  # 테스트넷 사용 시(옵션)
+  # BINANCE_FUTURES_TESTNET: "true"
+  # BINANCE_USE_TESTNET: "true"
+
+  # 프런트 리디렉션(옵션)
+  FRONTEND_BASE_URL: ""
+
 vpc_access_connector:
   name: projects/vaulted-scholar-466013-r5/locations/asia-northeast3/connectors/appengine-conn2
   egress_setting: all-traffic
