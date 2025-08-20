@@ -1,6 +1,11 @@
-# 변경: 빈도 4h → 1h (every 60 minutes)
+# cron.yaml
 cron:
-- description: "Auto trade every 5m minutes"
+- description: "Auto trade every 5 minutes"
   url: /tasks/trader
   schedule: every 5 minutes
+  timezone: Asia/Seoul
+
+- description: "Calibrate probability curve (daily)"
+  url: /tasks/calibrate
+  schedule: every day 04:10
   timezone: Asia/Seoul

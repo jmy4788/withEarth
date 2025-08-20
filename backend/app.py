@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from helpers.binance_client import get_open_orders  # 이미 다른 것들 임포트되어 있음
 from flask import Flask, jsonify, request, redirect, url_for, send_from_directory, make_response
+from app_tasks_calibrate import calib_bp
 
 # Optional but recommended for Option B when serving SPA from other origin
 try:
@@ -111,6 +112,8 @@ logger = setup_logging()  # 이제 logger는 유효
 
 
 app = Flask(__name__)
+app.register_blueprint(calib_bp)
+
 # compat alias (some older deployments import server)
 server = app
 

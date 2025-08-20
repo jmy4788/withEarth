@@ -1,8 +1,6 @@
-# helpers/data_fetch.py
+# helpers/data_fetch.py — refactor (2025-08-20, KST)
 from __future__ import annotations
 """
-helpers/data_fetch.py — refactor (2025-08-12, KST)
-
 설계 원칙
 - Binance USDⓈ-M Futures 데이터 수집은 **SDK 우선 → REST 폴백**.
 - 캔들 데이터는 표준 컬럼으로 정규화: timestamp, open, high, low, close, volume
@@ -10,24 +8,9 @@ helpers/data_fetch.py — refactor (2025-08-12, KST)
 - 신호용 파생지표(RSI, SMA_20, 변동성, ATR 등) 계산 유틸 제공.
 - 오더북/펀딩/MTF(1h/4h/1d) 원천 수집 지원.
 
-환경변수
-- BINANCE_USE_TESTNET=true           → REST 폴백에서 테스트넷 도메인 사용
-- BINANCE_FAPI_BASE                  → REST 폴백 프로덕션 베이스(URL)
-- BINANCE_FAPI_TESTNET_BASE          → REST 폴백 테스트넷 베이스(URL)
-- BINANCE_HTTP_TIMEOUT_MS, ...       → 타임아웃/재시도(요청 라이브러리 레벨에서 활용 가능)
-
-호환성
-- signals.py가 기대하는 공개 함수/시그니처를 유지합니다:
-  fetch_data(symbol, interval="5m", ohlcv_limit=200, orderbook_limit=50, include_orderbook=True) -> dict
-  fetch_mtf_raw(symbol) -> dict[str, pd.DataFrame]
-  add_indicators(df) -> pd.DataFrame
-  compute_atr(df, window=14) -> pd.Series
-  compute_orderbook_stats(ob) -> dict
-  compute_recent_price_sequence(df, n=10) -> list[float]
-  compute_support_resistance(df, lookback=50) -> dict
-  compute_relative_volume(df, lookback=20) -> float
-  fetch_orderbook(symbol, limit=50) -> dict
-  fetch_funding_rate(symbol) -> float
+업데이트(2025-08-20)
+- fetch_ohlcv(symbol, interval, limit, **start_ms, **end_ms) 옵션 인자 추가
+  * 구간 캔들 라벨링(진입→호라이즌)용. 지정되면 REST 경로로 강제 사용.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -89,17 +72,14 @@ _INTERVAL_MS = {
     "1M": 2_592_000_000,  # 30d approx
 }
 
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
 
 def _to_float(x: Any) -> float:
     try:
         return float(x)
     except Exception:
         return 0.0
-
 
 def _kline_to_df(rows: List[List[Any]], *, use_close_time: bool = True) -> pd.DataFrame:
     """
@@ -131,7 +111,6 @@ def _kline_to_df(rows: List[List[Any]], *, use_close_time: bool = True) -> pd.Da
     )
     return df
 
-
 def _trim_to_closed(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     """미종가(진행 중) 봉 제거: close_time이 현재보다 크거나, 차주기 미만이면 마지막 봉 drop."""
     if df is None or df.empty:
@@ -139,27 +118,19 @@ def _trim_to_closed(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     try:
         now = _now_ms()
         int_ms = _INTERVAL_MS.get(interval, 0)
-        # close_time 기준으로 판정
         last_close_ms = int(df["_close_time_ms"].iloc[-1])
         last_open_ms = int(df["_open_time_ms"].iloc[-1])
-        # close_time이 미래거나, (now - open) < 간격 → 진행중으로 간주
         if (last_close_ms > now) or (int_ms and (now - last_open_ms < int_ms)):
             df = df.iloc[:-1].copy()
-        # 내부용 컬럼 제거
-        if "_open_time_ms" in df.columns:
-            df.drop(columns=["_open_time_ms"], inplace=True)
-        if "_close_time_ms" in df.columns:
-            df.drop(columns=["_close_time_ms"], inplace=True)
-    except Exception:
-        # 실패시 내부컬럼만 제거
         for c in ["_open_time_ms", "_close_time_ms"]:
             if c in df.columns:
-                try:
-                    df.drop(columns=[c], inplace=True)
-                except Exception:
-                    pass
+                df.drop(columns=[c], inplace=True)
+    except Exception:
+        for c in ["_open_time_ms", "_close_time_ms"]:
+            if c in df.columns:
+                try: df.drop(columns=[c], inplace=True)
+                except Exception: pass
     return df
-
 
 # ----------------------------------------------------------------------------
 # Fetchers (SDK first → REST fallback)
@@ -170,18 +141,14 @@ def _sdk_fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[
         return None
     try:
         client = _get_client()
-        # SDK 메서드 네이밍 가드: 여러 후보 시도
         rest = getattr(client, "rest_api")
         for name in ["kline_candlestick_data", "kline_candlestick", "klines", "continuous_klines"]:
             fn = getattr(rest, name, None)
             if callable(fn):
                 resp = fn(symbol=symbol, interval=interval, limit=int(limit))
                 data = resp.data() if hasattr(resp, "data") else resp
-                # data가 이미 list[list] 형태일 수 있음
                 if isinstance(data, list) and data and isinstance(data[0], (list, tuple)):
-                    df = _kline_to_df(data)
-                    return df
-                # 일부 SDK는 객체 리스트를 제공 → 속성 추출
+                    return _kline_to_df(data)
                 rows: List[List[Any]] = []
                 for r in data or []:
                     try:
@@ -208,15 +175,20 @@ def _sdk_fetch_klines(symbol: str, interval: str, limit: int = 200) -> Optional[
         logger.info("SDK klines fetch failed: %s", e)
         return None
 
-
-def _rest_fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    """REST /fapi/v1/klines"""
+def _rest_fetch_klines(symbol: str, interval: str, limit: int = 200,
+                       start_ms: Optional[int] = None, end_ms: Optional[int] = None) -> pd.DataFrame:
+    """REST /fapi/v1/klines (startTime/endTime 옵션 지원)"""
     if requests is None:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
     base = FAPI_TESTNET_BASE if USE_TESTNET else FAPI_BASE
     url = f"{base}/fapi/v1/klines"
     try:
-        r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": int(limit)}, timeout=HTTP_TIMEOUT)
+        params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": int(limit)}
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         return _kline_to_df(data)
@@ -224,18 +196,18 @@ def _rest_fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataF
         logger.info("REST klines fetch failed: %s", e)
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-
-def fetch_ohlcv(symbol: str, interval: str = "5m", limit: int = 200) -> pd.DataFrame:
-    """OHLCV 수집(SDK 우선 → REST 폴백) + 부분봉 제거 + 표준화 컬럼 반환."""
-    df = _sdk_fetch_klines(symbol, interval, limit)
+def fetch_ohlcv(symbol: str, interval: str = "5m", limit: int = 200,
+                start_ms: Optional[int] = None, end_ms: Optional[int] = None) -> pd.DataFrame:
+    """OHLCV 수집(SDK 우선 → REST 폴백) + 부분봉 제거 + 표준화 컬럼. (시간 범위 인자 추가, 호환 유지)"""
+    # 시간 구간이 지정되면 REST를 사용(일부 SDK는 범위 미지원)
+    df = _sdk_fetch_klines(symbol, interval, limit) if (start_ms is None and end_ms is None) else None
     if df is None or df.empty:
-        df = _rest_fetch_klines(symbol, interval, limit)
+        df = _rest_fetch_klines(symbol, interval, limit, start_ms=start_ms, end_ms=end_ms)
     df = _trim_to_closed(df, interval)
     return df
 
-
 def fetch_orderbook(symbol: str, limit: int = 50) -> Dict[str, Any]:
-    """오더북(depth) 수집(REST). SDK 경로는 버전 의존성이 커서 REST를 기본 사용."""
+    """오더북(depth) 수집(REST)."""
     if requests is None:
         return {"bids": [], "asks": [], "timestamp": _now_ms()}
     base = FAPI_TESTNET_BASE if USE_TESTNET else FAPI_BASE
@@ -250,7 +222,6 @@ def fetch_orderbook(symbol: str, limit: int = 50) -> Dict[str, Any]:
     except Exception as e:
         logger.info("REST depth fetch failed: %s", e)
         return {"bids": [], "asks": [], "timestamp": _now_ms()}
-
 
 def fetch_funding_rate(symbol: str) -> float:
     """최근 펀딩비율(%) 하나를 반환. REST /fapi/v1/fundingRate?limit=1"""
@@ -269,12 +240,11 @@ def fetch_funding_rate(symbol: str) -> float:
         logger.info("REST fundingRate fetch failed: %s", e)
     return 0.0
 
-
 # ----------------------------------------------------------------------------
 # Indicators
 # ----------------------------------------------------------------------------
 def add_indicators(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """RSI(14), SMA_20, 변동성(20) 컬럼을 추가. df가 None/empty면 빈 DF를 반환."""
+    """RSI(14), SMA_20, 변동성(20) 컬럼을 추가."""
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "RSI", "SMA_20", "volatility"])
 
@@ -297,15 +267,13 @@ def add_indicators(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         out["volatility"] = ret.rolling(window=20, min_periods=5).std().fillna(0.0)
     except Exception as e:
         logger.info("add_indicators failed: %s", e)
-        # 최소 컬럼 보장
         for c in ["RSI", "SMA_20", "volatility"]:
             if c not in out.columns:
                 out[c] = 0.0
     return out
 
-
 def compute_atr(df: Optional[pd.DataFrame], window: int = 14) -> pd.Series:
-    """ATR(14) 계산. df가 비면 빈 시리즈 반환."""
+    """ATR(14) 계산."""
     if df is None or len(df) == 0:
         return pd.Series(dtype=float)
     high = pd.to_numeric(df["high"], errors="coerce")
@@ -337,35 +305,23 @@ def compute_orderbook_stats(ob: Optional[Dict[str, Any]]) -> Dict[str, float]:
         if not bids or not asks:
             return {"spread": 0.0, "imbalance": 0.0, "mid": 0.0, "microprice": 0.0, "micro_dislocation_bps": 0.0}
 
-        # top-of-book
         best_bid = float(bids[0][0]); best_ask = float(asks[0][0])
         mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else 0.0
         spread_bps = ((best_ask - best_bid) / mid * 10_000.0) if mid > 0 else 0.0
 
-        # 10레벨 누적
         bid_qty = float(sum(float(q) for _, q in bids[:10]))
         ask_qty = float(sum(float(q) for _, q in asks[:10]))
         tot = bid_qty + ask_qty
         imbalance = (bid_qty - ask_qty) / tot if tot > 0 else 0.0
 
-        # microprice (유동성 가중)
-        if tot > 0:
-            micro = ((best_ask * bid_qty) + (best_bid * ask_qty)) / tot
-        else:
-            micro = mid
-
+        micro = ((best_ask * bid_qty) + (best_bid * ask_qty)) / tot if tot > 0 else mid
         disloc_bps = ((micro - mid) / mid * 10_000.0) if (mid > 0) else 0.0
 
-        return {
-            "spread": float(spread_bps),
-            "imbalance": float(imbalance),
-            "mid": float(mid),
-            "microprice": float(micro),
-            "micro_dislocation_bps": float(disloc_bps),
-        }
+        return {"spread": float(spread_bps), "imbalance": float(imbalance), "mid": float(mid),
+                "microprice": float(micro), "micro_dislocation_bps": float(disloc_bps)}
     except Exception:
         return {"spread": 0.0, "imbalance": 0.0, "mid": 0.0, "microprice": 0.0, "micro_dislocation_bps": 0.0}
-    
+
 def compute_recent_price_sequence(df: Optional[pd.DataFrame], n: int = 10) -> List[float]:
     """최근 n개 종가 시퀀스(리스트)"""
     if df is None or len(df) == 0:
@@ -374,7 +330,6 @@ def compute_recent_price_sequence(df: Optional[pd.DataFrame], n: int = 10) -> Li
     if len(closes) < n:
         closes = [0.0] * (n - len(closes)) + closes
     return [float(x) for x in closes]
-
 
 def compute_support_resistance(df: Optional[pd.DataFrame], lookback: int = 50) -> Dict[str, float]:
     """최근 고저점(lookback) 기반 지지/저항 레벨"""
@@ -386,7 +341,6 @@ def compute_support_resistance(df: Optional[pd.DataFrame], lookback: int = 50) -
         "recent_high": float(pd.to_numeric(recent["high"], errors="coerce").max()),
         "recent_low": float(pd.to_numeric(recent["low"], errors="coerce").min()),
     }
-
 
 def compute_relative_volume(df: Optional[pd.DataFrame], lookback: int = 20) -> float:
     """현재봉(or 최근봉) 거래량 / 과거 lookback 기간 중앙값 → 상대거래량(배)"""
@@ -403,7 +357,6 @@ def compute_relative_volume(df: Optional[pd.DataFrame], lookback: int = 20) -> f
         return 1.0
     return float(cur / med)
 
-
 def compute_trend_filter(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
     """
     일봉 추세 필터
@@ -412,25 +365,21 @@ def compute_trend_filter(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
     """
     if df is None or len(df) == 0:
         return {"daily_uptrend": False, "trend_strength": 0.0}
-
     try:
         ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
         tmp = pd.DataFrame({"close": pd.to_numeric(df["close"], errors="coerce")}, index=ts)
         daily = tmp.resample("1D").last().dropna()
         if len(daily) < 5:
             return {"daily_uptrend": False, "trend_strength": 0.0}
-
         ma_fast = daily["close"].rolling(window=5, min_periods=5).mean()
         ma_slow = daily["close"].rolling(window=20, min_periods=5).mean()
         up = bool(ma_fast.iloc[-1] > (ma_slow.iloc[-1] if not np.isnan(ma_slow.iloc[-1]) else ma_fast.iloc[-1]))
-        # 간단한 강도: (fast - slow) / slow (abs 0~)
         denom = ma_slow.iloc[-1] if not np.isnan(ma_slow.iloc[-1]) and ma_slow.iloc[-1] != 0 else ma_fast.iloc[-1]
         strength = float((ma_fast.iloc[-1] - (denom)) / (denom)) if denom else 0.0
         return {"daily_uptrend": up, "trend_strength": strength}
     except Exception as e:
         logger.info("compute_trend_filter failed: %s", e)
         return {"daily_uptrend": False, "trend_strength": 0.0}
-
 
 # ----------------------------------------------------------------------------
 # Composite fetch (for payload)
@@ -474,7 +423,6 @@ def fetch_data(
 
     return {"ohlcv": df, "orderbook": ob, "times": times}
 
-
 def fetch_mtf_raw(symbol: str) -> Dict[str, pd.DataFrame]:
     """MTF 원천: 1h/4h/1d OHLCV dict 반환. 키는 {"1h","4h","1d"}"""
     out: Dict[str, pd.DataFrame] = {}
@@ -486,7 +434,6 @@ def fetch_mtf_raw(symbol: str) -> Dict[str, pd.DataFrame]:
             logger.info("fetch_mtf_raw %s failed: %s", tf, e)
             out[tf] = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
     return out
-
 
 __all__ = [
     "fetch_ohlcv",

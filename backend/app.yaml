@@ -48,8 +48,8 @@ env_variables:
   ENTRY_COOLDOWN_MIN: "10"
 
   # --- 손절/익절 ---
-  ATR_MULT_SL: "1.2"
-  ATR_MULT_TP: "2.0"
+  ATR_MULT_SL: "1.0"
+  ATR_MULT_TP: "2.2"
   TP_ORDER_TYPE: "LIMIT"                   # 필요 시 MARKET로 A/B
   SL_ORDER_TYPE: "STOP_MARKET"             # ★ STOP_LIMIT 시험시 변경
   SL_LIMIT_SLIPPAGE_BPS: "10"              # ★ STOP_LIMIT 사용 시만 관여
