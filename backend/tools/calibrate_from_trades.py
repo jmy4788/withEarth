@@ -1,162 +1,178 @@
-#!/usr/bin/env python3
+# tools/calibrate_from_trades.py
 from __future__ import annotations
-import argparse, csv, os, sys
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Iterable, Dict, Any
 from pathlib import Path
-from typing import List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+import csv
+import os
 
-import numpy as np
-import pandas as pd
+# --- flexible imports (root or helpers.*) ---
+try:
+    from data_fetch import fetch_ohlcv  # 1m 구간 조회가 중요
+except Exception:
+    from helpers.data_fetch import fetch_ohlcv  # type: ignore
 
-# 내부 모듈
-# PYTHONPATH에 프로젝트 루트가 잡혀 있어야 합니다. (예: `python -m tools.calibrate_from_trades`)
-from helpers.data_fetch import fetch_ohlcv  # 시간범위 인자 지원 필요 :contentReference[oaicite:8]{index=8}
-from helpers.calibration import ProbCalibrator  # 보정 곡선 저장/적용 :contentReference[oaicite:9]{index=9}
+try:
+    from utils import LOG_DIR, log_event
+except Exception:
+    from helpers.utils import LOG_DIR, log_event  # type: ignore
 
-LOG_DIR = Path(os.getenv("LOG_DIR", "./logs"))
-TRADES_CSV = LOG_DIR / "trades.csv"
-HORIZON_MIN_DEFAULT = int(os.getenv("HORIZON_MIN", "30"))  # signals와 일치 권장 :contentReference[oaicite:10]{index=10}
+# ---- Config fallbacks ----
+DEFAULT_LOG_DIR = LOG_DIR if isinstance(LOG_DIR, (str, Path)) else "./logs"
 
 @dataclass
 class Sample:
     prob: float
-    label: int
+    label: int   # 1=TP선행, 0=SL선행/미도달
     symbol: str
-    ts_iso: str
 
-def _parse_iso(ts: str) -> Optional[datetime]:
-    if not ts: return None
-    try:
-        return datetime.fromisoformat(ts)
-    except Exception:
+def _iso_to_ms(ts: str) -> Optional[int]:
+    if not ts:
+        return None
+    # ISO8601 다양한 포맷 수용
+    for cand in (ts, ts.replace("Z", "+00:00")):
         try:
-            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(cand)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
         except Exception:
-            return None
+            continue
+    return None
 
-def _ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
-
-def _label_from_ohlcv(df: pd.DataFrame, side: str, tp: float, sl: float,
-                      t0_ms: int, t1_ms: int) -> Optional[int]:
+def _first_touch_times(df, *, tp: float, sl: float, direction: str) -> Dict[str, Optional[int]]:
     """
-    캔들 타임스탬프는 '종가 시각(closetime)' 기준(helpers/data_fetch.py 설계)입니다. :contentReference[oaicite:11]{index=11}
-    - 동일 캔들에서 TP/SL 모두 터치 시 모호 → None 반환(샘플 제외)
-    - 호라이즌 내 아무것도 터치 안하면 0(실패) 반환
+    1분봉 고가/저가를 사용해 선행 터치 시각(ms)을 판정.
+    - 같은 봉에서 TP/SL이 동시에 터치 가능한 모호 케이스는 'ambiguous'로 간주(샘플 스킵 권장).
     """
-    if df is None or df.empty: return None
-    ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    ts_ms = (ts.view("int64") // 1_000_000).astype("int64")
-    mask = (ts_ms >= t0_ms) & (ts_ms <= t1_ms)
-    sub = df.loc[mask]
-    if sub.empty:
-        return None
-    highs = pd.to_numeric(sub["high"], errors="coerce").values
-    lows  = pd.to_numeric(sub["low"], errors="coerce").values
+    import pandas as pd  # lazy
+    if df is None or len(df) == 0:
+        return {"tp": None, "sl": None, "ambiguous": None}
+    H = pd.to_numeric(df["high"], errors="coerce")
+    L = pd.to_numeric(df["low"], errors="coerce")
+    # timestamp는 close_time(UTC ISO)로 들어옴
+    T = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
 
-    if side == "long":
-        for hi, lo in zip(highs, lows):
-            hit_tp = (hi >= tp)
-            hit_sl = (lo <= sl)
-            if hit_tp and hit_sl:
-                return None  # ambiguous
-            if hit_sl:
-                return 0
-            if hit_tp:
-                return 1
-        return 0
-    else:
-        for hi, lo in zip(highs, lows):
-            hit_sl = (hi >= sl)
-            hit_tp = (lo <= tp)
-            if hit_tp and hit_sl:
-                return None  # ambiguous
-            if hit_sl:
-                return 0
-            if hit_tp:
-                return 1
-        return 0
+    for i in range(len(df)):
+        hi = float(H.iloc[i]); lo = float(L.iloc[i])
+        t_ms = int(T.iloc[i].timestamp() * 1000) if pd.notna(T.iloc[i]) else None
+        if direction == "long":
+            tp_hit = (hi >= tp)
+            sl_hit = (lo <= sl)
+        else:  # short
+            tp_hit = (lo <= tp)
+            sl_hit = (hi >= sl)
+        if tp_hit and sl_hit:
+            return {"tp": t_ms, "sl": t_ms, "ambiguous": t_ms}
+        if tp_hit:
+            return {"tp": t_ms, "sl": None, "ambiguous": None}
+        if sl_hit:
+            return {"tp": None, "sl": t_ms, "ambiguous": None}
+    return {"tp": None, "sl": None, "ambiguous": None}
 
-def _maybe_float(x) -> Optional[float]:
+def _row_prob(row: Dict[str, Any]) -> Optional[float]:
+    for key in ("prob", "calibrated_prob", "p"):
+        v = row.get(key)
+        if v is None or v == "":
+            continue
+        try:
+            x = float(v)
+            if 0.0 <= x <= 1.0:
+                return x
+        except Exception:
+            continue
+    return None
+
+def _row_horizon(row: Dict[str, Any], default_min: int) -> int:
+    v = row.get("horizon_min")
     try:
-        return float(x)
+        hv = int(v)
+        return hv if hv > 0 else default_min
     except Exception:
-        return None
+        return int(default_min)
 
-def load_samples(csv_path: Path, horizon_min: int,
-                 only_symbols: Optional[List[str]] = None) -> List[Sample]:
-    rows: List[Sample] = []
-    if not csv_path.exists():
-        print(f"[WARN] trades.csv not found at {csv_path}")
-        return rows
+def load_samples(
+    trades_csv: Path | str,
+    horizon_min: int,
+    only_symbols: Optional[Iterable[str]] = None,
+    *,
+    max_rows: Optional[int] = None,
+) -> List[Sample]:
+    """
+    CSV→(prob,label) 샘플 생성.
+    - ambiguous(동일 봉에서 TP,SL 터치) → 보수적으로 스킵
+    - neither(호라이즌 내 미터치) → label=0(보수적)
+    """
+    path = Path(trades_csv or (Path(DEFAULT_LOG_DIR) / "trades.csv"))
+    if not path.exists():
+        return []
 
-    with open(csv_path, "r", encoding="utf-8") as f:
+    only = {s.upper() for s in (only_symbols or []) if str(s).strip()}
+    out: List[Sample] = []
+
+    with open(path, "r", encoding="utf-8") as f:
         r = csv.DictReader(f)
-        for row in r:
-            sym = str(row.get("symbol","")).upper()
-            if only_symbols and sym not in set(s.upper() for s in only_symbols):
-                continue
-            side = str(row.get("side","")).lower()
-            ts = _parse_iso(row.get("timestamp",""))
-            entry = _maybe_float(row.get("entry"))
-            tp = _maybe_float(row.get("tp"))
-            sl = _maybe_float(row.get("sl"))
-            prob = (_maybe_float(row.get("prob")) or _maybe_float(row.get("prob_at_entry")))
+        rows = list(r)
 
-            # 필수 필드 체크
-            if ts is None or entry is None or tp is None or sl is None or prob is None:
-                continue
+    if not rows:
+        return []
 
-            # 너무 최근인 경우(호라이즌이 아직 안 지남) 제외
-            if datetime.now(tz=timezone.utc) < ts + timedelta(minutes=horizon_min):
+    if isinstance(max_rows, int) and max_rows > 0:
+        rows = rows[-max_rows:]
+
+    for row in rows:
+        try:
+            sym = str(row.get("symbol", "")).upper().strip()
+            if only and sym not in only:
                 continue
 
-            # 캔들 가져오기(버퍼 2바 포함)
-            interval = "5m"
-            int_ms = 300_000
-            start_ms = _ms(ts) - 2*int_ms
-            end_ms   = _ms(ts + timedelta(minutes=horizon_min)) + 2*int_ms
-            df = fetch_ohlcv(sym, interval=interval, limit=500, start_ms=start_ms, end_ms=end_ms)  # :contentReference[oaicite:12]{index=12}
-            label = _label_from_ohlcv(df, side=side, tp=tp, sl=sl, t0_ms=_ms(ts), t1_ms=_ms(ts + timedelta(minutes=horizon_min)))
-            if label is None:
+            side = str(row.get("side", "")).lower().strip()  # 'long' | 'short'
+            if side not in ("long", "short"):
                 continue
-            rows.append(Sample(prob=float(np.clip(prob,0,1)), label=int(label), symbol=sym, ts_iso=ts.isoformat()))
-    return rows
 
-def main():
-    ap = argparse.ArgumentParser(description="Build probability calibration from trades.csv")
-    ap.add_argument("--csv", type=str, default=str(TRADES_CSV), help="path to trades.csv")
-    ap.add_argument("--symbols", type=str, default="", help="comma-separated symbols filter, e.g., BTCUSDT,ETHUSDT")
-    ap.add_argument("--horizon-min", type=int, default=HORIZON_MIN_DEFAULT)
-    ap.add_argument("--min-samples", type=int, default=int(os.getenv("CALIB_MIN_SAMPLES", "150")))
-    ap.add_argument("--bins", type=int, default=int(os.getenv("CALIB_BINS", "10")))
-    args = ap.parse_args()
+            ts_entry = _iso_to_ms(row.get("timestamp", ""))
+            entry = float(row.get("entry", 0.0) or 0.0)
+            tp = float(row.get("tp", 0.0) or 0.0)
+            sl = float(row.get("sl", 0.0) or 0.0)
+            if not ts_entry or entry <= 0 or tp <= 0 or sl <= 0:
+                continue
 
-    only_symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
-    samples = load_samples(Path(args.csv), args.horizon_min, only_symbols=only_symbols)
-    print(f"[INFO] collected samples: {len(samples)} (min required: {args.min_samples})")
+            # 확률
+            prob = _row_prob(row)
+            if prob is None:
+                # prob가 없으면 데이터 오염 방지를 위해 스킵(캘리브레이션 의미 퇴색 방지)
+                continue
 
-    if len(samples) < args.min_samples:
-        print("[WARN] not enough samples; aborting calibration.")
-        return
+            # 호라이즌: 행 단위 우선 → 없으면 파라미터 기본
+            hz_min = _row_horizon(row, default_min=int(horizon_min))
+            start_ms = int(ts_entry)
+            end_ms = int(ts_entry + hz_min * 60_000)
 
-    probs = [s.prob for s in samples]
-    labels = [s.label for s in samples]
+            # 1분봉으로 판정(더 정밀)
+            df = fetch_ohlcv(sym, interval="1m", limit=hz_min + 5, start_ms=start_ms, end_ms=end_ms)
 
-    calib = ProbCalibrator(bins=args.bins, min_samples=args.min_samples)  # :contentReference[oaicite:13]{index=13}
-    ok = calib.fit_from_arrays(probs, labels)
-    if not ok:
-        print("[WARN] calibration fit failed (insufficient or unsuitable data).")
-        return
-    calib.save()
-    print("[OK] calibration saved.")
-    # 간략 리포트
-    # bin_edges는 x좌표(평균 예측확률), bin_means는 경험적 승률(단조 보정 후)
-    xs, ys = calib.bin_edges, calib.bin_means
-    print("=== Reliability Table ===")
-    for x, y in zip(xs, ys):
-        print(f"  p̂≈{x:.2f} -> P(TP first)≈{y:.2f}")
+            touch = _first_touch_times(df, tp=tp, sl=sl, direction=side)
+            if touch.get("ambiguous") is not None:
+                # 같은 봉 내 동시 터치는 방향성 불확실 → 샘플 제외
+                continue
 
-if __name__ == "__main__":
-    sys.exit(main())
+            if touch.get("tp") is not None:
+                label = 1
+            elif touch.get("sl") is not None:
+                label = 0
+            else:
+                # 호라이즌 내 미터치 → 보수적으로 패배(0) 처리
+                label = 0
+
+            out.append(Sample(prob=float(prob), label=int(label), symbol=sym))
+        except Exception:
+            continue
+
+    try:
+        log_event("calibrate.samples_built", total=len(out))
+    except Exception:
+        pass
+    return out
+
+__all__ = ["Sample", "load_samples"]

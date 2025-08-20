@@ -1,8 +1,13 @@
-# cron.yaml
+# cron.yaml — maintain 잡 추가(권장)
 cron:
 - description: "Auto trade every 5 minutes"
   url: /tasks/trader
   schedule: every 5 minutes
+  timezone: Asia/Seoul
+
+- description: "Maintain positions (BE trail / time barrier)"
+  url: /tasks/maintain
+  schedule: every 1 minutes
   timezone: Asia/Seoul
 
 - description: "Calibrate probability curve (daily)"

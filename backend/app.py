@@ -1,24 +1,12 @@
 from __future__ import annotations
 """
-app.py — Backend API for withEarth_V0 (Liquid Glass ready, Option B)
+app.py — Single-file merged app (merged from app.py + app_tasks_calibrate.py + app_tasks_trader.py)
 
-This Flask app exposes the trading APIs and data feeds used by the React SPA.
-It is designed to run locally and on Google App Engine (GAE).
-
-Provided endpoints
-- GET  /health                          : simple health check
-- GET|POST /tasks/trader                : run signal generation (and optionally execute trades)
-- GET  /api/overview                    : account balances & positions overview
-- GET  /api/trades?limit=200            : recent trade journal rows from logs/trades.csv
-- GET  /api/logs?lines=200              : tail of logs/bot.log
-- GET  /api/signals                     : list recent model decisions (debug payloads)
-- GET  /api/signals/latest?symbol=...   : on-demand latest signal for a symbol (no execution)
-- GET  /api/candles?symbol=...&tf=5m    : OHLCV for charting
-- GET  /api/orderbook?symbol=...        : top-of-book depth snapshot
-
-Option B (React SPA separate):
-- If FRONTEND_BASE_URL is set, GET / and /dashboard redirect to that URL.
-- Otherwise, they render a small info page explaining how to serve the SPA.
+- Keeps /api/* endpoints, logging, CORS, and file tail utilities (from original app.py).
+- Inlines two Blueprints:
+    * calib_bp  → /tasks/calibrate
+    * trader_bp → /tasks/trader, /tasks/maintain
+- Avoids duplicate /tasks/trader by NOT defining a separate route outside the blueprint.
 """
 
 import csv
@@ -26,31 +14,17 @@ import glob
 import json
 import logging
 import os
-import sys
 import time
-from dataclasses import asdict, dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from helpers.binance_client import get_open_orders  # 이미 다른 것들 임포트되어 있음
-from flask import Flask, jsonify, request, redirect, url_for, send_from_directory, make_response
-from app_tasks_calibrate import calib_bp
-
-# Optional but recommended for Option B when serving SPA from other origin
-try:
-    from flask_cors import CORS
-except Exception:  # pragma: no cover
-    CORS = None  # type: ignore
-
-# Rotating log to file
-from logging.handlers import RotatingFileHandler
+from typing import Any, Dict, List, Optional
 
 # -----------------------------
-# Environment & Constants
+# Environment & Timezone
 # -----------------------------
 TZ = os.getenv("TZ", "Asia/Seoul")
 try:
-    import tzset  # type: ignore  # if installed
+    import tzset  # type: ignore
 except Exception:
     try:
         if hasattr(time, "tzset"):
@@ -67,10 +41,18 @@ LOG_DIR_ENV = os.getenv("LOG_DIR", "./logs")
 DEFAULT_TMP_DIR = "/tmp/trading_bot"  # GAE writable
 PAYLOAD_DIR_NAME = "payloads"
 
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip()  # e.g., https://spa.example.com
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip()
+
+# Optional CORS
+try:
+    from flask_cors import CORS  # type: ignore
+except Exception:  # pragma: no cover
+    CORS = None  # type: ignore
+
+from flask import Flask, jsonify, request, redirect, make_response
 
 # -----------------------------
-# App & Logging
+# Logging & Directories
 # -----------------------------
 def _ensure_dir_writable(pref: str) -> str:
     """Ensure directory exists & is writable; fallback to /tmp on GAE."""
@@ -83,14 +65,12 @@ def _ensure_dir_writable(pref: str) -> str:
         return str(p)
     except Exception:
         pass
-    # fallback
     p = Path(DEFAULT_TMP_DIR)
     p.mkdir(parents=True, exist_ok=True)
     return str(p)
 
 LOG_DIR = _ensure_dir_writable(LOG_DIR_ENV)
 LOG_PATH = str(Path(LOG_DIR) / "bot.log")
-# app.py — FIX setup_logging() to return a logger and use it safely
 
 def setup_logging() -> logging.Logger:
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -100,50 +80,34 @@ def setup_logging() -> logging.Logger:
     logging.getLogger().handlers.clear()
     logging.basicConfig(level=level, format=fmt)
 
-    # 모듈 개별 로거 레벨
+    # per-module levels (helpful for helpers.*)
     logging.getLogger("helpers.signals").setLevel(level)
     logging.getLogger("helpers.predictor").setLevel(level)
-
-    # 반환: 현재 모듈 로거
     return logging.getLogger(__name__)
 
-# 호출부
-logger = setup_logging()  # 이제 logger는 유효
-
-
-app = Flask(__name__)
-app.register_blueprint(calib_bp)
-
-# compat alias (some older deployments import server)
-server = app
-
-# CORS (only if flask_cors available). By default allow same-origin; if FRONTEND_BASE_URL set, allow that origin.
-if CORS is not None:
-    cors_origins = []
-    if FRONTEND_BASE_URL:
-        cors_origins = [FRONTEND_BASE_URL]
-    else:
-        # during local dev via Vite default port
-        cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
-    CORS(app, resources={r"/api/*": {"origins": cors_origins}}, supports_credentials=False)
+logger = setup_logging()  # root logger configured
 
 # -----------------------------
-# Imports from helpers
+# Imports from helpers/*
 # -----------------------------
+# signals & trading orchestration
 try:
-    from helpers.signals import generate_signal, manage_trade, get_overview as sig_get_overview, maintain_positions  # type: ignore
+    from helpers.signals import (
+        generate_signal, manage_trade, get_overview as sig_get_overview, maintain_positions
+    )  # noqa
 except Exception as e:
     logger.exception("Failed to import helpers.signals: %s", e)
-    # Soft stubs for development without full environment
+
     def generate_signal(symbol: str) -> Dict[str, Any]:
-        return {"symbol": symbol, "result": {"direction": "hold", "entry": 0, "tp": 0, "sl": 0, "prob": 0.5, "risk_ok": False, "rr": 0.0, "payload_preview": {}}}
+        return {"symbol": symbol, "result": {"direction": "hold", "entry": 0, "tp": 0, "sl": 0, "prob": 0.5, "risk_ok": False, "rr": 0.0}}
     def manage_trade(symbol: str) -> Dict[str, Any]:
         return {"symbol": symbol, "error": "signals_unavailable"}
     def sig_get_overview() -> Dict[str, Any]:
         return {"balances": [], "positions": []}
 
+# data fetchers
 try:
-    from helpers.data_fetch import fetch_ohlcv, fetch_orderbook  # type: ignore
+    from helpers.data_fetch import fetch_ohlcv, fetch_orderbook  # noqa
 except Exception as e:
     logger.exception("Failed to import helpers.data_fetch: %s", e)
     def fetch_ohlcv(symbol: str, interval: str = "5m", limit: int = 200):
@@ -152,30 +116,41 @@ except Exception as e:
     def fetch_orderbook(symbol: str, limit: int = 50):
         return {"bids": [], "asks": [], "timestamp": int(time.time()*1000)}
 
+# get_open_orders for /api/open_orders
+try:
+    from helpers.binance_client import get_open_orders  # noqa
+except Exception as e:
+    logger.info("helpers.binance_client.get_open_orders import failed: %s", e)
+    def get_open_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        return []
+
+# utils (log_event, gcs_enabled) used by calib blueprint
+try:
+    from helpers.utils import log_event, gcs_enabled  # noqa
+except Exception:
+    def log_event(event: str, **fields): logger.info("[event]%s %s", event, fields)
+    def gcs_enabled() -> bool: return False
+
 # -----------------------------
-# Utilities
+# Small utilities
 # -----------------------------
 def _plainify(o):
-    """모든 객체를 JSON-가능한 구조로 재귀 변환"""
     if isinstance(o, dict):
         return {k: _plainify(v) for k, v in o.items()}
     if isinstance(o, (list, tuple)):
         return [_plainify(x) for x in o]
-    # pydantic BaseModel 호환
     for attr in ("model_dump", "dict"):
         if hasattr(o, attr):
             try:
                 return _plainify(getattr(o, attr)())
             except Exception:
                 pass
-    # dataclass
     try:
         from dataclasses import is_dataclass, asdict
         if is_dataclass(o):
             return _plainify(asdict(o))
     except Exception:
         pass
-    # 일반 객체
     if hasattr(o, "__dict__"):
         try:
             return {k: _plainify(v) for k, v in o.__dict__.items() if not str(k).startswith("_")}
@@ -184,25 +159,20 @@ def _plainify(o):
     return o
 
 def _json_ok(**kwargs):
-    resp = {"status": "ok"}
-    resp.update(kwargs)
+    resp = {"status": "ok"}; resp.update(kwargs)
     return jsonify(_plainify(resp))
 
 def _json_err(msg: str, **kwargs):
-    resp = {"status": "error", "message": msg}
-    resp.update(kwargs)
+    resp = {"status": "error", "message": msg}; resp.update(kwargs)
     return jsonify(_plainify(resp)), 400
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
+    try: return float(x)
+    except Exception: return default
 
 def _tail_file(path: str, lines: int = 200) -> List[str]:
     if not Path(path).exists():
         return []
-    # simple tail implementation
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -252,13 +222,9 @@ def _read_trades_csv(limit: int = 200) -> List[Dict[str, Any]]:
         return []
 
 def _signals_debug_list(limit: int = 50) -> List[Dict[str, Any]]:
-    """
-    Scan logs/payloads/YYYYMMDD/*_decision.json files and return latest ones.
-    """
     base = Path(LOG_DIR) / PAYLOAD_DIR_NAME
     if not base.exists():
         return []
-    # Search today and recent 1 day
     patterns = []
     today = datetime.now(tz=timezone.utc)
     for d in [today, today - timedelta(days=1)]:
@@ -277,8 +243,149 @@ def _signals_debug_list(limit: int = 50) -> List[Dict[str, Any]]:
             continue
     return items[-limit:]
 
+# ======================================================================
+# Blueprint 1: Calibration (/tasks/calibrate) — from app_tasks_calibrate.py
+# ======================================================================
+from flask import Blueprint
+
+calib_bp = Blueprint("tasks_calibrate", __name__)
+
+@calib_bp.route("/tasks/calibrate", methods=["GET", "POST"])
+def tasks_calibrate():
+    # App Engine Cron 보호: 내부 크론 호출만 허용
+    if request.headers.get("X-Appengine-Cron", "").lower() != "true":
+        return jsonify({"error": "forbidden"}), 403
+
+    # imports kept local to avoid import cost if not used
+    import os
+    from pathlib import Path
+    try:
+        from helpers.calibration import ProbCalibrator  # file-backed calibrator
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"calibrator_import_failed: {e}"}), 500
+    try:
+        from tools.calibrate_from_trades import load_samples  # samples from trades.csv
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"samples_import_failed: {e}"}), 500
+
+    symbols_env = os.getenv("SYMBOLS", "")
+    only_symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
+    horizon_min = int(os.getenv("HORIZON_MIN", "30"))
+    min_samples = int(os.getenv("CALIB_MIN_SAMPLES", "150"))
+    bins = int(os.getenv("CALIB_BINS", "10"))
+
+    log_dir = Path(os.getenv("LOG_DIR", "./logs"))
+    trades_csv = log_dir / "trades.csv"
+
+    # 1) collect samples
+    samples = load_samples(trades_csv, horizon_min, only_symbols=only_symbols)
+    n = len(samples)
+    log_event("calibrate.collect", symbols=only_symbols or "ALL", horizon_min=horizon_min, samples=n)
+
+    if n < min_samples:
+        return jsonify({"status": "skipped", "reason": "insufficient_samples", "n": n, "min_samples": min_samples}), 200
+
+    probs = [s.prob for s in samples]
+    labels = [s.label for s in samples]
+
+    # 2) fit + save
+    calib = ProbCalibrator(bins=bins, min_samples=min_samples)
+    ok = calib.fit_from_arrays(probs, labels)
+    if not ok:
+        return jsonify({"status": "failed", "reason": "fit_failed"}), 200
+
+    calib.save()
+    log_event("calibrate.saved", path=calib.path, bins=bins, n=n)
+
+    # 3) optional GCS upload
+    if gcs_enabled():
+        try:
+            from google.cloud import storage  # type: ignore
+            client = storage.Client()
+            bucket = client.bucket(os.getenv("GCS_BUCKET"))
+            prefix = os.getenv("GCS_PREFIX", "trading_bot")
+            dst = f"{prefix}/calibration/latest/calibration.json"
+            blob = bucket.blob(dst)
+            blob.cache_control = "no-cache"
+            blob.upload_from_filename(calib.path, content_type="application/json")
+            log_event("calibrate.gcs_uploaded", gcs_path=dst)
+        except Exception as e:
+            log_event("calibrate.gcs_upload_failed", error=str(e))
+
+    return jsonify({"status": "ok", "saved_to": calib.path, "samples_used": n, "bins": bins}), 200
+
+# ======================================================================
+# Blueprint 2: Trader (/tasks/trader, /tasks/maintain) — from app_tasks_trader.py
+# ======================================================================
+trader_bp = Blueprint("tasks_trader", __name__)
+
+def _symbols_from_env() -> List[str]:
+    val = os.getenv("SYMBOLS", "")
+    return [s.strip().upper() for s in val.split(",") if s.strip()]
+
+def _is_cron(req) -> bool:
+    return str(req.headers.get("X-Appengine-Cron", "")).lower() == "true"
+
+@trader_bp.route("/tasks/trader", methods=["GET", "POST"])
+def tasks_trader():
+    if not _is_cron(request):
+        return jsonify({"error": "forbidden"}), 403
+
+    syms = _symbols_from_env()
+    exec_live = str(os.getenv("EXECUTE_TRADES", "false")).lower() in ("1", "true", "yes")
+    out: List[Dict[str, Any]] = []
+
+    for sym in syms:
+        try:
+            if exec_live:
+                res = manage_trade(sym)  # 실제 주문 + 브래킷 생성
+            else:
+                sig = generate_signal(sym)  # 드라이런: 신호만 생성
+                res = {"symbol": sym, "action": "dryrun", "signal": sig}
+        except Exception as e:
+            res = {"symbol": sym, "error": str(e)}
+        out.append(res)
+
+    log_event("tasks.trader", execute=exec_live, results=len(out))
+    return jsonify({"status": "ok", "execute": exec_live, "results": out}), 200
+
+@trader_bp.route("/tasks/maintain", methods=["GET", "POST"])
+def tasks_maintain():
+    if not _is_cron(request):
+        return jsonify({"error": "forbidden"}), 403
+
+    syms = _symbols_from_env()
+    results: Dict[str, Any] = {}
+    for sym in syms:
+        try:
+            r = maintain_positions(sym)  # BE 트레일링/타임배리어/브래킷 청소
+        except Exception as e:
+            r = {"action": "error", "error": str(e)}
+        results[sym] = r
+
+    log_event("tasks.maintain", symbols=syms, n=len(syms))
+    return jsonify({"status": "ok", "results": results}), 200
+
 # -----------------------------
-# Routes
+# Flask app & CORS
+# -----------------------------
+app = Flask(__name__)
+server = app  # compat alias
+
+# Register inlined blueprints
+app.register_blueprint(calib_bp)
+app.register_blueprint(trader_bp)
+
+if CORS is not None:
+    cors_origins = []
+    if FRONTEND_BASE_URL:
+        cors_origins = [FRONTEND_BASE_URL]
+    else:
+        cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    CORS(app, resources={r"/api/*": {"origins": cors_origins}}, supports_credentials=False)
+
+# -----------------------------
+# API routes (from original app.py)
 # -----------------------------
 @app.route("/health")
 def health():
@@ -288,7 +395,6 @@ def health():
 def root():
     if FRONTEND_BASE_URL:
         return redirect(FRONTEND_BASE_URL, code=302)
-    # fallback info page
     html = f"""
     <!doctype html>
     <html><head>
@@ -312,45 +418,9 @@ def root():
 
 @app.route("/dashboard")
 def dashboard_redirect():
-    # Option B: redirect to SPA
     if FRONTEND_BASE_URL:
         return redirect(FRONTEND_BASE_URL, code=302)
-    # else same as root()
     return root()
-
-@app.route("/tasks/trader", methods=["GET", "POST"])
-def tasks_trader():
-    """
-    Trigger signal generation (and optionally execution) for given symbols.
-    Query/body:
-      - symbols: comma-separated (default from env SYMBOLS)
-      - debug=1 : include exceptions in result
-    """
-    debug = str(request.args.get("debug") or request.form.get("debug") or "0") in ("1", "true", "yes")
-    symbols_raw = request.args.get("symbols") or request.form.get("symbols") or ",".join(SYMBOLS)
-    symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
-    results: List[Dict[str, Any]] = []
-
-    for sym in symbols:
-        try:
-            # Triple-barrier/time cleanup before entering new trades
-            maint = None
-            try:
-                maint = maintain_positions(sym)
-            except Exception:
-                maint = {"action": "none"}
-            if EXECUTE_TRADES:
-                out = manage_trade(sym)
-                results.append({"symbol": sym, "maintenance": maint, "result": out})
-            else:
-                sig = generate_signal(sym)
-                results.append({"symbol": sym, "maintenance": maint, "result": sig.get("result") or sig})
-        except Exception as e:
-            if debug:
-                results.append({"symbol": sym, "error": repr(e)})
-            else:
-                results.append({"symbol": sym, "error": "failed"})
-    return _json_ok(results=results, executed=bool(EXECUTE_TRADES))
 
 @app.route("/api/overview")
 def api_overview():
@@ -393,7 +463,6 @@ def api_signals_latest():
     symbol = (request.args.get("symbol") or SYMBOLS[0]).upper()
     try:
         sig = generate_signal(symbol)
-        # Ensure shape friendly to frontend
         out = sig.get("result") if isinstance(sig, dict) else None
         return _json_ok(symbol=symbol, **({"result": out} if out else {"raw": sig}))
     except Exception as e:
@@ -409,7 +478,6 @@ def api_candles():
         limit = 500
     try:
         df = fetch_ohlcv(symbol, interval=tf, limit=limit)
-        # to list of dicts {t,o,h,l,c,v}
         rows: List[Dict[str, Any]] = []
         if df is not None and len(df) > 0:
             for _, r in df.iterrows():
@@ -438,10 +506,7 @@ def api_orderbook():
         return _json_ok(symbol=symbol, orderbook=ob)
     except Exception as e:
         return _json_err("orderbook_failed", error=str(e))
-# app.py 상단 import에 추가
 
-
-# 아래와 같이 라우트 추가
 @app.route("/api/open_orders", methods=["GET"])
 def api_open_orders():
     symbol = request.args.get("symbol")
