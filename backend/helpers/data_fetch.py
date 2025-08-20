@@ -320,28 +320,52 @@ def compute_atr(df: Optional[pd.DataFrame], window: int = 14) -> pd.Series:
     atr = tr.rolling(window=window, min_periods=1).mean()
     return atr
 
-
 def compute_orderbook_stats(ob: Optional[Dict[str, Any]]) -> Dict[str, float]:
-    """오더북 요약: 스프레드(bps), 수량 불균형."""
-    if not isinstance(ob, dict):
-        return {"spread": 0.0, "imbalance": 0.0}
-    bids = ob.get("bids") or []
-    asks = ob.get("asks") or []
-    if not bids or not asks:
-        return {"spread": 0.0, "imbalance": 0.0}
+    """
+    오더북 요약:
+      - spread(bps): (ask-bid)/mid * 1e4
+      - imbalance: 10레벨 누적 (bid_qty-ask_qty)/(bid_qty+ask_qty)
+      - mid: (bid+ask)/2
+      - microprice: (ask*bid_vol + bid*ask_vol) / (bid_vol + ask_vol)
+      - micro_dislocation_bps: (microprice-mid)/mid * 1e4
+    """
+    try:
+        if not isinstance(ob, dict):
+            return {"spread": 0.0, "imbalance": 0.0, "mid": 0.0, "microprice": 0.0, "micro_dislocation_bps": 0.0}
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+        if not bids or not asks:
+            return {"spread": 0.0, "imbalance": 0.0, "mid": 0.0, "microprice": 0.0, "micro_dislocation_bps": 0.0}
 
-    best_bid = float(bids[0][0])
-    best_ask = float(asks[0][0])
-    mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else 0.0
-    spread_bps = ((best_ask - best_bid) / mid * 10_000.0) if mid > 0 else 0.0
+        # top-of-book
+        best_bid = float(bids[0][0]); best_ask = float(asks[0][0])
+        mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else 0.0
+        spread_bps = ((best_ask - best_bid) / mid * 10_000.0) if mid > 0 else 0.0
 
-    bid_qty = float(sum(q for _, q in bids[:10]))
-    ask_qty = float(sum(q for _, q in asks[:10]))
-    tot = bid_qty + ask_qty
-    imbalance = (bid_qty - ask_qty) / tot if tot > 0 else 0.0
-    return {"spread": float(spread_bps), "imbalance": float(imbalance)}
+        # 10레벨 누적
+        bid_qty = float(sum(float(q) for _, q in bids[:10]))
+        ask_qty = float(sum(float(q) for _, q in asks[:10]))
+        tot = bid_qty + ask_qty
+        imbalance = (bid_qty - ask_qty) / tot if tot > 0 else 0.0
 
+        # microprice (유동성 가중)
+        if tot > 0:
+            micro = ((best_ask * bid_qty) + (best_bid * ask_qty)) / tot
+        else:
+            micro = mid
 
+        disloc_bps = ((micro - mid) / mid * 10_000.0) if (mid > 0) else 0.0
+
+        return {
+            "spread": float(spread_bps),
+            "imbalance": float(imbalance),
+            "mid": float(mid),
+            "microprice": float(micro),
+            "micro_dislocation_bps": float(disloc_bps),
+        }
+    except Exception:
+        return {"spread": 0.0, "imbalance": 0.0, "mid": 0.0, "microprice": 0.0, "micro_dislocation_bps": 0.0}
+    
 def compute_recent_price_sequence(df: Optional[pd.DataFrame], n: int = 10) -> List[float]:
     """최근 n개 종가 시퀀스(리스트)"""
     if df is None or len(df) == 0:

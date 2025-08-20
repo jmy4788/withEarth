@@ -53,12 +53,15 @@ _api_secret = get_secret("BINANCE_API_SECRET") or os.getenv("BINANCE_API_SECRET"
 if not _api_key or not _api_secret:
     logger.warning("Binance API key/secret not provided; running in unauthenticated mode.")
 
-_USE_TESTNET = os.getenv("BINANCE_FUTURES_TESTNET", "").lower() in ("1", "true", "yes")
+_USE_TESTNET = (
+    os.getenv("BINANCE_FUTURES_TESTNET", "") or os.getenv("BINANCE_USE_TESTNET", "")
+).lower() in ("1", "true", "yes")
 _BASE_PATH = (
     DERIVATIVES_TRADING_USDS_FUTURES_REST_API_TESTNET_URL
     if _USE_TESTNET
     else DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
 )
+
 _TIMEOUT_MS = int(os.getenv("BINANCE_HTTP_TIMEOUT_MS", "10000"))
 _RETRIES = int(os.getenv("BINANCE_HTTP_RETRIES", "3"))
 _BACKOFF_MS = int(os.getenv("BINANCE_HTTP_BACKOFF_MS", "1000"))
@@ -67,6 +70,8 @@ _BACKOFF_MS = int(os.getenv("BINANCE_HTTP_BACKOFF_MS", "1000"))
 _TP_ORDER_TYPE = os.getenv("TP_ORDER_TYPE", "LIMIT").strip().upper()
 # limit error fallback to market
 _LIMIT_FAILOVER_TO_MARKET = str(os.getenv("LIMIT_FAILOVER_TO_MARKET", "true")).lower() in ("1", "true", "yes")
+_SL_ORDER_TYPE = os.getenv("SL_ORDER_TYPE", "STOP_MARKET").strip().upper()  # STOP_MARKET | STOP
+_SL_LIMIT_SLIPPAGE_BPS = float(os.getenv("SL_LIMIT_SLIPPAGE_BPS", "10.0"))  # STOP_LIMIT 시 리밋 오프셋(bps)
 
 _config = ConfigurationRestAPI(
     api_key=_api_key or "",
@@ -484,7 +489,9 @@ def place_market_order(symbol: str, side: str, quantity: float, reduce_only: boo
         logger.error("place_market_order error: %s", e)
         raise
 
-def place_limit_order(symbol: str, side: str, quantity: float, price: float, time_in_force: str = "GTC", reduce_only: bool = False) -> Dict[str, Any]:
+def place_limit_order(symbol: str, side: str, quantity: float, price: float,
+                      time_in_force: str = "GTC", reduce_only: bool = False,
+                      post_only: bool = False) -> Dict[str, Any]:
     client = _get_client()
     side = side.upper()
     ps = _position_side()
@@ -496,7 +503,7 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float, tim
         "symbol": symbol,
         "side": side,
         "type": "LIMIT",
-        "time_in_force": time_in_force,
+        "time_in_force": time_in_force,  # GTC | IOC | FOK | GTX(POST-ONLY)
         "price": _format_to_tick_str(symbol, px),
         "quantity": str(q),
         "reduce_only": bool(reduce_only),
@@ -518,7 +525,8 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float, tim
         return data if isinstance(data, dict) else {"raw": data}
     except Exception as e:
         logger.error("place_limit_order error: %s", e)
-        if _LIMIT_FAILOVER_TO_MARKET:
+        # POST-ONLY 의도일 때는 MARKET 폴백 금지
+        if _LIMIT_FAILOVER_TO_MARKET and (not post_only):
             logger.info("Falling back to MARKET due to limit error for %s: %s", symbol, e)
             return place_market_order(symbol, side, quantity, reduce_only=reduce_only)
         raise
@@ -578,8 +586,43 @@ def place_stop_market(symbol: str, opp_side: str, quantity: float, sl_price: flo
     data = _to_plain(raw)
     return data if isinstance(data, dict) else {"raw": data}
 
+def place_stop_limit(symbol: str, opp_side: str, quantity: float, stop_price: float,
+                     limit_slippage_bps: float = _SL_LIMIT_SLIPPAGE_BPS) -> Dict[str, Any]:
+    """
+    STOP_LIMIT(SL=STOP) 생성.
+    SELL(롱 청산): limit = stop * (1 - ε)
+    BUY (숏 청산): limit = stop * (1 + ε)
+    """
+    client = _get_client()
+    ps = _position_side()
+    opp_side = opp_side.upper()
+    eps = float(limit_slippage_bps) / 1e4
+    if opp_side == "SELL":
+        limit_px = stop_price * (1.0 - eps)
+    else:
+        limit_px = stop_price * (1.0 + eps)
+    limit_px = normalize_price_for_side(symbol, limit_px, opp_side)
+
+    payload = {
+        "symbol": symbol,
+        "side": opp_side,
+        "type": "STOP",
+        "time_in_force": "GTC",
+        "price": _format_to_tick_str(symbol, limit_px),
+        "stop_price": _format_to_tick_str(symbol, stop_price),
+        "working_type": "MARK_PRICE",
+        "quantity": str(quantity),
+        "reduce_only": True,
+        "position_side": ps,
+    }
+    log_event("binance.order.request", **payload)
+    resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
+    raw = resp.data() if hasattr(resp, "data") else resp
+    data = _to_plain(raw)
+    return data if isinstance(data, dict) else {"raw": data}
+
 def place_bracket_orders(symbol: str, side: str, quantity: float, take_profit: float, stop_loss: float) -> Dict[str, Any]:
-    """엔트리 직후 브래킷(RO) 생성: TP(LIMIT|MARKET), SL(STOP_MARKET)"""
+    """엔트리 직후 브래킷(RO) 생성: TP(LIMIT|MARKET), SL(STOP_MARKET|STOP)"""
     side = side.upper()
     opp = "SELL" if side == "BUY" else "BUY"
 
@@ -603,10 +646,13 @@ def place_bracket_orders(symbol: str, side: str, quantity: float, take_profit: f
         logger.info("place_bracket_orders TP failed: %s", e)
 
     try:
-        sl_data = place_stop_market(symbol, opp, qty_q, sl_price)
+        if _SL_ORDER_TYPE == "STOP":
+            sl_data = place_stop_limit(symbol, opp, qty_q, sl_price, limit_slippage_bps=_SL_LIMIT_SLIPPAGE_BPS)
+        else:
+            sl_data = place_stop_market(symbol, opp, qty_q, sl_price)
         sl_plain = _to_plain(sl_data)
         log_event("binance.order.response",
-                  symbol=symbol, side=opp, type="STOP_MARKET",
+                  symbol=symbol, side=opp, type=("STOP" if _SL_ORDER_TYPE=="STOP" else "STOP_MARKET"),
                   orderId=(sl_plain.get("orderId") if isinstance(sl_plain, dict) else None),
                   status=(sl_plain.get("status") if isinstance(sl_plain, dict) else None),
                   price=None, qty=qty_q, raw=sl_plain)
