@@ -127,6 +127,9 @@ MTF_RSI_LONG_MIN = float(os.getenv("MTF_RSI_LONG_MIN", "48"))
 MTF_RSI_SHORT_MAX = float(os.getenv("MTF_RSI_SHORT_MAX", "52"))
 ENTRY_COOLDOWN_MIN = int(os.getenv("ENTRY_COOLDOWN_MIN", "10"))
 
+RR_GATE_MODE = os.getenv("RR_GATE_MODE", "worst").lower()  # worst | expected | best
+MAKER_PROB_LOOKBACK = int(os.getenv("MAKER_PROB_LOOKBACK", "200"))
+
 # =====================
 # 데이터 구조
 # =====================
@@ -150,6 +153,77 @@ class SignalOut:
 # ==============
 # 유틸리티
 # ==============
+def _estimate_p_maker_from_journal() -> float:
+    """
+    최근 trades.csv와 limit 엔트리 메타(maintain/exec 로그)를 바탕으로
+    메이커 체결률 근사치를 추정한다. 정보가 부족하면 0.5로.
+    """
+    try:
+        path = os.path.join(LOG_DIR if isinstance(LOG_DIR, str) else str(LOG_DIR), "trades.csv")
+        if not os.path.exists(path):
+            return 0.5
+        import csv
+        rows = []
+        with open(path, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                rows.append(row)
+        if not rows:
+            return 0.5
+        rows = rows[-MAKER_PROB_LOOKBACK:]
+        # 힌트: LIMIT 체결(폴백X) 사례를 메이커로 인정
+        # exec_res에 대한 정밀 표시는 trades.csv엔 없으므로, 보수적 휴리스틱 사용:
+        # - qty가 0이 아닌 LIMIT 모드 엔트리이며 TTL 이후 MARKET 폴백으로 기록된 특이 로그가 드문 경우 메이커 가정↑
+        # - 데이터 부족 시 0.5
+        # 더 나은 해법: manage_trade에서 maker/taker 플래그를 trades.csv에 직접 기록(아래 5‑D 패치 참조)
+        cnt = len(rows)
+        return 0.5 if cnt < 20 else 0.6  # 데이터 없으면 중립, 임시 상수
+    except Exception:
+        return 0.5
+
+def _rr_with_fee_mode(entry: float, tp: float, sl: float) -> float:
+    """
+    RR_EVAL_WITH_FEES=true일 때 RR_GATE_MODE에 따라 순RR을 계산.
+    - worst: 현재와 동일(엔트리=테이커 가정 가능)
+    - best: 엔트리=메이커 가정
+    - expected: p_maker로 기대 수수료 적용
+    """
+    if not RR_EVAL_WITH_FEES:
+        # 기존 gross RR
+        if entry <= 0 or tp <= 0 or sl <= 0: return 0.0
+        up_gross = (tp - entry) / entry
+        dn_gross = (entry - sl) / entry
+        return up_gross / max(1e-12, dn_gross)
+
+    # leg별 수수료(bps) 설정
+    maker = FEE_MAKER_BPS / 1e4
+    taker = FEE_TAKER_BPS / 1e4
+
+    def _rr_net_local(e_is_maker: bool, tp_is_maker: bool, sl_is_taker: bool) -> float:
+        e = entry; t = tp; s = sl
+        if e <= 0 or t <= 0 or s <= 0: return 0.0
+        up_gross = (t - e) / e
+        dn_gross = (e - s) / e
+        fee_e  = maker if e_is_maker else taker
+        fee_tp = maker if tp_is_maker else taker
+        fee_sl = taker if sl_is_taker else maker
+        up_net = max(0.0, up_gross - (fee_e + fee_tp))
+        dn_net = max(1e-12, dn_gross + (fee_e + fee_sl))
+        return up_net / dn_net
+
+    # 기존 worst-case 로직
+    entry_is_maker_worst = (ENTRY_MODE == "LIMIT" and ENTRY_POST_ONLY and (not LIMIT_TTL_FALLBACK_TO_MARKET))
+    rr_worst = _rr_net_local(entry_is_maker_worst, TP_ORDER_TYPE == "LIMIT", True)
+    if RR_GATE_MODE == "worst":
+        return rr_worst
+    if RR_GATE_MODE == "best":
+        return _rr_net_local(True, TP_ORDER_TYPE == "LIMIT", True)
+    # expected
+    p_maker = _estimate_p_maker_from_journal()
+    rr_maker = _rr_net_local(True, TP_ORDER_TYPE == "LIMIT", True)
+    rr_taker = _rr_net_local(False, TP_ORDER_TYPE == "LIMIT", True)
+    return max(0.0, p_maker * rr_maker + (1.0 - p_maker) * rr_taker)
+    
 def _df_ok(df: Optional[pd.DataFrame]) -> bool:
     return isinstance(df, pd.DataFrame) and not df.empty and all(c in df.columns for c in ("timestamp","open","high","low","close","volume"))
 
@@ -505,17 +579,25 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         }
 
     # shock against either possible trade direction → block if either countertrend shock exists
+    # 기존: if sg_long or sg_short: ...  → 교체
     sg_long, sg_bps_L, sg_mult_L, _ = _shock_guard_block("long", ohlcv, atr5)
     sg_short, sg_bps_S, sg_mult_S, _ = _shock_guard_block("short", ohlcv, atr5)
-    if sg_long or sg_short:
-        bps = max(sg_bps_L, sg_bps_S)
-        mult = max(sg_mult_L, sg_mult_S)
-        return {
-            "symbol": symbol, "action": "hold", "direction": "hold",
-            "entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
-            "tp": 0.0, "sl": 0.0, "prob": 0.5, "risk_ok": False, "rr": 0.0,
-            "reason": f"pre_gate_shock({bps:.1f}bps,{mult:.2f}ATR)",
-        }
+
+    if (sg_long or sg_short):
+        # 규칙 힌트가 존재하고, 그 힌트 방향과 '쇼크 캔들 방향'이 일치하면 통과(모멘텀 허용)
+        candle_up = float(ohlcv.iloc[-1]["close"]) - float(ohlcv.iloc[-1]["open"]) > 0 if _df_ok(ohlcv) else False
+        shock_dir = "long" if candle_up else "short"
+        if dir_hint in ("long","short") and dir_hint == shock_dir:
+            pass  # allow
+        else:
+            bps = max(sg_bps_L, sg_bps_S)
+            mult = max(sg_mult_L, sg_mult_S)
+            return {
+                "symbol": symbol, "action": "hold", "direction": "hold",
+                "entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
+                "tp": 0.0, "sl": 0.0, "prob": 0.5, "risk_ok": False, "rr": 0.0,
+                "reason": f"pre_gate_shock({bps:.1f}bps,{mult:.2f}ATR)",
+            }
 
     # Optional pre-check: if we already have a confident rule-based hint, ensure MTF alignment before LLM
     if MTF_ALIGN_ENABLED and dir_hint in ("long","short"):
@@ -624,18 +706,10 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         reasons.append(f"entry_cooldown({cd_left2}m_left)")
 
     # ---- 수수료 인지형 RR 평가 ----
-    rr_for_report = rr_gross
-    if RR_EVAL_WITH_FEES:
-        entry_is_maker = (ENTRY_MODE == "LIMIT" and ENTRY_POST_ONLY)
-        tp_is_maker = (TP_ORDER_TYPE == "LIMIT")
-        sl_is_taker = True  # SL은 기본 STOP_MARKET
-        rr_net = _rr_net(entry, tp, sl, entry_is_maker, tp_is_maker, sl_is_taker)
-        rr_for_report = rr_net
-        if rr_net <= 0 or rr_net < rr_req:
-            reasons.append(f"rr_net_below_min({rr_net:.2f}<{rr_req:.2f})")
-    else:
-        if rr_gross <= 0 or rr_gross < rr_req:
-            reasons.append(f"rr_below_min({rr_gross:.2f}<{rr_req:.2f})")
+    rr_for_report = _rr_with_fee_mode(entry, tp, sl)
+    rr_req = RR_MIN_HIGH_PROB if prob >= PROB_RELAX_THRESHOLD else RR_MIN
+    if rr_for_report <= 0 or rr_for_report < rr_req:
+        reasons.append(f"rr_net_below_min({rr_for_report:.2f}<{rr_req:.2f})")
 
     # --- 변동성 가중 사이징(기존 구현 유지) ---
     risk_scalar = 1.0
@@ -949,7 +1023,20 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         else:
             exec_res = _enter_limit_then_brackets(symbol, side, qty, desired_entry=entry, tp=tp, sl=sl)
             mode = "LIMIT"
-
+        # after exec_res prepared
+        entry_fill_is_maker = (mode == "LIMIT" and ENTRY_POST_ONLY and exec_res.get("reprices", 0) >= 0 and exec_res.get("filled_qty", 0) > 0)
+        row = {
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "symbol": symbol,
+            "side": "long" if side == "BUY" else "short",
+            "qty": float(exec_res.get("filled_qty", qty) if mode == "LIMIT" else qty),
+            "entry": float(entry), "tp": float(tp), "sl": float(sl),
+            "exit": 0.0, "pnl": 0.0, "status": "open", "id": "",
+            "entry_maker": int(1 if entry_fill_is_maker else 0),  # <-- 추가
+            "tp_type": TP_ORDER_TYPE,                              # <-- 추가(리포팅용)
+        }
+        headers = ["timestamp","symbol","side","qty","entry","tp","sl","exit","pnl","status","id","entry_maker","tp_type"]
+                
         log_event("signal.decision", symbol=symbol, direction=("long" if side=="BUY" else "short"),
                   prob=float(res.get("prob", 0.0)), entry=float(entry), tp=float(tp), sl=float(sl),
                   rr=float(res.get("rr", 0.0)), risk_ok=True)

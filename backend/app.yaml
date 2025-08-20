@@ -31,18 +31,18 @@ env_variables:
   # --- 리스크/게이팅 ---
   MIN_PROB: "0.65"
   PROB_RELAX_THRESHOLD: "0.78"
-  RR_MIN: "1.25"
+  RR_MIN: "1.2"
   RR_MIN_HIGH_PROB: "1.08"
   RR_EVAL_WITH_FEES: "true"              # ★ 패치-2로 활성화
-  MAX_SPREAD_BPS: "2.0"
+  MAX_SPREAD_BPS: "1.8"
   HORIZON_MIN: "25"
   TIME_BARRIER_ENABLED: "true"
   MIN_VOL_FRAC: "0.0005"
 
   # --- MTF/쇼크/쿨다운 게이트(★ 모두 활성화) ---
   MTF_ALIGN_ENABLED: "true"
-  MTF_RSI_LONG_MIN: "47"
-  MTF_RSI_SHORT_MAX: "53"
+  MTF_RSI_LONG_MIN: "49"
+  MTF_RSI_SHORT_MAX: "51"
   SHOCK_BPS: "30"
   SHOCK_ATR_MULT: "1.8"
   ENTRY_COOLDOWN_MIN: "10"
@@ -57,7 +57,7 @@ env_variables:
   # --- 집행/주문 ---
   ENTRY_MODE: "LIMIT"
   ENTRY_POST_ONLY: "true"                  # ★ 패치-1로 활성화
-  LIMIT_TTL_SEC: "25"
+  LIMIT_TTL_SEC: "20"
   LIMIT_POLL_SEC: "1.0"
   LIMIT_MAX_REPRICES: "2"
   LIMIT_MAX_SLIPPAGE_BPS: "2.0"

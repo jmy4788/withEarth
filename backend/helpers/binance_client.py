@@ -182,14 +182,17 @@ def load_symbol_filters(symbol: str) -> Dict[str, Any]:
 
     price_f = fmap.get("PRICE_FILTER") or {}
     lot_f   = fmap.get("LOT_SIZE") or {}
-    not_f   = fmap.get("NOTIONAL") or {}
+    not_f = fmap.get("MIN_NOTIONAL") or fmap.get("NOTIONAL") or {}
 
     tick = _to_decimal(price_f.get("tickSize") or getattr(price_f, "tickSize", "0.01"))
     step = _to_decimal(lot_f.get("stepSize")   or getattr(lot_f,   "stepSize", "0.001"))
     min_qty = _to_decimal(lot_f.get("minQty")  or getattr(lot_f,   "minQty",   "0.0"))
     max_qty = _to_decimal(lot_f.get("maxQty")  or getattr(lot_f,   "maxQty",   "0.0"))
-    min_notional = _to_decimal(not_f.get("notional") or getattr(not_f, "notional", "5"))
-
+    min_notional = _to_decimal(
+    (not_f.get("minNotional") if isinstance(not_f, dict) else getattr(not_f, "minNotional", None))
+    or (not_f.get("notional") if isinstance(not_f, dict) else getattr(not_f, "notional", None))
+    or "5")
+    
     result = {
         "tickSize": tick,
         "stepSize": step,
@@ -361,18 +364,24 @@ def set_position_mode(mode: str = "ONEWAY") -> None:
     mode = (mode or "").upper()
     dual = True if mode == "HEDGE" else False
     try:
-        _call(
-            client.rest_api,
-            ["change_position_mode", "changePositionMode", "change_position_side_dual"],
-            dual_side_position=str(dual).lower(),
-        )
-        logger.info("Position mode set to %s", mode)
-    except Exception as e:
-        msg = str(getattr(e, "message", str(e)))
-        if "no need to change" in msg.lower():
+        # 1차: snake_case
+        _call(client.rest_api, ["change_position_mode", "changePositionMode", "change_position_side_dual"],
+              dual_side_position=str(dual).lower())
+        logger.info("Position mode set to %s (snake_case)", mode)
+        return
+    except Exception as e1:
+        msg1 = str(getattr(e1, "message", str(e1)))
+        if "no need to change" in msg1.lower():
             logger.info("Position mode already %s", mode)
-        else:
-            logger.error("Position mode set error: %s", msg)
+            return
+        logger.info("Position mode snake_case failed: %s", msg1)
+    try:
+        # 2차: camelCase
+        _call(client.rest_api, ["change_position_mode", "changePositionMode", "change_position_side_dual"],
+              dualSidePosition=str(dual).lower())
+        logger.info("Position mode set to %s (camelCase)", mode)
+    except Exception as e2:
+        logger.error("Position mode set error: %s", str(getattr(e2, "message", str(e2))))
 
 def set_margin_type(symbol: str, margin_type: str = "ISOLATED") -> None:
     client = _get_client()
