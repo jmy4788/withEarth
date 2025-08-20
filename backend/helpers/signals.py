@@ -178,43 +178,64 @@ def _estimate_p_maker_from_journal() -> float:
         return 0.5 if cnt < 20 else 0.6
     except Exception:
         return 0.5
-
-def _rr_with_fee_mode(entry: float, tp: float, sl: float) -> float:
+# helpers/signals.py 內 기존 _rr_with_fee_mode 를 아래로 교체
+def _rr_with_fee_mode(direction: str, entry: float, tp: float, sl: float) -> float:
     """
-    RR_EVAL_WITH_FEES=true일 때 RR_GATE_MODE에 따라 순RR을 계산.
-    - worst: 엔트리=테이커
-    - best:  엔트리=메이커
-    - expected: p_maker 가중 평균
+    RR_EVAL_WITH_FEES=true일 때 RR_GATE_MODE에 따라 '순 RR'을 계산.
+    direction: "long" | "short"
+    - worst   : 엔트리=테이커(또는 POST-ONLY 조건시 메이커), TP=LIMIT면 메이커, SL=테이커 가정
+    - best    : 엔트리/TP=메이커, SL=테이커
+    - expected: p_maker(저널 기반) 혼합
     """
-    if entry <= 0 or tp <= 0 or sl <= 0:
+    e = float(entry); t = float(tp); s = float(sl)
+    if e <= 0 or t <= 0 or s <= 0:
         return 0.0
 
-    # 입력을 수익률 스케일로 변환
-    up_gross = (tp - entry) / entry
-    dn_gross = (entry - sl) / entry
-    if up_gross <= 0 or dn_gross <= 0:
-        return 0.0
     if not RR_EVAL_WITH_FEES:
-        return up_gross / max(1e-12, dn_gross)
+        # gross RR (방향별)
+        if direction == "long":
+            up_gross = (t - e) / e
+            dn_gross = (e - s) / e
+        else:  # short
+            up_gross = (e - t) / e
+            dn_gross = (s - e) / e
+        if dn_gross <= 0:
+            return 0.0
+        return max(0.0, up_gross) / max(1e-12, dn_gross)
 
     maker = FEE_MAKER_BPS / 1e4
     taker = FEE_TAKER_BPS / 1e4
 
-    def rr_case(e_is_maker: bool) -> float:
+    def _rr_net_local(e_is_maker: bool, tp_is_maker: bool, sl_is_taker: bool) -> float:
+        if direction == "long":
+            up_gross = (t - e) / e
+            dn_gross = (e - s) / e
+        else:  # short
+            up_gross = (e - t) / e
+            dn_gross = (s - e) / e
+
         fee_e  = maker if e_is_maker else taker
-        fee_tp = maker if TP_ORDER_TYPE == "LIMIT" else taker
-        fee_sl = taker                                   # SL은 시장형으로 가정
+        fee_tp = maker if tp_is_maker else taker
+        fee_sl = taker if sl_is_taker else maker  # SL은 보통 테이커 체결
+
         up_net = max(0.0, up_gross - (fee_e + fee_tp))
         dn_net = max(1e-12, dn_gross + (fee_e + fee_sl))
         return float(up_net / dn_net)
 
+    # worst: LIMIT+POST_ONLY & 폴백금지 시 메이커 가정 가능
+    entry_is_maker_worst = (ENTRY_MODE == "LIMIT" and ENTRY_POST_ONLY and (not LIMIT_TTL_FALLBACK_TO_MARKET))
+    rr_worst = _rr_net_local(entry_is_maker_worst, TP_ORDER_TYPE == "LIMIT", True)
+    if RR_GATE_MODE == "worst":
+        return rr_worst
     if RR_GATE_MODE == "best":
-        return rr_case(True)
-    if RR_GATE_MODE == "expected":
-        p_maker = _estimate_p_maker_from_journal()
-        return max(0.0, p_maker * rr_case(True) + (1.0 - p_maker) * rr_case(False))
-    # worst
-    return rr_case(False)
+        return _rr_net_local(True, TP_ORDER_TYPE == "LIMIT", True)
+
+    # expected
+    p_maker = _estimate_p_maker_from_journal()
+    rr_maker = _rr_net_local(True, TP_ORDER_TYPE == "LIMIT", True)
+    rr_taker = _rr_net_local(False, TP_ORDER_TYPE == "LIMIT", True)
+    return max(0.0, p_maker * rr_maker + (1.0 - p_maker) * rr_taker)
+
     
 def _df_ok(df: Optional[pd.DataFrame]) -> bool:
     return isinstance(df, pd.DataFrame) and not df.empty and all(c in df.columns for c in ("timestamp","open","high","low","close","volume"))
@@ -605,7 +626,7 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         k_sl=float(os.getenv("ATR_MULT_SL", str(ATR_MULT_SL))),
     )
 
-    rr_for_report = _rr_with_fee_mode(entry, tp, sl)
+    rr_for_report = _rr_with_fee_mode(direction, entry, tp, sl)
     rr_req = RR_MIN_HIGH_PROB if prob >= PROB_RELAX_THRESHOLD else RR_MIN
 
     reasons: List[str] = []
@@ -929,34 +950,22 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         else:
             exec_res = _enter_limit_then_brackets(symbol, side, qty, desired_entry=entry, tp=tp, sl=sl)
             mode = "LIMIT"
-
-        # 메이커 여부 추정(참고치)
-        entry_fill_is_maker = (mode == "LIMIT" and ENTRY_POST_ONLY
-                               and exec_res.get("filled_qty", 0) > 0)
-
-        # 이벤트 로그
-        log_event("signal.decision",
-                  symbol=symbol, direction=("long" if side=="BUY" else "short"),
-                  prob=prob, entry=entry, tp=tp, sl=sl, rr=rr, risk_ok=True, mode=mode)
-
-        # ---- 단일 경로 CSV 저널링 (확장 필드 유지) ----
-        headers = [
-            "timestamp","symbol","side","qty","entry","tp","sl","exit","pnl","status","id",
-            "prob","rr","horizon_min","entry_maker","tp_type","mode"
-        ]
-        row = {
-            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-            "symbol": symbol,
-            "side": "long" if side == "BUY" else "short",
-            "qty": float(exec_res.get("filled_qty", qty) if mode == "LIMIT" else qty),
-            "entry": float(entry), "tp": float(tp), "sl": float(sl),
-            "exit": 0.0, "pnl": 0.0, "status": "open", "id": "",
-            "prob": float(prob), "rr": float(rr), "horizon_min": int(HORIZON_MIN),
-            "entry_maker": int(1 if entry_fill_is_maker else 0),
-            "tp_type": TP_ORDER_TYPE,
-            "mode": mode,
-        }
+            
+        # === 저널 기록 ===
         try:
+            entry_fill_is_maker = (mode == "LIMIT" and ENTRY_POST_ONLY and exec_res.get("filled_qty", 0) > 0)
+            row = {
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "symbol": symbol,
+                "side": "long" if side == "BUY" else "short",
+                "qty": float(exec_res.get("filled_qty", qty) if mode == "LIMIT" else qty),
+                "entry": float(entry), "tp": float(tp), "sl": float(sl),
+                "exit": 0.0, "pnl": 0.0, "status": "open", "id": "",
+                "entry_maker": int(1 if entry_fill_is_maker else 0),
+                "tp_type": TP_ORDER_TYPE,
+            }
+            headers = ["timestamp","symbol","side","qty","entry","tp","sl","exit","pnl","status","id","entry_maker","tp_type"]
+
             os.makedirs(os.path.dirname(TRADES_CSV), exist_ok=True)
             new_file = not os.path.exists(TRADES_CSV)
             import csv
@@ -964,8 +973,9 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 w = csv.DictWriter(f, fieldnames=headers)
                 if new_file: w.writeheader()
                 w.writerow(row)
+
             if gcs_enabled():
-                gcs_append_csv_row("trades", headers, row)  # helpers/utils.py
+                gcs_append_csv_row("trades", headers, row)
         except Exception as e:
             logger.info("journal append failed: %s", e)
 

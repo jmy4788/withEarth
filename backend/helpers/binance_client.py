@@ -799,7 +799,8 @@ def get_position(symbol: str) -> Optional[Dict[str, Any]]:
     def _try_call(with_symbol: bool):
         return _call(
             client.rest_api,
-            ["position_information_v3", "position_information_v2", "position_information", "position_risk"],
+            # 가장 보수적인 엔드포인트부터 시도
+            ["position_risk", "position_information", "position_information_v2", "position_information_v3"],
             **({"symbol": symbol} if with_symbol else {})
         )
 
