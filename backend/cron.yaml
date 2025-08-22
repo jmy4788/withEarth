@@ -12,5 +12,5 @@ cron:
 
 - description: "Calibrate probability curve (daily)"
   url: /tasks/calibrate
-  schedule: every day 04:10
+  schedule: every day 03:40
   timezone: Asia/Seoul

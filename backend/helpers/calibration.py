@@ -2,12 +2,18 @@
 from __future__ import annotations
 import json, os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 import numpy as np
 
+# ---- LOG_DIR 일원화: helpers.utils의 LOG_DIR 사용 ----
+try:
+    from .utils import LOG_DIR as _LOG_DIR_PATH  # Path or str
+    _LOG_DIR_STR = str(_LOG_DIR_PATH)
+except Exception:
+    _LOG_DIR_STR = os.getenv("LOG_DIR", "/tmp/trading_bot")  # 마지막 폴백
+
 # 환경
-_LOG_DIR = os.getenv("LOG_DIR", "./logs")
-_CAL_PATH = os.getenv("PROB_CALIBRATION_PATH", str(Path(_LOG_DIR) / "calibration.json"))
+_CAL_PATH = os.getenv("PROB_CALIBRATION_PATH", str(Path(_LOG_DIR_STR) / "calibration.json"))
 _MIN_SAMPLES = int(os.getenv("CALIB_MIN_SAMPLES", "150"))
 _BINS = int(os.getenv("CALIB_BINS", "10"))
 
@@ -32,7 +38,6 @@ def _interp(x: float, xs: List[float], ys: List[float]) -> float:
     if not xs or not ys or len(xs) != len(ys):
         return x
     x = max(0.0, min(1.0, float(x)))
-    # 구간 내 선형보간
     for i in range(1, len(xs)):
         if x <= xs[i]:
             x0, x1 = xs[i-1], xs[i]
@@ -70,7 +75,7 @@ class ProbCalibrator:
 
     def fit_from_arrays(self, probs: List[float], labels: List[int]) -> bool:
         """
-        labels: 1=승리(TP 우선), 0=패배(SL 우선/기대 미달).
+        labels: 1=승리(TP 우선), 0=패배(SL/타임아웃 등).
         데이터 부족/단조 위반 시 False.
         """
         n = min(len(probs), len(labels))
@@ -78,6 +83,7 @@ class ProbCalibrator:
             return False
         p = np.clip(np.asarray(probs[:n], dtype=float), 0.0, 1.0)
         y = np.asarray(labels[:n], dtype=int)
+
         # 등폭 bin
         edges = np.linspace(0, 1, self.bins + 1)
         means_x, means_y = [], []
@@ -87,17 +93,19 @@ class ProbCalibrator:
             if mask.sum() < 5:
                 continue
             px = float(p[mask].mean())
-            py = float(y[mask].mean())  # 경험적 중첩확률
+            py = float(y[mask].mean())
             means_x.append(px)
             means_y.append(py)
         if len(means_x) < 3:
             return False
-        # 단조(비감소) 강제
+
+        # 단조 비감소 강제
         mono = []
         last = 0.0
         for v in means_y:
             last = max(last, float(v))
             mono.append(last)
+
         self.bin_edges = means_x
         self.bin_means = mono
         self.save()
@@ -114,4 +122,11 @@ _CAL = ProbCalibrator()
 def calibrate_prob(prob: float) -> float:
     return _CAL.calibrate(prob)
 
-__all__ = ["ProbCalibrator", "calibrate_prob"]
+def reload_global() -> None:
+    """cron 캘리브레이션 직후 메모리 테이블을 핫리로드."""
+    try:
+        _CAL._load()
+    except Exception:
+        pass
+
+__all__ = ["ProbCalibrator", "calibrate_prob", "reload_global"]

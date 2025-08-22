@@ -232,51 +232,62 @@ def _import_samples_loader():
     return None
 
 @calib_bp.route("/tasks/calibrate", methods=["GET", "POST"])
+# app.py 中 일부만 교체: calib_bp.route("/tasks/calibrate") 함수
+@calib_bp.route("/tasks/calibrate", methods=["GET", "POST"])
 def tasks_calibrate():
-    # App Engine Cron 보호
+    # App Engine Cron 보호: 내부 크론 호출만 허용
     if request.headers.get("X-Appengine-Cron", "").lower() != "true":
         return jsonify({"error": "forbidden"}), 403
+
+    # imports kept local to avoid import cost if not used
+    import os
+    from pathlib import Path
     try:
-        from helpers.calibration import ProbCalibrator  # file-backed calibrator
+        from helpers.calibration import ProbCalibrator, reload_global
     except Exception as e:
-        return jsonify({"status":"error","message":f"calibrator_import_failed: {e}"}), 500
+        return jsonify({"status": "error", "message": f"calibrator_import_failed: {e}"}), 500
+    try:
+        from tools.calibrate_from_trades import load_samples  # samples from trades.csv
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"samples_import_failed: {e}"}), 500
 
     symbols_env = os.getenv("SYMBOLS", "")
     only_symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
     horizon_min = int(os.getenv("HORIZON_MIN", "30"))
     min_samples = int(os.getenv("CALIB_MIN_SAMPLES", "150"))
     bins = int(os.getenv("CALIB_BINS", "10"))
+
     log_dir = Path(os.getenv("LOG_DIR", "./logs"))
     trades_csv = log_dir / "trades.csv"
 
-    loader = _import_samples_loader()
-    if loader is None:
-        logger.info("Using fallback calibrate loader (no external module)")
-        samples = _fallback_load_samples(trades_csv, only_symbols)
-    else:
-        try:
-            samples = loader(trades_csv, horizon_min, only_symbols)
-        except Exception as e:
-            logger.info("External loader failed, fallback: %s", e)
-            samples = _fallback_load_samples(trades_csv, only_symbols)
-
+    # 1) collect samples
+    samples = load_samples(trades_csv, horizon_min, only_symbols=only_symbols)
     n = len(samples)
     log_event("calibrate.collect", symbols=only_symbols or "ALL", horizon_min=horizon_min, samples=n)
 
     if n < min_samples:
-        return jsonify({"status":"skipped","reason":"insufficient_samples","n":n,"min_samples":min_samples}), 200
+        return jsonify({"status": "skipped", "reason": "insufficient_samples", "n": n, "min_samples": min_samples}), 200
 
     probs = [s.prob for s in samples]
     labels = [s.label for s in samples]
 
+    # 2) fit + save
     calib = ProbCalibrator(bins=bins, min_samples=min_samples)
     ok = calib.fit_from_arrays(probs, labels)
     if not ok:
-        return jsonify({"status":"failed","reason":"fit_failed"}), 200
+        return jsonify({"status": "failed", "reason": "fit_failed"}), 200
 
     calib.save()
     log_event("calibrate.saved", path=calib.path, bins=bins, n=n)
 
+    # 2.5) in-memory 테이블 핫리로드
+    try:
+        reload_global()
+        log_event("calibrate.reloaded")
+    except Exception as e:
+        log_event("calibrate.reload_failed", error=str(e))
+
+    # 3) optional GCS upload
     if gcs_enabled():
         try:
             from google.cloud import storage  # type: ignore
@@ -291,7 +302,7 @@ def tasks_calibrate():
         except Exception as e:
             log_event("calibrate.gcs_upload_failed", error=str(e))
 
-    return jsonify({"status":"ok","saved_to": calib.path, "samples_used": n, "bins": bins}), 200
+    return jsonify({"status": "ok", "saved_to": calib.path, "samples_used": n, "bins": bins}), 200
 
 # ======================================================================
 # Blueprint 2: Trader (/tasks/trader, /tasks/maintain)

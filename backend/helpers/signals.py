@@ -1,4 +1,6 @@
-# helpers/signals.py — 3rd pass (balance-% sizing, journaling/telemetry extended) — 2025-08-22
+# helpers/signals.py — 3rd pass (balance-% sizing, journaling/telemetry extended)
+# Hotfix-1: export get_overview() for app.py import
+# Hotfix-2: restore _last_open_trade_timestamp() used by cooldown/time-barrier
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 import logging, os, uuid
@@ -61,7 +63,7 @@ logger.setLevel(logging.INFO)
 MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))
 RR_MIN = float(os.getenv("RR_MIN", "1.20"))
 
-# ATR-based levels (user’s current values respected)
+# ATR-based levels (respect current user values)
 ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "2.2"))
 ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.2"))
 
@@ -188,7 +190,7 @@ def _best_quotes(symbol: str) -> Tuple[Optional[float], Optional[float]]:
         pass
     return None, None
 
-# === maker probability estimate (for RR expected-mode) ===
+# maker-prob estimate (for RR expected-mode)
 def _estimate_p_maker_from_journal() -> float:
     try:
         path = TRADES_CSV
@@ -212,7 +214,7 @@ def _estimate_p_maker_from_journal() -> float:
     except Exception:
         return 0.5
 
-# === RR with fees (worst/best/expected) ===
+# RR with fees (worst/best/expected)
 def _rr_with_fee_mode(direction: str, entry: float, tp: float, sl: float) -> float:
     e = float(entry); t = float(tp); s = float(sl)
     if e <= 0 or t <= 0 or s <= 0: return 0.0
@@ -223,7 +225,6 @@ def _rr_with_fee_mode(direction: str, entry: float, tp: float, sl: float) -> flo
             up_gross = (e - t) / e; dn_gross = (s - e) / e
         if dn_gross <= 0: return 0.0
         return max(0.0, up_gross) / max(1e-12, dn_gross)
-
     maker = FEE_MAKER_BPS / 1e4
     taker = FEE_TAKER_BPS / 1e4
     def _rr_net_local(e_is_maker: bool, tp_is_maker: bool, sl_is_taker: bool) -> float:
@@ -237,19 +238,17 @@ def _rr_with_fee_mode(direction: str, entry: float, tp: float, sl: float) -> flo
         up_net = max(0.0, up_gross - (fee_e + fee_tp))
         dn_net = max(1e-12, dn_gross + (fee_e + fee_sl))
         return float(up_net / dn_net)
-
     entry_is_maker_worst = (ENTRY_MODE == "LIMIT" and ENTRY_POST_ONLY and (not LIMIT_TTL_FALLBACK_TO_MARKET))
     if RR_GATE_MODE == "worst":
         return _rr_net_local(entry_is_maker_worst, TP_ORDER_TYPE == "LIMIT", True)
     if RR_GATE_MODE == "best":
         return _rr_net_local(True, TP_ORDER_TYPE == "LIMIT", True)
-
     p_maker = _estimate_p_maker_from_journal()
     rr_maker = _rr_net_local(True, TP_ORDER_TYPE == "LIMIT", True)
     rr_taker = _rr_net_local(False, TP_ORDER_TYPE == "LIMIT", True)
     return max(0.0, p_maker * rr_maker + (1.0 - p_maker) * rr_taker)
 
-# === shock guard / MTF / cooldown ===
+# --- shock guard / MTF / cooldown ---
 def _shock_guard_block(direction: str, ohlcv: pd.DataFrame, atr5: float) -> Tuple[bool, float, float, str]:
     if not _df_ok(ohlcv) or direction not in ("long","short"):
         return False, 0.0, 0.0, ""
@@ -272,6 +271,23 @@ def _mtf_align_ok(direction: str, extra: Dict[str, Any]) -> Tuple[bool, str]:
     else:
         ok = (r1h <= MTF_RSI_SHORT_MAX) and (r4h <= MTF_RSI_SHORT_MAX)
     return ok, "mtf_rsi_mismatch"
+
+# === last-open timestamp (restored) ===
+def _last_open_trade_timestamp(symbol: str) -> Optional[datetime]:
+    try:
+        import csv
+        if not os.path.exists(TRADES_CSV): return None
+        last_ts: Optional[datetime] = None
+        with open(TRADES_CSV, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if str(row.get("symbol","")).upper() != symbol.upper(): continue
+                if str(row.get("status","")).lower() != "open": continue
+                dt = _parse_iso(row.get("timestamp",""))
+                if dt and (last_ts is None or dt > last_ts): last_ts = dt
+        return last_ts
+    except Exception:
+        return None
 
 def _cooldown_active(symbol: str) -> Tuple[bool, int]:
     mins = int(max(0, ENTRY_COOLDOWN_MIN))
@@ -397,9 +413,6 @@ def _rule_backup(ohlcv: pd.DataFrame, trend: Dict[str, Any]) -> Tuple[str, float
 # Balance-% sizing helpers (NEW)
 # ---------------------------------
 def _infer_quote_asset(symbol: str) -> str:
-    """
-    우선 exchangeInfo(raw)에서 quoteAsset을 읽고, 실패 시 알려진 접미사로 추정.
-    """
     try:
         f = load_symbol_filters(symbol)
         raw = f.get("raw") if isinstance(f, dict) else {}
@@ -408,16 +421,12 @@ def _infer_quote_asset(symbol: str) -> str:
         if q: return q
     except Exception:
         pass
-    # fallback: common quote suffix
     for cand in ("FDUSD","USDT","USDC","BUSD","TUSD","DAI","BIDR","EUR","TRY","BRL","USD"):
         if symbol.upper().endswith(cand):
             return cand
     return "USDT"
 
 def _wallet_balance(asset: str, include_upnl: bool = False) -> float:
-    """
-    Binance USDⓈ-M Futures 지갑 잔고 조회. get_overview() 기반.  :contentReference[oaicite:6]{index=6}
-    """
     try:
         ov = _bn_get_overview() or {}
         bals = ov.get("balances") or []
@@ -433,33 +442,23 @@ def _wallet_balance(asset: str, include_upnl: bool = False) -> float:
     return 0.0
 
 def _compute_size(symbol: str, entry: float, sl: float, risk_scalar: float = 1.0) -> Tuple[float, Dict[str, Any]]:
-    """
-    수량과 사이징 메타를 함께 산출.
-    - SIZE_MODE=USDT       → notional = RISK_USDT * risk_scalar
-    - SIZE_MODE=BALANCE_PCT → notional = wallet_balance * (RISK_BAL_PCT/100) * risk_scalar
-    이후 심볼 필터에 맞춰 minNotional/stepSize 보정.  :contentReference[oaicite:7]{index=7}
-    """
     entry = float(entry or 0.0)
     if entry <= 0:
         return 0.0, {"size_mode": SIZE_MODE}
-
     size_mode = (SIZE_MODE or "USDT").upper()
     bal_asset = (SIZE_BAL_ASSET_OVERRIDE or _infer_quote_asset(symbol)).upper()
     include_upnl = bool(SIZE_BAL_INCLUDE_UPNL)
-
     if size_mode.startswith("BAL"):
         wallet = _wallet_balance(bal_asset, include_upnl=include_upnl)
         notional = max(1.0, float(wallet) * max(0.0, float(RISK_BAL_PCT)) / 100.0) * float(risk_scalar)
     else:
         notional = max(1.0, float(RISK_USDT) * float(risk_scalar))
-
     qty = notional / entry
     try:
         f = load_symbol_filters(symbol)
         qty = ensure_min_notional(symbol, qty, price=entry, filters=f)
     except Exception:
         pass
-
     meta = {
         "size_mode": size_mode,
         "bal_asset": bal_asset,
@@ -470,7 +469,6 @@ def _compute_size(symbol: str, entry: float, sl: float, risk_scalar: float = 1.0
         "risk_scalar": float(risk_scalar),
     }
     if size_mode.startswith("BAL"):
-        # 지표/로그 가독성을 위해 잔고도 기록
         try:
             meta["wallet_balance"] = float(_wallet_balance(bal_asset, include_upnl=include_upnl))
         except Exception:
@@ -482,20 +480,14 @@ def _compute_size(symbol: str, entry: float, sl: float, risk_scalar: float = 1.0
 # ---------------------------------
 def generate_signal(symbol: str) -> Dict[str, Any]:
     payload, ohlcv, ob = _build_payload(symbol)
-
-    # PRE #0: volatility & spread
     spread_bps_gate = float((payload.get("extra") or {}).get("orderbook_spread", 0.0))
     proceed_basic = should_predict(payload, min_vol_frac_env="MIN_VOL_FRAC") and _spread_ok(spread_bps_gate)
-
-    # PRE #1: cooldown / shock
     dir_hint, _ = _rule_backup(ohlcv, payload.get("trend_filter") or {})
     atr5 = float((payload.get("extra") or {}).get("ATR_5m") or 0.0)
-
     cd_active, cd_left = _cooldown_active(symbol)
     if cd_active:
         return {"symbol": symbol, "action":"hold","direction":"hold","entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
                 "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,"reason": f"pre_gate_cooldown({cd_left}m_left)"}
-
     sg_long, bpsL, multL, _ = _shock_guard_block("long", ohlcv, atr5)
     sg_short, bpsS, multS, _ = _shock_guard_block("short", ohlcv, atr5)
     if (sg_long or sg_short):
@@ -505,8 +497,6 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
             bps = max(bpsL, bpsS); mult = max(multL, multS)
             return {"symbol":symbol,"action":"hold","direction":"hold","entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
                     "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,"reason": f"pre_gate_shock({bps:.1f}bps,{mult:.2f}ATR)"}
-
-    # LLM or rule backup
     if not proceed_basic:
         trend = payload.get("trend_filter") or {}
         direction_rb, prob_rb = _rule_backup(ohlcv, trend)
@@ -524,23 +514,18 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
             prob = float(calibrate_prob(prob))
         llm_support = llm_decision.get("support")
         llm_resistance = llm_decision.get("resistance")
-
     entry = float((payload.get("entry_5m") or {}).get("close") or 0.0)
     extra = payload.get("extra") or {}
     spread_bps = float(extra.get("orderbook_spread") or 0.0)
-
     if direction not in ("long","short") or entry <= 0:
         log_event("signal.decision", symbol=symbol, direction="hold", prob=prob, entry=entry, tp=0.0, sl=0.0, rr=0.0, risk_ok=False)
         return {"symbol":symbol,"action":"hold","direction":"hold","entry":entry,"tp":0.0,"sl":0.0,"prob":prob,"risk_ok":False,"rr":0.0,"reason":"invalid_direction_or_entry"}
-
     sr_high = float(extra.get("recent_high_5m") or 0.0)
     sr_low  = float(extra.get("recent_low_5m") or 0.0)
     tp, sl = _tp_sl_with_sr_clamp(direction, entry, float(extra.get("ATR_5m") or 0.0), sr_high, sr_low, llm_support, llm_resistance,
                                   k_tp=float(os.getenv("ATR_MULT_TP", str(ATR_MULT_TP))), k_sl=float(os.getenv("ATR_MULT_SL", str(ATR_MULT_SL))))
-
     rr_net = _rr_with_fee_mode(direction, entry, tp, sl)
     rr_req = RR_MIN_HIGH_PROB if prob >= PROB_RELAX_THRESHOLD else RR_MIN
-
     reasons: List[str] = []
     if prob < MIN_PROB: reasons.append("prob_below_threshold")
     if not _spread_ok(spread_bps): reasons.append(f"wide_spread({spread_bps:.2f}bps)")
@@ -551,8 +536,6 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
     cd_active2, cd_left2 = _cooldown_active(symbol)
     if cd_active2: reasons.append(f"entry_cooldown({cd_left2}m_left)")
     if rr_net <= 0 or rr_net < rr_req: reasons.append(f"rr_net_below_min({rr_net:.2f}<{rr_req:.2f})")
-
-    # 변동성 가중 스케일
     risk_scalar = 1.0
     try:
         if VOL_SIZE_SCALING and _df_ok(ohlcv):
@@ -563,11 +546,9 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
                 risk_scalar = max(VOL_SCALAR_MIN, min(VOL_SCALAR_MAX, med / cur))
     except Exception:
         risk_scalar = 1.0
-
     risk_ok = (len(reasons) == 0)
     log_event("signal.gate", symbol=symbol, direction=direction, prob=float(prob), spread_bps=float(spread_bps),
               rr=float(rr_net), rr_req=float(rr_req), rr_mode=RR_GATE_MODE, reasons=";".join(reasons) if reasons else "ok")
-
     telemetry = {
         "spread_bps": float(spread_bps),
         "atr_now": float(extra.get("ATR_5m") or 0.0),
@@ -576,7 +557,6 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         "rr_gate_mode": RR_GATE_MODE,
         "sizing_mode": SIZE_MODE,
     }
-
     out = {
         "symbol": symbol,
         "action": "enter" if risk_ok else "hold",
@@ -635,7 +615,6 @@ def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
     side = side.upper()
     tif = "GTX" if ENTRY_POST_ONLY else "GTC"
     last_submitted: Optional[float] = None
-
     def _post_only_px() -> Optional[float]:
         bid, ask = _best_quotes(symbol)
         if bid is None or ask is None: return None
@@ -653,29 +632,21 @@ def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
             if bid and tick > 0 and px <= bid:
                 px = normalize_price_for_side(symbol, bid + tick, side="SELL")
             return float(px)
-
     def _next_px(prev: Optional[float]) -> Optional[float]:
         return _post_only_px() if ENTRY_POST_ONLY else _limit_price_for_side(symbol, side, desired_entry, prev)
-
-    # 1st attempt
     price = _next_px(None)
     if price is None or price <= 0: raise RuntimeError("Could not determine limit price")
     try:
         entry_res = place_limit_order(symbol, side, quantity=qty, price=price, time_in_force=tif, reduce_only=False, post_only=ENTRY_POST_ONLY)
     except Exception:
         entry_res = {"type": ("LIMIT_POST_ONLY_REJECTED" if ENTRY_POST_ONLY else "LIMIT_FAILOVER_MARKET")}
-
     filled = 0.0; reprices = 0; used_market_fallback = False
     from time import sleep, time as _t
     deadline = _t() + float(LIMIT_TTL_SEC)
-
-    # poll fill
     while _t() < deadline:
         q = _position_qty_after_fill(symbol, side)
         if q >= (qty * 0.95): filled = q; break
         sleep(max(0.1, float(LIMIT_POLL_SEC)))
-
-    # reprices loop
     while filled <= 0 and reprices < LIMIT_MAX_REPRICES:
         reprices += 1
         try: cancel_open_orders(symbol)
@@ -692,8 +663,6 @@ def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
             if q >= (qty * 0.95): filled = q; break
             sleep(max(0.1, float(LIMIT_POLL_SEC)))
         if filled > 0: break
-
-    # market fallback
     if filled <= 0 and LIMIT_TTL_FALLBACK_TO_MARKET:
         try:
             entry_res = place_market_order(symbol, side, quantity=qty, reduce_only=False)
@@ -701,16 +670,12 @@ def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
             filled = _position_qty_after_fill(symbol, side)
         except Exception as e:
             logger.info("market fallback after TTL failed: %s", e)
-
-    # bracket orders
     brackets = {"take_profit": None, "stop_loss": None}
     if filled > 0:
         try:
             brackets = place_bracket_orders(symbol, side, filled, take_profit=tp, stop_loss=sl)
         except Exception as e:
             logger.info("placing brackets failed: %s", e)
-
-    # best-effort fill price readback
     fill_px = 0.0
     try:
         pos = get_position(symbol) or {}
@@ -732,7 +697,6 @@ def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
                     fill_px = float(px) if px is not None else 0.0
         except Exception:
             pass
-
     return {"entry_order": entry_res, "brackets": brackets, "filled_qty": float(filled),
             "reprices": reprices, "used_market_fallback": bool(used_market_fallback),
             "entry_price": float(fill_px)}
@@ -803,7 +767,6 @@ def _rewrite_trades_csv(rows: list, pref_headers: Optional[list] = None) -> None
         "timestamp","symbol","side","qty","entry","entry_intent","tp","sl","exit","pnl","status","id",
         "prob","rr","entry_maker","tp_type","mode","reprices","used_market_fallback","post_only",
         "spread_bps","atr_now","funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
-        # NEW sizing meta columns
         "size_mode","bal_asset","notional","bal_pct",
     ]
     headers = [k for k in base if k in keys] + [k for k in sorted(keys) if k not in base]
@@ -856,7 +819,6 @@ def _settle_by_orders(symbol: str) -> bool:
 
 def maintain_positions(symbol: str) -> Dict[str, Any]:
     try:
-        # 1) time-barrier exit
         if _time_barrier_due(symbol):
             od = _close_position_market(symbol)
             exitp = 0.0
@@ -870,8 +832,6 @@ def maintain_positions(symbol: str) -> Dict[str, Any]:
             if exitp > 0:
                 _journal_close_last(symbol, exitp, reason="time_exit")
             return {"action": "time_exit", "order": od or {}}
-
-        # 2) BE trailing
         if BE_TRAILING_ENABLED:
             p = get_position(symbol) or {}
             amt = float(p.get("positionAmt") or p.get("positionAmount") or 0.0)
@@ -899,8 +859,6 @@ def maintain_positions(symbol: str) -> Dict[str, Any]:
                                 return {"action": "be_move", "new_stop": new_sl, "details": replaced}
                             except Exception as e:
                                 logger.info("be_trailing replace SL failed for %s: %s", symbol, e)
-
-        # 3) flat position → settle by orders
         p = get_position(symbol) or {}
         amt = float(p.get("positionAmt") or p.get("positionAmount") or 0.0)
         if abs(amt) <= 1e-12:
@@ -912,7 +870,6 @@ def maintain_positions(symbol: str) -> Dict[str, Any]:
             settled = _settle_by_orders(symbol)
             if settled: return {"action": "settled"}
             return {"action": "none"}
-
         return {"action": "none"}
     except Exception as e:
         logger.info("maintain_positions error for %s: %s", symbol, e)
@@ -936,7 +893,6 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         sig = generate_signal(symbol)
         if "result" not in sig or not isinstance(sig["result"], dict):
             return {"symbol": symbol, "error": "no_signal"}
-
         res = sig["result"]
         telemetry = sig.get("telemetry") or {}
         direction = res.get("direction", "hold")
@@ -948,30 +904,22 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         risk_ok = bool(res.get("risk_ok", False))
         reason = sig.get("reason", "")
         risk_scalar = float(res.get("risk_scalar", 1.0)) if "risk_scalar" in res else float(res.get("risk_scalar", 1.0))
-
         if direction not in ("long","short") or not risk_ok or entry_intent <= 0 or tp <= 0 or sl <= 0:
             return {"symbol": symbol, "action": "hold", "direction": direction,
                     "entry": entry_intent, "tp": tp, "sl": sl, "prob": prob,
                     "risk_ok": False, "rr": rr, "reason": reason or "no_trade_conditions"}
-
         if prob < float(os.getenv("MIN_PROB", "0.60")):
             return {"symbol": symbol, "action": "hold", "direction": direction,
                     "entry": entry_intent, "tp": tp, "sl": sl, "prob": prob,
                     "risk_ok": False, "rr": rr, "reason": "prob_below_threshold"}
-
-        # account setup
         try: set_position_mode(POSITION_MODE)
         except Exception as e: logger.warning("set_position_mode: %s", e)
         try: set_margin_type(symbol, MARGIN_TYPE)
         except Exception as e: logger.warning("set_margin_type: %s", e)
         try: set_leverage(symbol, DEFAULT_LEVERAGE)
         except Exception as e: logger.warning("set_leverage: %s", e)
-
-        # sizing (NEW)
         qty, size_meta = _compute_size(symbol, entry_intent, sl, risk_scalar)
         side = "BUY" if direction == "long" else "SELL"
-
-        # execute
         if ENTRY_MODE == "MARKET":
             entry_res = place_market_order(symbol, side, quantity=qty)
             bracket_res = place_bracket_orders(symbol, side, quantity=qty, take_profit=tp, stop_loss=sl)
@@ -981,7 +929,6 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         else:
             exec_res = _enter_limit_then_brackets(symbol, side, qty, desired_entry=entry_intent, tp=tp, sl=sl)
             mode = "LIMIT"
-
         entry_actual = float(exec_res.get("entry_price") or 0.0)
         if entry_actual <= 0:
             try:
@@ -989,8 +936,6 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 entry_actual = float(pos.get("entryPrice") or 0.0) or entry_intent
             except Exception:
                 entry_actual = entry_intent
-
-        # === journaling (append open) ===
         try:
             row = {
                 "timestamp": _now_utc().isoformat(),
@@ -1013,7 +958,6 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 "reprices": int(exec_res.get("reprices", 0)),
                 "used_market_fallback": "1" if exec_res.get("used_market_fallback", False) else "0",
                 "post_only": "1" if ENTRY_POST_ONLY else "0",
-                # market meta
                 "spread_bps": f"{float(telemetry.get('spread_bps', 0.0)):.6f}",
                 "atr_now": f"{float(telemetry.get('atr_now', 0.0)):.10f}",
                 "funding_pct": f"{float(telemetry.get('funding_pct', 0.0)):.6f}",
@@ -1021,7 +965,6 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 "rr_gate_mode": str(telemetry.get("rr_gate_mode", RR_GATE_MODE)),
                 "reasons": str(sig.get("reason","")),
                 "close_reason": "",
-                # sizing meta (NEW)
                 "size_mode": str(size_meta.get("size_mode","")),
                 "bal_asset": str(size_meta.get("bal_asset","")),
                 "notional": f"{float(size_meta.get('notional', float(qty*entry_intent))):.10f}",
@@ -1032,13 +975,10 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 gcs_append_csv_row("trades", list(row.keys()), row)
         except Exception as e:
             logger.info("journal append failed: %s", e)
-
-        # enrich telemetry
         try:
             log_event("order.size_meta", symbol=symbol, **{k: v for k, v in size_meta.items() if k in ("size_mode","bal_asset","wallet_balance","notional","bal_pct","include_upnl","risk_scalar")})
         except Exception:
             pass
-
         return {"symbol": symbol, "action": "enter", "direction": direction,
                 "entry": entry_actual, "tp": tp, "sl": sl, "prob": prob,
                 "risk_ok": True, "rr": rr, "order": exec_res, "mode": mode}
@@ -1053,7 +993,6 @@ def _journal_append_open(row: Dict[str, Any]) -> None:
         "timestamp","symbol","side","qty","entry","entry_intent","tp","sl","exit","pnl","status","id",
         "prob","rr","entry_maker","tp_type","mode","reprices","used_market_fallback","post_only",
         "spread_bps","atr_now","funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
-        # NEW sizing meta
         "size_mode","bal_asset","notional","bal_pct",
     ]
     if not os.path.exists(TRADES_CSV):
@@ -1066,3 +1005,12 @@ def _journal_append_open(row: Dict[str, Any]) -> None:
             w = csv.DictWriter(f, fieldnames=headers); w.writerow(row)
     else:
         old_rows.append(row); _rewrite_trades_csv(old_rows, pref_headers=headers)
+
+# === NEW: export to app.py ===
+def get_overview() -> Dict[str, Any]:
+    """Pass-through for /api/overview import in app.py."""
+    try:
+        return _bn_get_overview()
+    except Exception as e:
+        logger.info("get_overview passthrough failed: %s", e)
+        return {"balances": [], "positions": []}

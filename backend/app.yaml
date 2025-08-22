@@ -20,7 +20,7 @@ env_variables:
   # --- 모델 ---
   GEMINI_MODEL: "gemini-2.5-flash-lite"
   USE_CALIBRATED_PROB: "true"              # ★ 명시
-  PROB_CALIBRATION_PATH: "logs/calibration.json"
+  PROB_CALIBRATION_PATH: "/tmp/trading_bot/calibration.json"
   CALIB_MIN_SAMPLES: "150"
   CALIB_BINS: "10"
 
@@ -35,7 +35,7 @@ env_variables:
   RR_MIN_HIGH_PROB: "1.08"
   RR_EVAL_WITH_FEES: "true"              # ★ 패치-2로 활성화
   MAX_SPREAD_BPS: "1.5"
-  HORIZON_MIN: "25"
+  HORIZON_MIN: "30"
   TIME_BARRIER_ENABLED: "true"
   MIN_VOL_FRAC: "0.0005"
 
