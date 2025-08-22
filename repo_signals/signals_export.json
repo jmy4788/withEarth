@@ -1,0 +1,25 @@
+{
+    "items": [
+        {
+            "decision": {
+                "direction": "long",
+                "prob": 0.55,
+                "reasoning": "",
+                "resistance": 0.0,
+                "support": 0.0
+            },
+            "file": "040802_BTCUSDT_decision.json"
+        },
+        {
+            "decision": {
+                "direction": "short",
+                "prob": 0.45,
+                "reasoning": "",
+                "resistance": 0.0,
+                "support": 0.0
+            },
+            "file": "040805_ETHUSDT_decision.json"
+        }
+    ],
+    "status": "ok"
+}

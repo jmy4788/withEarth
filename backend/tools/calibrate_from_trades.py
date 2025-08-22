@@ -56,7 +56,7 @@ def load_samples(
         if status == "open":
             continue  # 미결제
 
-        prob = _to_float(row.get("prob"))
+        prob = _to_float(row.get("prob_raw") or row.get("prob"))
         if not (0.0 <= prob <= 1.0):
             continue  # prob 없는 거래는 제외
 

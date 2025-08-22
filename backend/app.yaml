@@ -93,6 +93,8 @@ env_variables:
 
   # ───────── 프런트 리디렉션(옵션) ─────────
   FRONTEND_BASE_URL: ""                        # 배포 프런트엔드 URL (없으면 공백)
+  # --- 로깅 ---
+  LOG_DIR: "/tmp/trading_bot"
 vpc_access_connector:
   name: projects/vaulted-scholar-466013-r5/locations/asia-northeast3/connectors/appengine-conn2
   egress_setting: all-traffic

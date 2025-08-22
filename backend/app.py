@@ -1,12 +1,13 @@
+# app.py — single-file backend (v2 → v2.1 analytics), 2025-08-22
 from __future__ import annotations
 """
-app.py — single-file backend (v2, 2025-08-22)
-- /tasks/calibrate: robust import of external loader with fallback
-- /tasks/trader, /tasks/maintain: unchanged behavior
-- /api/*: unchanged
+변경 요약
+- /tasks/calibrate: robust import of external loader with fallback (중복 데코레이터 제거)
+- /api/metrics, /api/metrics/curve, /api/metrics/calibration 추가
+- 기존 /api/*, /tasks/*, /health 그대로 유지
 """
 
-import csv, glob, json, logging, os, time
+import csv, glob, json, logging, os, time, math
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -196,8 +197,10 @@ def _fallback_load_samples(trades_csv: Path, only_symbols: List[str]) -> List[_S
                 if only_symbols and sym not in only_symbols: continue
                 st = str(row.get("status","")).lower()
                 if st not in ("closed_tp", "closed_sl"): continue
-                try: p = float(row.get("prob", ""))
-                except Exception: continue
+                try:
+                    p = float(row.get("prob", ""))
+                except Exception:
+                    continue
                 out.append(_Sample(prob=p, label=(1 if st == "closed_tp" else 0)))
     except Exception as e:
         logger.info("fallback sample load failed: %s", e)
@@ -232,24 +235,21 @@ def _import_samples_loader():
     return None
 
 @calib_bp.route("/tasks/calibrate", methods=["GET", "POST"])
-# app.py 中 일부만 교체: calib_bp.route("/tasks/calibrate") 함수
-@calib_bp.route("/tasks/calibrate", methods=["GET", "POST"])
 def tasks_calibrate():
     # App Engine Cron 보호: 내부 크론 호출만 허용
     if request.headers.get("X-Appengine-Cron", "").lower() != "true":
         return jsonify({"error": "forbidden"}), 403
 
-    # imports kept local to avoid import cost if not used
-    import os
-    from pathlib import Path
     try:
-        from helpers.calibration import ProbCalibrator, reload_global
+        from helpers.calibration import ProbCalibrator, reload_global  # 저장/핫리로드
     except Exception as e:
         return jsonify({"status": "error", "message": f"calibrator_import_failed: {e}"}), 500
-    try:
-        from tools.calibrate_from_trades import load_samples  # samples from trades.csv
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"samples_import_failed: {e}"}), 500
+
+    # 샘플 로더 결정
+    loader = _import_samples_loader()
+    if loader is None:
+        def loader(trades_csv: Path, horizon_min: int, only_symbols: List[str]) -> List[_Sample]:
+            return _fallback_load_samples(trades_csv, only_symbols)
 
     symbols_env = os.getenv("SYMBOLS", "")
     only_symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
@@ -261,7 +261,7 @@ def tasks_calibrate():
     trades_csv = log_dir / "trades.csv"
 
     # 1) collect samples
-    samples = load_samples(trades_csv, horizon_min, only_symbols=only_symbols)
+    samples = loader(trades_csv, horizon_min, only_symbols=only_symbols)
     n = len(samples)
     log_event("calibrate.collect", symbols=only_symbols or "ALL", horizon_min=horizon_min, samples=n)
 
@@ -380,6 +380,7 @@ def root():
       <li><a href="/api/trades">/api/trades</a></li>
       <li><a href="/api/logs">/api/logs</a></li>
       <li><a href="/api/signals">/api/signals</a></li>
+      <li><a href="/api/metrics">/api/metrics</a></li>
     </ul></body></html>"""
     return make_response(html, 200)
 
@@ -465,6 +466,297 @@ def api_open_orders():
         return _json_ok(orders=orders)
     except Exception as e:
         return _json_err(f"open_orders_failed: {e}")
+
+# ==============================
+# Analytics: metrics endpoints
+# ==============================
+def _parse_bool(s: str, default: bool = False) -> bool:
+    if s is None:
+        return default
+    return str(s).lower() in ("1","true","yes","y","on")
+
+def _coerce_label(status: str, pnl: float) -> int:
+    """1=TP 승, 0=SL/시간/패 (tools/calibrate_from_trades.py 라벨링과 정렬)"""
+    st = str(status or "").strip().lower()
+    if "closed_tp" in st or ("tp" in st and "stop" not in st):
+        return 1
+    if "closed_sl" in st or "stop" in st or "time_exit" in st:
+        return 0
+    return 1 if float(pnl or 0.0) > 0 else 0
+
+def _read_trades_full(limit: int = 5000) -> list[dict]:
+    path = Path(LOG_DIR) / "trades.csv"
+    if not path.exists():
+        return []
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                try:
+                    rows.append({
+                        "timestamp": row.get("timestamp",""),
+                        "symbol": row.get("symbol","").upper(),
+                        "side": row.get("side",""),
+                        "qty": _safe_float(row.get("qty",0)),
+                        "entry": _safe_float(row.get("entry",0)),
+                        "tp": _safe_float(row.get("tp",0)),
+                        "sl": _safe_float(row.get("sl",0)),
+                        "exit": _safe_float(row.get("exit",0)),
+                        "pnl": _safe_float(row.get("pnl",0)),
+                        "status": row.get("status",""),
+                        "id": row.get("id",""),
+                        "prob": _safe_float(row.get("prob",0.0)),
+                        "prob_raw": _safe_float(row.get("prob_raw", float("nan"))),
+                        "prob_cal": _safe_float(row.get("prob_cal", float("nan"))),
+                        "rr": _safe_float(row.get("rr",0.0)),
+                        "entry_maker": int(row.get("entry_maker","0") or "0"),
+                        "mode": row.get("mode",""),
+                        "reprices": int(row.get("reprices","0") or "0"),
+                        "used_market_fallback": int(row.get("used_market_fallback","0") or "0"),
+                        "post_only": int(row.get("post_only","0") or "0"),
+                        "spread_bps": _safe_float(row.get("spread_bps",0.0)),
+                        "atr_now": _safe_float(row.get("atr_now",0.0)),
+                        "funding_pct": _safe_float(row.get("funding_pct",0.0)),
+                        "reasons": row.get("reasons",""),
+                    })
+                except Exception:
+                    continue
+        return rows[-limit:]
+    except Exception:
+        return []
+
+def _filter_trades(rows: list[dict], symbol: str|None, days: int|None, include_open: bool) -> list[dict]:
+    if symbol:
+        rows = [r for r in rows if r.get("symbol","").upper()==symbol.upper()]
+    if days and days>0:
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        out = []
+        for r in rows:
+            ts = r.get("timestamp","")
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z","+00:00"))
+                if dt >= cutoff:
+                    out.append(r)
+            except Exception:
+                out.append(r)  # 보수적으로 포함
+        rows = out
+    if not include_open:
+        rows = [r for r in rows if str(r.get("status","")).lower()!="open"]
+    return rows
+
+def _equity_curve(rows: list[dict]) -> tuple[list[float], list[float]]:
+    eq = []
+    dd = []
+    s = 0.0
+    peak = 0.0
+    for r in rows:
+        s += float(r.get("pnl",0.0))
+        peak = max(peak, s)
+        eq.append(s)
+        dd.append(peak - s)
+    return eq, dd
+
+def _brier(arr: list[tuple[float,int]]) -> float|None:
+    if not arr:
+        return None
+    return sum((p-y)**2 for p,y in arr)/len(arr)
+
+def _logloss(arr: list[tuple[float,int]]) -> float|None:
+    if not arr:
+        return None
+    eps = 1e-12
+    return -sum(y*math.log(max(eps,min(1-eps,p))) + (1-y)*math.log(max(eps,min(1-eps,1-p))) for p,y in arr)/len(arr)
+
+def _auc(arr: list[tuple[float,int]]) -> float|None:
+    """Mann-Whitney U 기반 AUC (tie 평균 랭크 처리)."""
+    if not arr:
+        return None
+    n1 = sum(1 for _,y in arr if y==1)
+    n0 = sum(1 for _,y in arr if y==0)
+    if n1==0 or n0==0:
+        return None
+    arr_sorted = sorted(arr, key=lambda x: x[0])
+    i = 0
+    rank_sum_pos = 0.0
+    n = len(arr_sorted)
+    while i < n:
+        j = i
+        val = arr_sorted[i][0]
+        while j < n and arr_sorted[j][0]==val:
+            j+=1
+        avg_rank = (i+1 + j)/2.0
+        pos_in_tie = sum(1 for k in range(i,j) if arr_sorted[k][1]==1)
+        rank_sum_pos += avg_rank*pos_in_tie
+        i = j
+    U = rank_sum_pos - n1*(n1+1)/2.0
+    return U/(n1*n0)
+
+def _reliability_bins(arr: list[tuple[float,int]], bins: int=10) -> dict:
+    if not arr or bins<3:
+        return {"points": [], "ece": None}
+    edges = [i/bins for i in range(bins+1)]
+    pts = []
+    total = len(arr)
+    ece = 0.0
+    for i in range(bins):
+        lo, hi = edges[i], edges[i+1]
+        seg = [(p,y) for (p,y) in arr if (p>=lo and (p<hi if i<bins-1 else p<=hi))]
+        if len(seg) < 3:
+            continue
+        mean_p = sum(p for p,_ in seg)/len(seg)
+        mean_y = sum(y for _,y in seg)/len(seg)
+        w = len(seg)/total
+        ece += w*abs(mean_y-mean_p)
+        pts.append({"x": mean_p, "y": mean_y, "n": len(seg)})
+    return {"points": pts, "ece": ece}
+
+def _basic_stats(rows: list[dict]) -> dict:
+    if not rows:
+        return {"n":0}
+    pnl = [float(r.get("pnl",0.0)) for r in rows]
+    n = len(rows)
+    pos = [x for x in pnl if x>0]
+    neg = [x for x in pnl if x<=0]
+    total = sum(pnl)
+    wins = len(pos)
+    losses = len(neg)
+    pf = (sum(pos)/max(1e-12, -sum(neg))) if losses>0 else None
+    exp = total/n
+    mu = exp
+    sigma = (sum((x-mu)**2 for x in pnl)/n)**0.5 if n>1 else 0.0
+    eq, dd = _equity_curve(rows)
+    max_dd = max(dd) if dd else 0.0
+    return {
+        "n": n, "wins": wins, "losses": losses, "win_rate": wins/max(1,n),
+        "total_pnl": total, "avg_pnl": exp, "profit_factor": pf,
+        "std_pnl": sigma, "max_drawdown": max_dd,
+    }
+
+@app.route("/api/metrics")
+def api_metrics():
+    try: limit = int(request.args.get("limit","500"))
+    except Exception: limit = 500
+    symbol = request.args.get("symbol")
+    try: days = int(request.args.get("days","0"))
+    except Exception: days = 0
+    try: bins = int(request.args.get("bins","10"))
+    except Exception: bins = 10
+    include_open = _parse_bool(request.args.get("include_open","false"))
+
+    rows_all = _read_trades_full(limit=5000)
+    rows = _filter_trades(rows_all[-limit:], symbol, days, include_open)
+    if not rows:
+        return _json_ok(summary={"n":0}, prediction={}, reliability={}, execution={}, per_symbol={})
+
+    # labels & probs
+    labels = [_coerce_label(r.get("status",""), float(r.get("pnl",0.0))) for r in rows]
+    probs_cal = [float(r.get("prob",0.0)) for r in rows]
+    # prob_raw가 없을 수 있음
+    probs_raw = []
+    labels_for_raw = []
+    for i, r in enumerate(rows):
+        prx = float(r.get("prob_raw")) if r.get("prob_raw") not in (None, "", "nan") else float("nan")
+        if prx == prx:  # not NaN
+            probs_raw.append(prx)
+            labels_for_raw.append(labels[i])
+
+    arr_cal = list(zip(probs_cal, labels))
+    arr_raw = list(zip(probs_raw, labels_for_raw)) if probs_raw else []
+
+    # summary
+    summary = _basic_stats(rows)
+    # prediction quality
+    pred = {
+        "brier_cal": _brier(arr_cal),
+        "logloss_cal": _logloss(arr_cal),
+        "auc_cal": _auc(arr_cal),
+    }
+    if arr_raw:
+        b_raw = _brier(arr_raw)
+        b_cal = _brier(arr_cal)
+        pred.update({
+            "brier_raw": b_raw,
+            "logloss_raw": _logloss(arr_raw),
+            "auc_raw": _auc(arr_raw),
+            "improvement_brier": (b_raw - b_cal) if (b_raw is not None and b_cal is not None) else None,
+        })
+    # reliability
+    rel_cal = _reliability_bins(arr_cal, bins=bins)
+    rel_raw = _reliability_bins(arr_raw, bins=bins) if arr_raw else {"points": [], "ece": None}
+
+    # execution quality
+    maker_ratio = sum(int(r.get("entry_maker",0)) for r in rows)/max(1,len(rows))
+    fallback_ratio = sum(int(r.get("used_market_fallback",0)) for r in rows)/max(1,len(rows))
+    avg_spread = sum(float(r.get("spread_bps",0.0)) for r in rows)/max(1,len(rows))
+    avg_atr = sum(float(r.get("atr_now",0.0)) for r in rows)/max(1,len(rows))
+    execq = {
+        "entry_maker_ratio": maker_ratio,
+        "market_fallback_ratio": fallback_ratio,
+        "avg_spread_bps": avg_spread,
+        "avg_atr": avg_atr,
+    }
+
+    # per-symbol rollup
+    per_sym: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        s = r.get("symbol","")
+        per_sym.setdefault(s, {"n":0,"pnl":0.0,"wins":0})
+        per_sym[s]["n"] += 1
+        per_sym[s]["pnl"] += float(r.get("pnl",0.0))
+        per_sym[s]["wins"] += 1 if _coerce_label(r.get("status",""), float(r.get("pnl",0.0)))==1 else 0
+    for s,v in per_sym.items():
+        v["win_rate"] = v["wins"]/max(1,v["n"])
+
+    return _json_ok(
+        summary=summary,
+        prediction=pred,
+        reliability={"calibrated": rel_cal, "raw": rel_raw},
+        execution=execq,
+        per_symbol=per_sym,
+        sample_size=len(rows),
+    )
+
+@app.route("/api/metrics/curve")
+def api_metrics_curve():
+    try: limit = int(request.args.get("limit","500"))
+    except Exception: limit = 500
+    symbol = request.args.get("symbol")
+    try: days = int(request.args.get("days","0"))
+    except Exception: days = 0
+    include_open = _parse_bool(request.args.get("include_open","false"))
+    rows = _filter_trades(_read_trades_full(limit=5000)[-limit:], symbol, days, include_open)
+    if not rows:
+        return _json_ok(points=[])
+    eq, dd = _equity_curve(rows)
+    points = [{"t": rows[i]["timestamp"], "equity": eq[i], "drawdown": dd[i]} for i in range(len(rows))]
+    return _json_ok(points=points)
+
+@app.route("/api/metrics/calibration")
+def api_metrics_calibration():
+    # 현재 저장된 보정 테이블과, 최신 샘플 기준 ECE/Brier를 함께 노출
+    try:
+        from helpers.calibration import ProbCalibrator
+        cal = ProbCalibrator()
+        be = getattr(cal, "bin_edges", []) or []
+        bm = getattr(cal, "bin_means", []) or []
+    except Exception as e:
+        be, bm = [], []
+    try: limit = int(request.args.get("limit","1000"))
+    except Exception: limit = 1000
+    try: bins = int(request.args.get("bins","10"))
+    except Exception: bins = 10
+    rows = _filter_trades(_read_trades_full(limit=5000)[-limit:], symbol=request.args.get("symbol"), days=None, include_open=False)
+    labels = [_coerce_label(r.get("status",""), float(r.get("pnl",0.0))) for r in rows]
+    probs = [float(r.get("prob",0.0)) for r in rows]
+    arr = list(zip(probs, labels))
+    return _json_ok(
+        calibration_table={"bin_edges": be, "bin_means": bm},
+        current_sample={"brier": _brier(arr), "rel": _reliability_bins(arr, bins=bins)},
+        n=len(rows),
+    )
+
+# ======================================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)

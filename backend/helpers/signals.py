@@ -502,6 +502,9 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         direction_rb, prob_rb = _rule_backup(ohlcv, trend)
         if direction_rb in ("long","short"):
             direction, prob = direction_rb, prob_rb
+            prob_raw = float(prob_rb)
+            prob_cal = float(calibrate_prob(prob_raw)) if USE_CALIBRATED_PROB else float(prob_raw)
+            prob = prob_cal
             llm_support = None; llm_resistance = None
         else:
             return {"symbol":symbol,"action":"hold","direction":"hold","entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
@@ -509,9 +512,9 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
     else:
         llm_decision = get_gemini_prediction(payload, symbol=symbol)
         direction = str(llm_decision.get("direction") or "").lower()
-        prob = float(llm_decision.get("prob", 0.0))
-        if USE_CALIBRATED_PROB:
-            prob = float(calibrate_prob(prob))
+        prob_raw = float(llm_decision.get("prob", 0.0))
+        prob_cal = float(calibrate_prob(prob_raw)) if USE_CALIBRATED_PROB else float(prob_raw)
+        prob = prob_cal
         llm_support = llm_decision.get("support")
         llm_resistance = llm_decision.get("resistance")
     entry = float((payload.get("entry_5m") or {}).get("close") or 0.0)
@@ -564,13 +567,17 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         "entry": float(entry),
         "tp": float(tp),
         "sl": float(sl),
-        "prob": float(prob),
+        "prob": float(prob),             # calibrated if USE_CALIBRATED_PROB else raw
+        "prob_raw": float(prob_raw if 'prob_raw' in locals() else prob),
+        "prob_cal": float(prob if 'prob' in locals() else prob),
         "rr": float(rr_net),
         "risk_ok": bool(risk_ok),
         "reason": "ok" if risk_ok else ";".join(reasons) or "no_trade_conditions",
         "result": {
             "direction": direction, "entry": float(entry), "tp": float(tp), "sl": float(sl),
-            "prob": float(prob), "rr": float(rr_net), "risk_ok": bool(risk_ok), "risk_scalar": float(risk_scalar),
+            "prob": float(prob), "prob_raw": float(prob_raw if 'prob_raw' in locals() else prob),
+            "prob_cal": float(prob if 'prob' in locals() else prob),
+            "rr": float(rr_net), "risk_ok": bool(risk_ok), "risk_scalar": float(risk_scalar),
         },
         "telemetry": telemetry,
     }
@@ -900,6 +907,8 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         tp = float(res.get("tp", 0.0))
         sl = float(res.get("sl", 0.0))
         prob = float(res.get("prob", 0.5))
+        prob_raw = float(res.get("prob_raw", prob))
+        prob_cal = float(res.get("prob_cal", prob))
         rr = float(res.get("rr", 0.0))
         risk_ok = bool(res.get("risk_ok", False))
         reason = sig.get("reason", "")
@@ -951,6 +960,8 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 "status": "open",
                 "id": str(uuid.uuid4())[:8],
                 "prob": f"{float(prob):.6f}",
+                "prob_raw": f"{float(prob_raw):.6f}",
+                "prob_cal": f"{float(prob_cal):.6f}",
                 "rr": f"{float(rr):.6f}",
                 "entry_maker": "1" if (mode == "LIMIT" and ENTRY_POST_ONLY and not exec_res.get("used_market_fallback", False)) else "0",
                 "tp_type": str(TP_ORDER_TYPE),
@@ -991,7 +1002,7 @@ def _journal_append_open(row: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(TRADES_CSV), exist_ok=True)
     headers = [
         "timestamp","symbol","side","qty","entry","entry_intent","tp","sl","exit","pnl","status","id",
-        "prob","rr","entry_maker","tp_type","mode","reprices","used_market_fallback","post_only",
+        "prob","prob_raw","prob_cal","rr","entry_maker","tp_type","mode","reprices","used_market_fallback","post_only",
         "spread_bps","atr_now","funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
         "size_mode","bal_asset","notional","bal_pct",
     ]

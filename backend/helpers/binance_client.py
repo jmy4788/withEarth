@@ -20,7 +20,7 @@ import os
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, List, Optional, Tuple
-
+import inspect
 import pandas as pd
 
 # ---- Optional utils integration ------------------------------------------------
@@ -241,37 +241,58 @@ def normalize_price_for_side(symbol: str, price: float, side: str) -> float:
     else:
         vq = round_to_step(v, tick)
     return float(vq)
-
+# --- replace this function in helpers/binance_client.py ---
+import inspect
 def list_all_orders(symbol: str, limit: int = 100, start_time_ms: Optional[int] = None) -> List[Dict[str, Any]]:
     """
-    최근 주문 히스토리를 반환. SDK 메서드 이름이 버전에 따라 다를 수 있어 후보군을 순회.
+    최근 주문 히스토리(심볼별). 모듈러 SDK의 메서드명이 혼재하므로
+    소수 후보만 시도하고, **시그니처에 존재하는 인자만** 전달한다.
     """
     client = _get_client()
-    cand = ["all_orders", "allOrders", "get_all_orders", "query_all_orders", "allorders", "list_all_orders"]
-    fn = _pick(client.rest_api, cand)
-    if not fn:
-        # fallback: best-effort method 탐색
-        cands = [n for n in dir(client.rest_api) if ("order" in n.lower() and "all" in n.lower())]
-        fn = getattr(client.rest_api, cands[0], None) if cands else None
-        if not fn:
+    candidates = ["all_orders", "allOrders", "get_all_orders", "query_all_orders", "list_all_orders"]
+    fn = None
+    for name in candidates:
+        cand = getattr(client.rest_api, name, None)
+        if callable(cand):
+            fn = cand
+            break
+    if fn is None:
+        # best-effort fallback
+        names = [n for n in dir(client.rest_api) if "order" in n.lower() and "all" in n.lower()]
+        fn = getattr(client.rest_api, names[0], None) if names else None
+        if fn is None:
             return []
 
-    kwargs: Dict[str, Any] = {"symbol": symbol, "limit": int(limit)}
-    # 일부 SDK는 camel/snake 혼용
+    # --- 시그니처 기반 안전 kwargs 구성 ---
+    try:
+        sig = inspect.signature(fn)
+        params = set(sig.parameters.keys())
+    except Exception:
+        params = set()
+
+    kwargs: Dict[str, Any] = {}
+    if "symbol" in params: kwargs["symbol"] = symbol
+    if "limit"  in params: kwargs["limit"] = int(limit)
     if start_time_ms:
-        kwargs["start_time"] = int(start_time_ms)
-        kwargs["startTime"] = int(start_time_ms)
+        # camel/snake 중 존재하는 쪽만 선택
+        if "start_time" in params:
+            kwargs["start_time"] = int(start_time_ms)
+        elif "startTime" in params:
+            kwargs["startTime"] = int(start_time_ms)
+
     try:
         r = fn(**kwargs)
         data = r.data() if hasattr(r, "data") else r
-        if isinstance(data, list):
-            return [_as_plain_dict(x) for x in data]
-        if isinstance(data, dict) and isinstance(data.get("orders"), list):
-            return data["orders"]
+        if isinstance(data, list):   return [_as_plain_dict(x) for x in data]
+        if isinstance(data, dict):
+            if isinstance(data.get("orders"), list): return data["orders"]
+            return [_as_plain_dict(data)]
+        if hasattr(data, "__iter__"): return list(data)
         return [_as_plain_dict(data)]
     except Exception as e:
         logger.info("list_all_orders failed for %s: %s", symbol, e)
         return []
+
 
 def find_recent_exit_fill(symbol: str, since_ms: int) -> Optional[Dict[str, Any]]:
     """
@@ -751,40 +772,61 @@ def build_entry_and_brackets(symbol: str, side: str, quantity: float, target_pri
 # Readbacks
 # ==================
 def get_open_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-    """현재 미체결 주문 나열(타입 정규화 없음)"""
+    """
+    현재 미체결 주문 나열. **심볼 지정이 되면 심볼별 엔드포인트 우선**.
+    SDK의 일부 구현은 빈 결과에서 IndexError를 던지므로 try/except로 우회.
+    """
     client = _get_client()
-    try:
-        cand_names = [
-            "open_orders", "openOrders", "allOpenOrders", "get_open_orders", "getAllOpenOrders",
-            "current_all_open_orders", "query_current_all_open_orders",
-            "currentAllOpenOrders", "queryCurrentAllOpenOrders",
-            "current_open_orders", "query_current_open_orders",
-            "currentOpenOrders", "queryCurrentOpenOrders",
-        ]
-        fn = _pick(client.rest_api, cand_names)
-        if not fn:
-            candidates = [n for n in dir(client.rest_api)
-                          if ("order" in n.lower() and "open" in n.lower() and callable(getattr(client.rest_api, n)))]
-            fn = getattr(client.rest_api, candidates[0], None) if candidates else None
-            if not fn:
-                raise AttributeError("No method for open orders")
+    # 1) 심볼별 우선
+    per_symbol_candidates = ["open_orders", "openOrders", "current_open_orders", "currentOpenOrders", "get_open_orders"]
+    # 2) 전체(모든 심볼)
+    all_candidates = ["current_all_open_orders", "allOpenOrders", "getAllOpenOrders", "query_current_all_open_orders", "queryCurrentAllOpenOrders"]
 
-        r = fn(symbol=symbol) if symbol else fn()
+    # helper
+    def _try(fn, with_symbol: bool):
+        try:
+            sig = inspect.signature(fn)
+            params = set(sig.parameters.keys())
+        except Exception:
+            params = set()
+        kwargs = {}
+        if with_symbol and "symbol" in params and symbol:
+            kwargs["symbol"] = symbol
+        r = fn(**kwargs) if kwargs else fn()
         data = r.data() if hasattr(r, "data") else r
-
-        if isinstance(data, list):
-            return data
+        if isinstance(data, list): return data
         if isinstance(data, dict):
-            if "orders" in data and isinstance(data["orders"], list):
-                return data["orders"]
+            if isinstance(data.get("orders"), list): return data["orders"]
             return [data]
-        if hasattr(data, "__iter__"):
-            return list(data)
-
+        if hasattr(data, "__iter__"): return list(data)
         return [_as_plain_dict(data)]
-    except Exception as e:
-        logger.error(f"get_open_orders failed: {e}")
-        return []
+
+    # 1) 심볼 지정이 있으면 per-symbol 먼저
+    if symbol:
+        for name in per_symbol_candidates:
+            fn = getattr(client.rest_api, name, None)
+            if callable(fn):
+                try:
+                    out = _try(fn, with_symbol=True)
+                    if isinstance(out, list): return out
+                except Exception as e:
+                    # noise 줄이기: debug 로그만
+                    logger.info("get_open_orders %s(%s) failed: %s", name, symbol, e)
+                    continue
+
+    # 2) 전체 오더(메서드에 버그가 있으면 스킵)
+    for name in all_candidates:
+        fn = getattr(client.rest_api, name, None)
+        if callable(fn):
+            try:
+                out = _try(fn, with_symbol=False)
+                if isinstance(out, list): return out
+            except Exception as e:
+                logger.info("get_open_orders %s(all) failed: %s", name, e)
+                continue
+
+    return []
+
 
 def _as_plain_dict(obj: Any) -> Dict[str, Any]:
     if isinstance(obj, dict):
