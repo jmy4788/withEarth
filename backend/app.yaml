@@ -34,7 +34,7 @@ env_variables:
   RR_MIN: "1.2"
   RR_MIN_HIGH_PROB: "1.08"
   RR_EVAL_WITH_FEES: "true"              # ★ 패치-2로 활성화
-  MAX_SPREAD_BPS: "1.8"
+  MAX_SPREAD_BPS: "1.5"
   HORIZON_MIN: "25"
   TIME_BARRIER_ENABLED: "true"
   MIN_VOL_FRAC: "0.0005"
@@ -48,7 +48,7 @@ env_variables:
   ENTRY_COOLDOWN_MIN: "10"
 
   # --- 손절/익절 ---
-  ATR_MULT_SL: "1.0"
+  ATR_MULT_SL: "1.2"
   ATR_MULT_TP: "2.2"
   TP_ORDER_TYPE: "LIMIT"                   # 필요 시 MARKET로 A/B
   SL_ORDER_TYPE: "STOP_MARKET"             # ★ STOP_LIMIT 시험시 변경
@@ -66,10 +66,13 @@ env_variables:
 
   # --- BE 트레일링 ---
   BE_TRAILING_ENABLED: "true"
-  BE_TRIGGER_R_MULT: "0.7"
+  BE_TRIGGER_R_MULT: "1.0"
   BE_OFFSET_TICKS: "2"
 
-  # --- 포지션/사이징 ---
+  # --- 포지션/사이징 --- #
+  SIZE_MODE: "USDT"          # USDT | BALANCE_PCT
+  RISK_BAL_PCT: "1.50"              # 지갑의 1.5% 사용
+  SIZE_BAL_INCLUDE_UPNL: "false"    # 미실현손익 포함 여부 (true/false)
   RISK_USDT: "100"
   LEVERAGE: "5"
   MARGIN_TYPE: "ISOLATED"

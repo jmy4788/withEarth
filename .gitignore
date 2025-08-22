@@ -60,3 +60,7 @@ pnpm-debug.log*
 
 # --- Misc ---
 /setup.cfg
+
+# Mytools
+
+/Mytools

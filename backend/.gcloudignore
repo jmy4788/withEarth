@@ -44,3 +44,6 @@ build/
 # Misc
 *.log
 /setup.cfg
+
+# My_tools
+/My_tools

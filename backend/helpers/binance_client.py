@@ -242,6 +242,76 @@ def normalize_price_for_side(symbol: str, price: float, side: str) -> float:
         vq = round_to_step(v, tick)
     return float(vq)
 
+def list_all_orders(symbol: str, limit: int = 100, start_time_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    최근 주문 히스토리를 반환. SDK 메서드 이름이 버전에 따라 다를 수 있어 후보군을 순회.
+    """
+    client = _get_client()
+    cand = ["all_orders", "allOrders", "get_all_orders", "query_all_orders", "allorders", "list_all_orders"]
+    fn = _pick(client.rest_api, cand)
+    if not fn:
+        # fallback: best-effort method 탐색
+        cands = [n for n in dir(client.rest_api) if ("order" in n.lower() and "all" in n.lower())]
+        fn = getattr(client.rest_api, cands[0], None) if cands else None
+        if not fn:
+            return []
+
+    kwargs: Dict[str, Any] = {"symbol": symbol, "limit": int(limit)}
+    # 일부 SDK는 camel/snake 혼용
+    if start_time_ms:
+        kwargs["start_time"] = int(start_time_ms)
+        kwargs["startTime"] = int(start_time_ms)
+    try:
+        r = fn(**kwargs)
+        data = r.data() if hasattr(r, "data") else r
+        if isinstance(data, list):
+            return [_as_plain_dict(x) for x in data]
+        if isinstance(data, dict) and isinstance(data.get("orders"), list):
+            return data["orders"]
+        return [_as_plain_dict(data)]
+    except Exception as e:
+        logger.info("list_all_orders failed for %s: %s", symbol, e)
+        return []
+
+def find_recent_exit_fill(symbol: str, since_ms: int) -> Optional[Dict[str, Any]]:
+    """
+    'open'으로 남아있는 엔트리의 timestamp 이후에 체결된 TP/SL(감산 주문)의 fill을 추적.
+    우선순위: TAKE_PROFIT(_MARKET) > STOP(_MARKET), 최종 fill 기준 최신 1건 반환.
+    """
+    orders = list_all_orders(symbol, limit=200, start_time_ms=max(0, int(since_ms) - 5 * 60_000))
+    if not orders:
+        return None
+
+    def _ms(o: Dict[str, Any]) -> int:
+        for k in ("updateTime", "transactTime", "time", "workingTime"):
+            v = o.get(k)
+            if v is not None:
+                try:
+                    return int(v)
+                except Exception:
+                    pass
+        return 0
+
+    cands: List[Dict[str, Any]] = []
+    for o in orders:
+        t = str(o.get("type", "")).upper()
+        st = str(o.get("status", "")).upper()
+        if t in ("TAKE_PROFIT","TAKE_PROFIT_MARKET","STOP","STOP_MARKET") and st in ("FILLED","PARTIALLY_FILLED"):
+            if _ms(o) >= int(since_ms):
+                cands.append(o)
+    if not cands:
+        return None
+
+    cands.sort(key=_ms)
+    o = cands[-1]
+    typ = str(o.get("type","")).upper()
+    # 가격 취득 우선순위: avgPrice > price > stopPrice
+    px = o.get("avgPrice") or o.get("price") or o.get("stopPrice") or 0.0
+    try:
+        pxf = float(px)
+    except Exception:
+        pxf = 0.0
+    return {"type": typ, "price": pxf, "time": _ms(o)}
 # ==========================
 # Account & overview helpers
 # ==========================
@@ -872,4 +942,7 @@ __all__ = [
     "get_open_orders",
     "get_position",
     "replace_stop_loss_to_price",
+    # + add
+    "list_all_orders",
+    "find_recent_exit_fill",
 ]
