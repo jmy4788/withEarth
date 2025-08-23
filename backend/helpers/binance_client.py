@@ -293,46 +293,63 @@ def list_all_orders(symbol: str, limit: int = 100, start_time_ms: Optional[int] 
         logger.info("list_all_orders failed for %s: %s", symbol, e)
         return []
 
-
+# --- REPLACE THIS WHOLE FUNCTION in helpers/binance_client.py ---
 def find_recent_exit_fill(symbol: str, since_ms: int) -> Optional[Dict[str, Any]]:
     """
     'open'으로 남아있는 엔트리의 timestamp 이후에 체결된 TP/SL(감산 주문)의 fill을 추적.
-    우선순위: TAKE_PROFIT(_MARKET) > STOP(_MARKET), 최종 fill 기준 최신 1건 반환.
+    - 모듈러 SDK 응답의 key가 snake_case/camelCase 혼재하므로 둘 다 지원.
+    - 우선순위: TAKE_PROFIT(_MARKET) > STOP(_MARKET), 최종 fill 기준 최신 1건 반환.
     """
     orders = list_all_orders(symbol, limit=200, start_time_ms=max(0, int(since_ms) - 5 * 60_000))
     if not orders:
         return None
 
+    def _get(o: Dict[str, Any], *keys: str):
+        for k in keys:
+            if k in o and o[k] is not None:
+                return o[k]
+        return None
+
     def _ms(o: Dict[str, Any]) -> int:
-        for k in ("updateTime", "transactTime", "time", "workingTime"):
-            v = o.get(k)
-            if v is not None:
-                try:
-                    return int(v)
-                except Exception:
-                    pass
+        # 시간키: camel + snake 모두 시도
+        for k in ("updateTime", "transactTime", "time", "workingTime",
+                  "update_time", "transact_time", "working_time"):
+            v = _get(o, k)
+            if v is None:
+                continue
+            try:
+                return int(v)
+            except Exception:
+                continue
         return 0
 
     cands: List[Dict[str, Any]] = []
     for o in orders:
-        t = str(o.get("type", "")).upper()
-        st = str(o.get("status", "")).upper()
-        if t in ("TAKE_PROFIT","TAKE_PROFIT_MARKET","STOP","STOP_MARKET") and st in ("FILLED","PARTIALLY_FILLED"):
+        t = str(_get(o, "type") or "").upper()
+        st = str(_get(o, "status") or "").upper()
+        if t in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET") and \
+           st in ("FILLED", "PARTIALLY_FILLED"):
             if _ms(o) >= int(since_ms):
                 cands.append(o)
+
     if not cands:
         return None
 
+    # 최신순
     cands.sort(key=_ms)
     o = cands[-1]
-    typ = str(o.get("type","")).upper()
-    # 가격 취득 우선순위: avgPrice > price > stopPrice
-    px = o.get("avgPrice") or o.get("price") or o.get("stopPrice") or 0.0
+    typ = str(_get(o, "type") or "").upper()
+
+    # 가격키: camel + snake 모두 시도 (avgPrice > price > stopPrice 계열)
+    px = _get(o, "avgPrice", "avg_price", "price", "stopPrice", "stop_price")
     try:
-        pxf = float(px)
+        pxf = float(px) if px is not None else 0.0
     except Exception:
         pxf = 0.0
+
     return {"type": typ, "price": pxf, "time": _ms(o)}
+
+
 # ==========================
 # Account & overview helpers
 # ==========================
@@ -430,9 +447,13 @@ def cancel_order(symbol: str, order_id: Optional[int] = None, orig_client_order_
     except Exception as e:
         logger.info("cancel_order failed for %s: %s", symbol, e)
         return {}
+# helpers/binance_client.py
 
 def cancel_orders_by_type(symbol: str, types: List[str]) -> int:
-    """열린 주문 중 특정 타입(TAKE_PROFIT, STOP, STOP_MARKET 등)만 취소"""
+    """
+    열린 주문 중 특정 타입(TAKE_PROFIT, STOP, STOP_MARKET 등)만 취소.
+    - ID 키: orderId | order_id | (orig_)clientOrderId 모두 지원.
+    """
     typesU = {t.upper() for t in types}
     cnt = 0
     try:
@@ -440,14 +461,21 @@ def cancel_orders_by_type(symbol: str, types: List[str]) -> int:
     except Exception:
         orders = []
     for o in orders or []:
-        t = str((o.get("type") if isinstance(o, dict) else getattr(o, "type", "")) or "").upper()
-        oid = o.get("orderId") if isinstance(o, dict) else getattr(o, "orderId", None)
-        if t in typesU and oid is not None:
-            try:
+        d = o if isinstance(o, dict) else _as_plain_dict(o)
+        t = str((d.get("type") or "")).upper()
+        if t not in typesU:
+            continue
+        oid = d.get("orderId") or d.get("order_id")
+        ocid = d.get("origClientOrderId") or d.get("clientOrderId") or d.get("orig_client_order_id") or d.get("client_order_id")
+        try:
+            if oid is not None:
                 cancel_order(symbol, order_id=int(oid))
                 cnt += 1
-            except Exception:
-                pass
+            elif ocid:
+                cancel_order(symbol, orig_client_order_id=str(ocid))
+                cnt += 1
+        except Exception:
+            continue
     return cnt
 
 def set_position_mode(mode: str = "ONEWAY") -> None:
@@ -822,9 +850,12 @@ def get_open_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
                 out = _try(fn, with_symbol=False)
                 if isinstance(out, list): return out
             except Exception as e:
-                logger.info("get_open_orders %s(all) failed: %s", name, e)
+                msg = str(e)
+                if "list index out of range" in msg.lower():
+                    logger.debug("get_open_orders %s(all) benign fallback: %s", name, msg)
+                else:
+                    logger.info("get_open_orders %s(all) failed: %s", name, msg)
                 continue
-
     return []
 
 

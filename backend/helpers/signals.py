@@ -202,15 +202,20 @@ def _estimate_p_maker_from_journal() -> float:
             for row in r: rows.append(row)
         if not rows: return 0.5
         rows = rows[-MAKER_PROB_LOOKBACK:]
-        if "entry_maker" in rows[0]:
-            vals = []
-            for row in rows:
-                try: vals.append(int(row.get("entry_maker", 0)))
-                except Exception: pass
-            if vals:
-                m = sum(vals) / max(1, len(vals))
-                return float(min(1.0, max(0.0, m)))
-        return 0.5 if len(rows) < 20 else 0.6
+        vals = []
+        for row in rows:
+            try:
+                vals.append(int(row.get("entry_maker", 0)))
+            except Exception:
+                pass
+        n = len(vals)
+        if n == 0:
+            return 0.5
+        s = sum(1 for v in vals if v == 1)
+        a = float(os.getenv("MAKER_PROB_PRIOR_A", "3"))
+        b = float(os.getenv("MAKER_PROB_PRIOR_B", "3"))
+        p = (s + a) / (n + a + b)
+        return float(min(1.0, max(0.0, p)))
     except Exception:
         return 0.5
 
@@ -711,19 +716,29 @@ def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
 # ---------------------------------
 # Maintain (time barrier + BE trailing + cleanup)
 # ---------------------------------
+# helpers/signals.py
+
 def _current_stop_price(symbol: str) -> Optional[float]:
-    try: orders = get_open_orders(symbol)
-    except Exception: orders = []
+    try:
+        orders = get_open_orders(symbol)
+    except Exception:
+        orders = []
     sl_prices: List[float] = []
     for o in orders or []:
-        t = str((o.get("type") if isinstance(o, dict) else getattr(o, "type","")) or "").upper()
-        if t in ("STOP","STOP_MARKET"):
-            sp = (o.get("stopPrice") if isinstance(o, dict) else getattr(o, "stopPrice", None))
-            try:
-                if sp is not None: sl_prices.append(float(sp))
-            except Exception:
-                pass
-    if not sl_prices: return None
+        d = o if isinstance(o, dict) else {}
+        t = str((d.get("type") or "")).upper()
+        if t in ("STOP", "STOP_MARKET"):
+            for key in ("stopPrice", "stop_price", "price"):
+                v = d.get(key)
+                if v is None:
+                    continue
+                try:
+                    sl_prices.append(float(v))
+                    break
+                except Exception:
+                    continue
+    if not sl_prices:
+        return None
     sl_prices.sort()
     mid = sl_prices[len(sl_prices)//2]
     return float(mid)
@@ -771,13 +786,13 @@ def _rewrite_trades_csv(rows: list, pref_headers: Optional[list] = None) -> None
     keys = set()
     for r in rows: keys.update(r.keys())
     base = [
-        "timestamp","symbol","side","qty","entry","entry_intent","tp","sl","exit","pnl","status","id",
-        "prob","rr","entry_maker","tp_type","mode","reprices","used_market_fallback","post_only",
-        "spread_bps","atr_now","funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
-        "size_mode","bal_asset","notional","bal_pct",
+        "timestamp","symbol","side","qty","entry","entry_intent","tp","sl",
+        "exit","pnl","status","id","prob","rr","entry_maker","tp_type","mode",
+        "reprices","used_market_fallback","post_only","spread_bps","atr_now",
+        "funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
+        "size_mode","bal_asset","notional","bal_pct","exit_ts"  # NEW
     ]
     headers = [k for k in base if k in keys] + [k for k in sorted(keys) if k not in base]
-    if pref_headers: headers = pref_headers
     import csv, os
     os.makedirs(os.path.dirname(TRADES_CSV), exist_ok=True)
     with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
@@ -804,7 +819,14 @@ def _journal_close_last(symbol: str, exit_price: float, reason: str) -> bool:
         gross = (float(exit_price) - entry) * sgn * qty
         fees = entry * qty * fee_e + float(exit_price) * qty * fee_x
         pnl = float(gross - fees)
-        r.update({"exit": f"{float(exit_price):.10f}", "pnl": f"{pnl:.10f}", "status": reason, "close_reason": reason})
+        now_iso = _now_utc().isoformat()
+        r.update({
+            "exit": f"{float(exit_price):.10f}",
+            "pnl": f"{pnl:.10f}",
+            "status": reason,
+            "close_reason": reason,
+            "exit_ts": now_iso,     # NEW
+        })
         rows[idx] = r
         _rewrite_trades_csv(rows)
         log_event("journal.close", symbol=symbol, exit=float(exit_price), pnl=float(pnl), reason=reason)
@@ -996,7 +1018,7 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
     except Exception as e:
         logger.exception("manage_trade failed for %s", symbol)
         return {"symbol": symbol, "error": str(e)}
-
+    
 def _journal_append_open(row: Dict[str, Any]) -> None:
     import csv, os
     os.makedirs(os.path.dirname(TRADES_CSV), exist_ok=True)
@@ -1004,8 +1026,9 @@ def _journal_append_open(row: Dict[str, Any]) -> None:
         "timestamp","symbol","side","qty","entry","entry_intent","tp","sl","exit","pnl","status","id",
         "prob","prob_raw","prob_cal","rr","entry_maker","tp_type","mode","reprices","used_market_fallback","post_only",
         "spread_bps","atr_now","funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
-        "size_mode","bal_asset","notional","bal_pct",
+        "size_mode","bal_asset","notional","bal_pct","exit_ts"  # NEW
     ]
+    if "exit_ts" not in row: row["exit_ts"] = ""
     if not os.path.exists(TRADES_CSV):
         with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=headers); w.writeheader(); w.writerow(row); return
