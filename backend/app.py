@@ -1,9 +1,10 @@
-# app.py — single-file backend (v2 → v2.1 analytics), 2025-08-22
+# app.py — single-file backend (v2.1 + journal_sync + EV metrics), 2025-08-27
 from __future__ import annotations
 """
 변경 요약
-- /tasks/calibrate: robust import of external loader with fallback (중복 데코레이터 제거)
-- /api/metrics, /api/metrics/curve, /api/metrics/calibration 추가
+- /tasks/calibrate: 기존 유지
+- /tasks/journal_sync 추가(저널 최신본 GCS 백업/복원)
+- /api/metrics: EV(ex-ante) 집계(ev_ex_ante_perc_avg, ev_ex_ante_usd_sum) 추가
 - 기존 /api/*, /tasks/*, /health 그대로 유지
 """
 
@@ -45,7 +46,11 @@ def _ensure_dir_writable(pref: str) -> str:
     except Exception:
         p = Path(DEFAULT_TMP_DIR); p.mkdir(parents=True, exist_ok=True); return str(p)
 
-LOG_DIR = _ensure_dir_writable(LOG_DIR_ENV)
+try:
+    from helpers.utils import LOG_DIR as UTILS_LOG_DIR  # type: ignore
+    LOG_DIR = str(UTILS_LOG_DIR)
+except Exception:
+    LOG_DIR = _ensure_dir_writable(LOG_DIR_ENV)
 LOG_PATH = str(Path(LOG_DIR) / "bot.log")
 
 def setup_logging() -> logging.Logger:
@@ -62,7 +67,7 @@ logger = setup_logging()
 
 # --- imports from helpers ---
 try:
-    from helpers.signals import generate_signal, manage_trade, get_overview as sig_get_overview, maintain_positions  # noqa
+    from helpers.signals import generate_signal, manage_trade, get_overview as sig_get_overview, maintain_positions, journal_sync  # noqa
 except Exception as e:
     logger.exception("helpers.signals import failed: %s", e)
     def generate_signal(symbol: str) -> Dict[str, Any]:
@@ -71,6 +76,8 @@ except Exception as e:
         return {"symbol": symbol, "error": "signals_unavailable"}
     def sig_get_overview() -> Dict[str, Any]:
         return {"balances": [], "positions": []}
+    def journal_sync(mode: str = "backup") -> Dict[str, Any]:
+        return {"action": mode, "ok": False}
 
 try:
     from helpers.data_fetch import fetch_ohlcv, fetch_orderbook  # noqa
@@ -305,7 +312,7 @@ def tasks_calibrate():
     return jsonify({"status": "ok", "saved_to": calib.path, "samples_used": n, "bins": bins}), 200
 
 # ======================================================================
-# Blueprint 2: Trader (/tasks/trader, /tasks/maintain)
+# Blueprint 2: Trader (/tasks/trader, /tasks/maintain, /tasks/journal_sync)
 # ======================================================================
 trader_bp = Blueprint("tasks_trader", __name__)
 
@@ -349,6 +356,18 @@ def tasks_maintain():
         results[sym] = r
     log_event("tasks.maintain", symbols=syms, n=len(syms))
     return jsonify({"status":"ok","results":results}), 200
+
+@trader_bp.route("/tasks/journal_sync", methods=["GET","POST"])
+def tasks_journal_sync():
+    if not _is_cron(request):
+        return jsonify({"error":"forbidden"}), 403
+    mode = request.args.get("mode","backup")
+    try:
+        res = journal_sync(mode=mode)
+        log_event("tasks.journal_sync", **res)
+        return jsonify({"status":"ok", **res}), 200
+    except Exception as e:
+        return jsonify({"status":"error","message":str(e)}), 200
 
 # ======================================================================
 # Flask app & API routes
@@ -396,6 +415,21 @@ def api_overview():
         return _json_ok(overview=ov)
     except Exception as e:
         return _json_err("overview_failed", error=str(e))
+    
+@app.route("/api/debug/env")
+def api_debug_env():
+    # 진단용: 현재 서버가 보고 있는 LOG_DIR, trades.csv 존재 여부, GCS on/off
+    from pathlib import Path as _P
+    try:
+        ok = _P(Path(LOG_DIR) / "trades.csv").exists()
+    except Exception:
+        ok = False
+    try:
+        from helpers.utils import gcs_enabled as _gcs_en   # type: ignore
+        gcs_on = bool(_gcs_en())
+    except Exception:
+        gcs_on = False
+    return _json_ok(LOG_DIR=LOG_DIR, trades_csv_exists=ok, gcs_enabled=gcs_on)
 
 @app.route("/api/trades")
 def api_trades():
@@ -519,6 +553,9 @@ def _read_trades_full(limit: int = 5000) -> list[dict]:
                         "atr_now": _safe_float(row.get("atr_now",0.0)),
                         "funding_pct": _safe_float(row.get("funding_pct",0.0)),
                         "reasons": row.get("reasons",""),
+                        # NEW: EV fields
+                        "ev_perc": _safe_float(row.get("ev_perc", float("nan"))),
+                        "ev_usd": _safe_float(row.get("ev_usd", float("nan"))),
                     })
                 except Exception:
                     continue
@@ -647,7 +684,7 @@ def api_metrics():
     rows_all = _read_trades_full(limit=5000)
     rows = _filter_trades(rows_all[-limit:], symbol, days, include_open)
     if not rows:
-        return _json_ok(summary={"n":0}, prediction={}, reliability={}, execution={}, per_symbol={})
+        return _json_ok(summary={"n":0}, prediction={}, reliability={}, execution={}, per_symbol={}, ev={})
 
     # labels & probs
     labels = [_coerce_label(r.get("status",""), float(r.get("pnl",0.0))) for r in rows]
@@ -697,6 +734,15 @@ def api_metrics():
         "avg_atr": avg_atr,
     }
 
+    # EV ex-ante (if present)
+    ev_perc_vals = [float(r.get("ev_perc")) for r in rows if str(r.get("ev_perc")) not in ("", "nan")]
+    ev_usd_vals  = [float(r.get("ev_usd"))  for r in rows if str(r.get("ev_usd"))  not in ("", "nan")]
+    ev_stats = {
+        "ev_ex_ante_perc_avg": (sum(ev_perc_vals)/len(ev_perc_vals)) if ev_perc_vals else None,
+        "ev_ex_ante_usd_sum": sum(ev_usd_vals) if ev_usd_vals else None,
+        "n_with_ev": len(ev_perc_vals),
+    }
+
     # per-symbol rollup
     per_sym: Dict[str, Dict[str, Any]] = {}
     for r in rows:
@@ -713,6 +759,7 @@ def api_metrics():
         prediction=pred,
         reliability={"calibrated": rel_cal, "raw": rel_raw},
         execution=execq,
+        ev=ev_stats,
         per_symbol=per_sym,
         sample_size=len(rows),
     )

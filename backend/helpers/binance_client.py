@@ -293,14 +293,22 @@ def list_all_orders(symbol: str, limit: int = 100, start_time_ms: Optional[int] 
         logger.info("list_all_orders failed for %s: %s", symbol, e)
         return []
 
-# --- REPLACE THIS WHOLE FUNCTION in helpers/binance_client.py ---
-def find_recent_exit_fill(symbol: str, since_ms: int) -> Optional[Dict[str, Any]]:
+# --- REPLACE THIS WHOLE FUNCTION in helpers/binance_client.py ---# --- REPLACE THIS WHOLE FUNCTION in helpers/binance_client.py ---
+def find_recent_exit_fill(symbol: str, since_ms: int, *, back_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
-    'open'으로 남아있는 엔트리의 timestamp 이후에 체결된 TP/SL(감산 주문)의 fill을 추적.
-    - 모듈러 SDK 응답의 key가 snake_case/camelCase 혼재하므로 둘 다 지원.
-    - 우선순위: TAKE_PROFIT(_MARKET) > STOP(_MARKET), 최종 fill 기준 최신 1건 반환.
+    'open'으로 남아있는 엔트리의 timestamp(since_ms) 근방에서 체결된 TP/SL fill을 추적.
+    개선점:
+      - 시간 여유(back_ms, 기본 15분) 도입 → 거래소/SDK 타임스탬프 드리프트 방어
+      - 트리거 후 최종 체결이 LIMIT/MARKET(+reduceOnly) 으로만 표기되는 케이스 폴백 허용
+    반환: {"type": <str>, "price": <float>, "time": <ms>} | None
     """
-    orders = list_all_orders(symbol, limit=200, start_time_ms=max(0, int(since_ms) - 5 * 60_000))
+    try:
+        tol = int(os.getenv("EXIT_SEARCH_BACK_MS", str(back_ms if back_ms is not None else 15 * 60_000)))
+    except Exception:
+        tol = 15 * 60_000  # 15분
+    start = max(0, int(since_ms) - int(tol))
+
+    orders = list_all_orders(symbol, limit=200, start_time_ms=start)
     if not orders:
         return None
 
@@ -311,7 +319,6 @@ def find_recent_exit_fill(symbol: str, since_ms: int) -> Optional[Dict[str, Any]
         return None
 
     def _ms(o: Dict[str, Any]) -> int:
-        # 시간키: camel + snake 모두 시도
         for k in ("updateTime", "transactTime", "time", "workingTime",
                   "update_time", "transact_time", "working_time"):
             v = _get(o, k)
@@ -323,27 +330,30 @@ def find_recent_exit_fill(symbol: str, since_ms: int) -> Optional[Dict[str, Any]
                 continue
         return 0
 
-    cands: List[Dict[str, Any]] = []
-    for o in orders:
+    def _is_exit(o: Dict[str, Any]) -> bool:
         t = str(_get(o, "type") or "").upper()
         st = str(_get(o, "status") or "").upper()
-        if t in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET") and \
-           st in ("FILLED", "PARTIALLY_FILLED"):
-            if _ms(o) >= int(since_ms):
-                cands.append(o)
+        ro = _get(o, "reduceOnly", "reduce_only")
+        # 표준 TP/SL 타입
+        std_exit = t in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET")
+        # 폴백: 트리거 후 최종이 LIMIT/MARKET인데 reduceOnly=True로만 표기되는 경우
+        fb_exit = (t in ("LIMIT", "MARKET") and (str(ro).lower() == "true"))
+        return (st in ("FILLED", "PARTIALLY_FILLED")) and (std_exit or fb_exit)
 
+    # 시간 필터: start(= since_ms - tol) 이후만 허용
+    cands = [o for o in orders if _is_exit(o) and _ms(o) >= start]
     if not cands:
         return None
 
-    # 최신순
-    cands.sort(key=_ms)
+    cands.sort(key=_ms)  # 최신 순
     o = cands[-1]
     typ = str(_get(o, "type") or "").upper()
 
-    # 가격키: camel + snake 모두 시도 (avgPrice > price > stopPrice 계열)
-    px = _get(o, "avgPrice", "avg_price", "price", "stopPrice", "stop_price")
+    # 가격 추출(우선순위: avgPrice > price > stopPrice > activate/triggerPrice)
+    px = _get(o, "avgPrice", "avg_price", "price", "stopPrice", "stop_price",
+              "activatePrice", "triggerPrice", "activate_price", "trigger_price")
     try:
-        pxf = float(px) if px is not None else 0.0
+        pxf = float(px) if px not in (None, "") else 0.0
     except Exception:
         pxf = 0.0
 

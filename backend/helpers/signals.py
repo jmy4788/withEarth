@@ -1,4 +1,4 @@
-# helpers/signals.py — 3rd pass (balance-% sizing, journaling/telemetry extended)
+# helpers/signals.py — 3rd pass + checkpointing & EV logging (balance-% sizing, journaling/telemetry extended)
 # Hotfix-1: export get_overview() for app.py import
 # Hotfix-2: restore _last_open_trade_timestamp() used by cooldown/time-barrier
 from __future__ import annotations
@@ -11,11 +11,20 @@ import numpy as np
 
 # --- utils & io ---
 try:
-    from .utils import LOG_DIR, gcs_enabled, gcs_append_csv_row, log_event  # type: ignore
+    from .utils import (
+        LOG_DIR, gcs_enabled, gcs_append_csv_row, log_event,
+        gcs_list, gcs_download_text, GCS_PREFIX,
+        gcs_upload_file, gcs_download_file,
+    )  # type: ignore
 except Exception:  # pragma: no cover
     LOG_DIR = os.path.join(os.getcwd(), "logs")
     def gcs_enabled() -> bool: return False
     def gcs_append_csv_row(*args, **kwargs) -> None: return None
+    def gcs_list(prefix: str): return []
+    def gcs_download_text(path: str, encoding: str = "utf-8"): return ""
+    GCS_PREFIX = os.getenv("GCS_PREFIX", "trading_bot")
+    def gcs_upload_file(*args, **kwargs) -> bool: return False
+    def gcs_download_file(*args, **kwargs) -> bool: return False
     def log_event(*args, **kwargs): pass
 
 # --- data & indicators ---
@@ -127,6 +136,11 @@ RISK_USDT = float(os.getenv("RISK_USDT", "100"))                # legacy (SIZE_M
 RISK_BAL_PCT = float(os.getenv("RISK_BAL_PCT", "1.0"))          # % of wallet balance
 SIZE_BAL_INCLUDE_UPNL = str(os.getenv("SIZE_BAL_INCLUDE_UPNL", "false")).lower() in ("1", "true", "yes")
 SIZE_BAL_ASSET_OVERRIDE = os.getenv("SIZE_BAL_ASSET_OVERRIDE", "").upper().strip()
+
+# --- Journal checkpoint paths (NEW) ---
+_JOURNAL_LATEST = os.getenv("JOURNAL_LATEST_PATH", f"{GCS_PREFIX}/journal/latest/trades.csv")
+_JOURNAL_DAILY_PREFIX = os.getenv("JOURNAL_DAILY_PREFIX", f"{GCS_PREFIX}/journal")
+JOURNAL_SYNC_ON_START = str(os.getenv("JOURNAL_SYNC_ON_START","true")).lower() in ("1","true","yes")
 
 # =====================
 # Dataclass
@@ -481,6 +495,50 @@ def _compute_size(symbol: str, entry: float, sl: float, risk_scalar: float = 1.0
     return float(qty), meta
 
 # ---------------------------------
+# Journal checkpoint helpers (NEW)
+# ---------------------------------
+def _journal_restore_from_gcs_if_needed() -> bool:
+    """
+    로컬 trades.csv가 없거나 너무 작으면 GCS 최신본으로 복원.
+    """
+    try:
+        need = (not os.path.exists(TRADES_CSV)) or (os.path.getsize(TRADES_CSV) < 256)
+    except Exception:
+        need = True
+    if (not need) or (not gcs_enabled()):
+        return False
+    ok = gcs_download_file(_JOURNAL_LATEST, TRADES_CSV)
+    if ok:
+        log_event("journal.restore", source=_JOURNAL_LATEST, local=TRADES_CSV)
+    return ok
+
+def _journal_backup_to_gcs(tag: str = "auto") -> bool:
+    """
+    로컬 trades.csv 전체본을 GCS latest + 일자 보관 경로로 업로드.
+    """
+    if (not gcs_enabled()) or (not os.path.exists(TRADES_CSV)):
+        return False
+    from datetime import datetime, timezone
+    now = datetime.now(tz=timezone.utc)
+    date_dir = now.strftime("%Y%m%d"); time_tag = now.strftime("%H%M%S")
+    daily_path = f"{_JOURNAL_DAILY_PREFIX}/{date_dir}/trades_{time_tag}_{tag}.csv"
+    ok1 = gcs_upload_file(TRADES_CSV, _JOURNAL_LATEST, content_type="text/csv")
+    ok2 = gcs_upload_file(TRADES_CSV, daily_path, content_type="text/csv")
+    if ok1 or ok2:
+        log_event("journal.backup", latest=_JOURNAL_LATEST, daily=daily_path, tag=tag)
+    return bool(ok1 or ok2)
+
+def journal_sync(mode: str = "backup") -> Dict[str, Any]:
+    """
+    /tasks/journal_sync에서 호출용: "restore" 또는 "backup"
+    """
+    if mode == "restore":
+        ok = _journal_restore_from_gcs_if_needed()
+        return {"action":"restore","ok":bool(ok)}
+    ok = _journal_backup_to_gcs(tag="cron")
+    return {"action":"backup","ok":bool(ok)}
+
+# ---------------------------------
 # Signal generation
 # ---------------------------------
 def generate_signal(symbol: str) -> Dict[str, Any]:
@@ -716,8 +774,6 @@ def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
 # ---------------------------------
 # Maintain (time barrier + BE trailing + cleanup)
 # ---------------------------------
-# helpers/signals.py
-
 def _current_stop_price(symbol: str) -> Optional[float]:
     try:
         orders = get_open_orders(symbol)
@@ -782,6 +838,64 @@ def _last_open_row_index_and_ts(symbol: str) -> Tuple[Optional[int], Optional[in
             idx = i; ts_ms = _iso_to_ms(rows[i].get("timestamp","")); break
     return idx, ts_ms, rows
 
+def _journal_has_row_id(row_id: Optional[str]) -> bool:
+    if not row_id: return False
+    try:
+        import csv
+        if not os.path.exists(TRADES_CSV): return False
+        with open(TRADES_CSV, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if str(row.get("id","")) == str(row_id):
+                    return True
+    except Exception:
+        return False
+    return False
+
+def _reconcile_open_from_gcs(symbol: str, max_scan: int = 500) -> bool:
+    """
+    GCS trades/ 스냅샷에서 최신 'open' 행(해당 심볼)을 찾아 로컬 trades.csv에 복구.
+    """
+    if not gcs_enabled():
+        return False
+    try:
+        prefix = f"{GCS_PREFIX}/trades/"
+        names = [n for n in (gcs_list(prefix) or []) if n.endswith(".csv")]
+        if not names:
+            return False
+        names.sort(reverse=True)  # 최신 우선
+        import csv, io
+        scanned = 0
+        for name in names:
+            if "/trades_close/" in name:
+                continue
+            scanned += 1
+            if scanned > max_scan:
+                break
+            text = gcs_download_text(name) or ""
+            if not text:
+                continue
+            try:
+                row = next(csv.DictReader(io.StringIO(text), skipinitialspace=True), None)
+            except Exception:
+                row = None
+            if not row:
+                continue
+            if str(row.get("symbol","")).upper() != symbol.upper():
+                continue
+            if str(row.get("status","")).lower() != "open":
+                continue
+            if _journal_has_row_id(row.get("id")):
+                log_event("reconcile.skip", symbol=symbol, reason="already_present", id=row.get("id"))
+                return True
+            _journal_append_open(row)
+            log_event("reconcile.gcs_open_restored", symbol=symbol, source=name, id=row.get("id"))
+            return True
+        return False
+    except Exception as e:
+        logger.info("reconcile_from_gcs failed for %s: %s", symbol, e)
+        return False
+
 def _rewrite_trades_csv(rows: list, pref_headers: Optional[list] = None) -> None:
     keys = set()
     for r in rows: keys.update(r.keys())
@@ -790,7 +904,8 @@ def _rewrite_trades_csv(rows: list, pref_headers: Optional[list] = None) -> None
         "exit","pnl","status","id","prob","rr","entry_maker","tp_type","mode",
         "reprices","used_market_fallback","post_only","spread_bps","atr_now",
         "funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
-        "size_mode","bal_asset","notional","bal_pct","exit_ts"  # NEW
+        "size_mode","bal_asset","notional","bal_pct","exit_ts",  # NEW
+        "prob_raw","prob_cal","ev_perc","ev_usd"                 # NEW
     ]
     headers = [k for k in base if k in keys] + [k for k in sorted(keys) if k not in base]
     import csv, os
@@ -833,21 +948,36 @@ def _journal_close_last(symbol: str, exit_price: float, reason: str) -> bool:
         if gcs_enabled():
             try: gcs_append_csv_row("trades_close", list(r.keys()), r)
             except Exception: pass
+            # NEW: close 후 전체본 체크포인트 백업
+            try: _journal_backup_to_gcs(tag=reason)
+            except Exception: pass
         return True
     except Exception as e:
         logger.info("journal close failed: %s", e); return False
 
 def _settle_by_orders(symbol: str) -> bool:
     idx, ts_ms, rows = _last_open_row_index_and_ts(symbol)
-    if idx is None or ts_ms is None: return False
+    if idx is None or ts_ms is None:
+        restored = _reconcile_open_from_gcs(symbol)
+        if restored:
+            idx, ts_ms, rows = _last_open_row_index_and_ts(symbol)
+        if idx is None or ts_ms is None:
+            log_event("settle.skip", symbol=symbol, reason="no_open_row")
+            return False
     info = find_recent_exit_fill(symbol, since_ms=int(ts_ms))
-    if not info or not info.get("price"): return False
+    if not info or not info.get("price"):
+        log_event("settle.no_exit_found", symbol=symbol, since_ms=int(ts_ms))
+        return False
     typ = str(info.get("type","")).upper()
     rsn = "closed_tp" if "TAKE_PROFIT" in typ else ("closed_sl" if "STOP" in typ else "closed")
     return _journal_close_last(symbol, float(info["price"]), reason=rsn)
 
 def maintain_positions(symbol: str) -> Dict[str, Any]:
     try:
+        # NEW: 주기 태스크에서도 필요 시 복원
+        if JOURNAL_SYNC_ON_START:
+            _journal_restore_from_gcs_if_needed()
+
         if _time_barrier_due(symbol):
             od = _close_position_market(symbol)
             exitp = 0.0
@@ -914,11 +1044,46 @@ def _time_barrier_due(symbol: str) -> bool:
     except Exception:
         return _now_utc() >= (start + timedelta(minutes=HORIZON_MIN))
 
+# === NEW: EV components & EV_perc ===
+def _ev_components(direction: str, entry: float, tp: float, sl: float) -> tuple[float,float]:
+    """
+    fee-aware 순수 R_up_net, R_dn_net 계산(ENTRY/TP/SL maker/taker 기대 혼합).
+    """
+    e, t, s = float(entry), float(tp), float(sl)
+    if e<=0 or t<=0 or s<=0: return 0.0, 0.0
+    maker = FEE_MAKER_BPS / 1e4; taker = FEE_TAKER_BPS / 1e4
+    if direction == "long":
+        up_g = (t-e)/e; dn_g = (e-s)/e
+    else:
+        up_g = (e-t)/e; dn_g = (s-e)/e
+    if not RR_EVAL_WITH_FEES:
+        return max(0.0, up_g), max(1e-12, dn_g)
+    p_maker = _estimate_p_maker_from_journal()
+    up_net_m = max(0.0, up_g - (maker + (maker if TP_ORDER_TYPE=="LIMIT" else taker)))
+    up_net_t = max(0.0, up_g - (taker + (maker if TP_ORDER_TYPE=="LIMIT" else taker)))
+    up_net   = p_maker*up_net_m + (1.0-p_maker)*up_net_t
+    dn_net_m = max(1e-12, dn_g + (maker + taker))
+    dn_net_t = max(1e-12, dn_g + (taker + taker))
+    dn_net   = p_maker*dn_net_m + (1.0-p_maker)*dn_net_t
+    return float(up_net), float(dn_net)
+
+def _compute_ev_perc(prob: float, direction: str, entry: float, tp: float, sl: float) -> float:
+    """
+    EV_perc = p·R_up_net − (1−p)·R_dn_net
+    """
+    p = max(0.0, min(1.0, float(prob)))
+    up, dn = _ev_components(direction, entry, tp, sl)
+    return float(p*up - (1.0-p)*dn)
+
 # ---------------------------------
 # Manage trade (entry + journaling)
 # ---------------------------------
 def manage_trade(symbol: str) -> Dict[str, Any]:
     try:
+        # NEW: 필요 시 부팅 직후 복원
+        if JOURNAL_SYNC_ON_START:
+            _journal_restore_from_gcs_if_needed()
+
         sig = generate_signal(symbol)
         if "result" not in sig or not isinstance(sig["result"], dict):
             return {"symbol": symbol, "error": "no_signal"}
@@ -968,6 +1133,9 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
             except Exception:
                 entry_actual = entry_intent
         try:
+            # NEW: EV logging (fees+maker/taker 기대 반영, prob_cal 사용)
+            ev_perc = _compute_ev_perc(prob_cal, direction, entry_intent, tp, sl)
+            ev_usd  = ev_perc * float(size_meta.get('notional', float(qty*entry_intent)))
             row = {
                 "timestamp": _now_utc().isoformat(),
                 "symbol": symbol,
@@ -1002,10 +1170,15 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 "bal_asset": str(size_meta.get("bal_asset","")),
                 "notional": f"{float(size_meta.get('notional', float(qty*entry_intent))):.10f}",
                 "bal_pct": f"{float(size_meta.get('bal_pct', 0.0)):.6f}",
+                "ev_perc": f"{float(ev_perc):.10f}",   # NEW
+                "ev_usd": f"{float(ev_usd):.10f}",     # NEW
             }
             _journal_append_open(row)
             if gcs_enabled():
                 gcs_append_csv_row("trades", list(row.keys()), row)
+                # NEW: 엔트리 직후 최신본 백업(선택)
+                try: _journal_backup_to_gcs(tag="entry")
+                except Exception: pass
         except Exception as e:
             logger.info("journal append failed: %s", e)
         try:
@@ -1026,7 +1199,8 @@ def _journal_append_open(row: Dict[str, Any]) -> None:
         "timestamp","symbol","side","qty","entry","entry_intent","tp","sl","exit","pnl","status","id",
         "prob","prob_raw","prob_cal","rr","entry_maker","tp_type","mode","reprices","used_market_fallback","post_only",
         "spread_bps","atr_now","funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
-        "size_mode","bal_asset","notional","bal_pct","exit_ts"  # NEW
+        "size_mode","bal_asset","notional","bal_pct","exit_ts",  # NEW
+        "ev_perc","ev_usd"                                      # NEW
     ]
     if "exit_ts" not in row: row["exit_ts"] = ""
     if not os.path.exists(TRADES_CSV):

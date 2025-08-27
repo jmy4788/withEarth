@@ -6,7 +6,7 @@ entrypoint: gunicorn -b :$PORT app:server
 
 automatic_scaling:
   min_instances: 1
-  max_instances: 2
+  max_instances: 1
 
 env_variables:
   # --- 런타임/로깅 ---
@@ -73,7 +73,7 @@ env_variables:
   SIZE_MODE: "USDT"          # USDT | BALANCE_PCT
   RISK_BAL_PCT: "1.50"              # 지갑의 1.5% 사용
   SIZE_BAL_INCLUDE_UPNL: "false"    # 미실현손익 포함 여부 (true/false)
-  RISK_USDT: "100"
+  RISK_USDT: "50"
   LEVERAGE: "5"
   MARGIN_TYPE: "ISOLATED"
   POSITION_MODE: "ONEWAY"

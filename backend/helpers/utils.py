@@ -7,14 +7,9 @@ helpers/utils.py — refactor (2025-08-12, KST)
 - 로그/디렉토리 준비(LOG_DIR)
 - GCS 보조 유틸: CSV 1행 스냅샷 업로드(gcs_append_csv_row)
 - (선택) 파일 로거 초기화
-
-호환성
-- signals.py, predictor.py, binance_client.py가 기대하는 심볼을 그대로 제공합니다:
-  - LOG_DIR: Path 또는 str
-  - get_secret(name) -> Optional[str]
-  - gcs_enabled() -> bool
-  - gcs_append_csv_row(dataset: str, headers: list[str], row: dict) -> None
+- (추가) GCS 파일 업/다운(gcs_upload_file, gcs_download_file) — 저널 체크포인트용
 """
+
 import json
 import csv
 import logging
@@ -140,7 +135,7 @@ def setup_file_logger(filename: str = "bot.log", level: int = logging.INFO) -> N
 
 
 # ---------------------------
-# GCS 업로드 유틸(스냅샷 방식)
+# GCS 업로드 유틸(스냅샷 방식 + 파일 업/다운)
 # ---------------------------
 _GCS_OK = False
 try:
@@ -211,6 +206,70 @@ def gcs_append_csv_row(dataset: str, headers: List[str], row: dict) -> None:
     except Exception as e:
         logging.info(f"gcs_append_csv_row failed: {e}")
 
+def gcs_list(prefix: str) -> List[str]:
+    """
+    버킷 내 prefix로 blob 목록(name) 반환. (예: f"{GCS_PREFIX}/trades/")
+    """
+    if not gcs_enabled():
+        return []
+    try:
+        client = storage.Client()
+        blobs = client.list_blobs(GCS_BUCKET, prefix=prefix)  # type: ignore[arg-type]
+        return [b.name for b in blobs]  # type: ignore[attr-defined]
+    except Exception as e:
+        logging.info(f"gcs_list failed: {e}")
+        return []
+
+def gcs_download_text(path: str, encoding: str = "utf-8") -> str:
+    """
+    blob name(path) 기준 텍스트 다운로드.
+    """
+    if not gcs_enabled():
+        return ""
+    try:
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)  # type: ignore[arg-type]
+        blob = bucket.blob(path)
+        return blob.download_as_text(encoding=encoding)
+    except Exception as e:
+        logging.info(f"gcs_download_text failed: {e}")
+        return ""
+
+# ---- NEW: file up/down for checkpointing ----
+def gcs_upload_file(local_path: str, dst_path: str, content_type: str = "text/csv") -> bool:
+    """
+    로컬 파일을 GCS blob(dst_path)로 업로드. 예: dst_path=f"{GCS_PREFIX}/journal/latest/trades.csv"
+    """
+    if not gcs_enabled():
+        return False
+    try:
+        data = Path(local_path).read_bytes()
+        _gcs_upload_bytes(dst_path, data, content_type=content_type)
+        return True
+    except Exception as e:
+        logging.info(f"gcs_upload_file failed: {e}")
+        return False
+
+def gcs_download_file(src_path: str, local_path: str) -> bool:
+    """
+    GCS blob(src_path)을 로컬 파일(local_path)로 저장.
+    """
+    if not gcs_enabled():
+        return False
+    try:
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)  # type: ignore[arg-type]
+        blob = bucket.blob(src_path)
+        data = blob.download_as_bytes()
+        p = Path(local_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return True
+    except Exception as e:
+        logging.info(f"gcs_download_file failed: {e}")
+        return False
+
+
 def log_event(event: str, **fields) -> None:
     """
     Cloud Logging에서 보기 편하도록 JSON 문자열로 INFO 레벨 로그를 남깁니다.
@@ -230,5 +289,9 @@ __all__ = [
     "setup_file_logger",
     "gcs_enabled",
     "gcs_append_csv_row",
+    "gcs_list",
+    "gcs_download_text",
+    "gcs_upload_file",
+    "gcs_download_file",
     "log_event",
 ]
