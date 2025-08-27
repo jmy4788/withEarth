@@ -18,9 +18,9 @@ cron:
 - description: Journal checkpoint backup
   url: /tasks/journal_sync
   schedule: every 10 minutes
-  target: Asia/Seoul
+  target: default
 
 - description: Journal checkpoint restore (seldom; manual trigger preferred)
   url: /tasks/journal_sync?mode=restore
   schedule: every 24 hours
-  target: Asia/Seoul
+  target: default
