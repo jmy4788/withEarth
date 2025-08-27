@@ -852,6 +852,22 @@ def _journal_has_row_id(row_id: Optional[str]) -> bool:
         return False
     return False
 
+def _journal_status_by_id(row_id: Optional[str]) -> Optional[str]:
+    """해당 id의 현행 status(open/closed/None)를 반환."""
+    if not row_id: return None
+    try:
+        import csv
+        if not os.path.exists(TRADES_CSV): return None
+        with open(TRADES_CSV, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if str(row.get("id","")) == str(row_id):
+                    st = str(row.get("status","")).lower()
+                    return st
+    except Exception:
+        return None
+    return None
+
 def _reconcile_open_from_gcs(symbol: str, max_scan: int = 500) -> bool:
     """
     GCS trades/ 스냅샷에서 최신 'open' 행(해당 심볼)을 찾아 로컬 trades.csv에 복구.
@@ -886,8 +902,14 @@ def _reconcile_open_from_gcs(symbol: str, max_scan: int = 500) -> bool:
             if str(row.get("status","")).lower() != "open":
                 continue
             if _journal_has_row_id(row.get("id")):
-                log_event("reconcile.skip", symbol=symbol, reason="already_present", id=row.get("id"))
-                return True
+                st = _journal_status_by_id(row.get("id"))
+                if st == "open":
+                    log_event("reconcile.skip", symbol=symbol, reason="already_present_open", id=row.get("id"))
+                    return True
+                else:
+                    # 이미 로컬에 존재하되 open이 아님(=close 처리됨). 복구 불필요이며 정산 대상도 아님.
+                    log_event("reconcile.skip", symbol=symbol, reason="already_present_but_closed", id=row.get("id"))
+                    return False
             _journal_append_open(row)
             log_event("reconcile.gcs_open_restored", symbol=symbol, source=name, id=row.get("id"))
             return True

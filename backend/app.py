@@ -97,7 +97,7 @@ except Exception as e:
         return []
 
 try:
-    from helpers.utils import log_event, gcs_enabled  # noqa
+    from helpers.utils import log_event, gcs_enabled, gcs_list as _gcs_list, gcs_download_text as _gcs_download_text  # noqa
 except Exception:
     def log_event(event: str, **fields): logger.info("[event]%s %s", event, fields)
     def gcs_enabled() -> bool: return False
@@ -500,6 +500,56 @@ def api_open_orders():
         return _json_ok(orders=orders)
     except Exception as e:
         return _json_err(f"open_orders_failed: {e}")
+    
+@app.route("/api/journal/local.csv")
+def api_journal_local_csv():
+    try:
+        p = Path(LOG_DIR) / "trades.csv"
+        if not p.exists():
+            return _json_err("not_found", path=str(p))
+        text = p.read_text(encoding="utf-8")
+        resp = make_response(text, 200)
+        resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+        resp.headers["Content-Disposition"] = "attachment; filename=trades.csv"
+        return resp
+    except Exception as e:
+        return _json_err("read_failed", error=str(e))
+
+@app.route("/api/gcs/snapshots")
+def api_gcs_snapshots():
+    if not gcs_enabled():
+        return _json_err("gcs_disabled")
+    dataset = (request.args.get("dataset") or "trades").strip()
+    date = (request.args.get("date") or "").strip()  # YYYYMMDD (optional)
+    try:
+        limit = int(request.args.get("limit","200"))
+    except Exception:
+        limit = 200
+    prefix = f"{os.getenv('GCS_PREFIX','trading_bot')}/{dataset}/"
+    if date:
+        prefix = f"{prefix}{date}/"
+    names = _gcs_list(prefix) or []
+    names = sorted([n for n in names if n.endswith(".csv")])[-limit:]
+    return _json_ok(dataset=dataset, date=date or None, count=len(names), items=names)
+
+@app.route("/api/gcs/snapshot")
+def api_gcs_snapshot():
+    if not gcs_enabled():
+        return _json_err("gcs_disabled")
+    name = request.args.get("name")
+    if not name:
+        return _json_err("missing_name")
+    try:
+        text = _gcs_download_text(name)
+        if not text:
+            return _json_err("not_found_or_empty", name=name)
+        resp = make_response(text, 200)
+        resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+        fname = name.split("/")[-1] or "snapshot.csv"
+        resp.headers["Content-Disposition"] = f"attachment; filename={fname}"
+        return resp
+    except Exception as e:
+        return _json_err("download_failed", error=str(e))
 
 # ==============================
 # Analytics: metrics endpoints
