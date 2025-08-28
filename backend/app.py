@@ -53,14 +53,40 @@ except Exception:
     LOG_DIR = _ensure_dir_writable(LOG_DIR_ENV)
 LOG_PATH = str(Path(LOG_DIR) / "bot.log")
 
+# app.py
 def setup_logging() -> logging.Logger:
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
-    logging.getLogger().handlers.clear()
-    logging.basicConfig(level=level, format=fmt)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+    # root 초기화
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(level)
+
+    # 콘솔 핸들러
+    sh = logging.StreamHandler()
+    sh.setLevel(level)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+    # 파일 핸들러 (/api/logs가 tail하는 경로)
+    try:
+        Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except Exception as e:
+        root.info("File logging setup failed: %s", e)
+
+    # 서브로거 레벨
     logging.getLogger("helpers.signals").setLevel(level)
     logging.getLogger("helpers.predictor").setLevel(level)
+    logging.getLogger("event").setLevel(level)  # log_event가 쓰는 로거
+
     return logging.getLogger(__name__)
 
 logger = setup_logging()
@@ -719,7 +745,7 @@ def _basic_stats(rows: list[dict]) -> dict:
         "total_pnl": total, "avg_pnl": exp, "profit_factor": pf,
         "std_pnl": sigma, "max_drawdown": max_dd,
     }
-
+# app.py
 @app.route("/api/metrics")
 def api_metrics():
     try: limit = int(request.args.get("limit","500"))
@@ -739,12 +765,13 @@ def api_metrics():
     # labels & probs
     labels = [_coerce_label(r.get("status",""), float(r.get("pnl",0.0))) for r in rows]
     probs_cal = [float(r.get("prob",0.0)) for r in rows]
-    # prob_raw가 없을 수 있음
+
+    # prob_raw (optional)
     probs_raw = []
     labels_for_raw = []
     for i, r in enumerate(rows):
         prx = float(r.get("prob_raw")) if r.get("prob_raw") not in (None, "", "nan") else float("nan")
-        if prx == prx:  # not NaN
+        if prx == prx:
             probs_raw.append(prx)
             labels_for_raw.append(labels[i])
 
@@ -753,21 +780,19 @@ def api_metrics():
 
     # summary
     summary = _basic_stats(rows)
+
     # prediction quality
-    pred = {
-        "brier_cal": _brier(arr_cal),
-        "logloss_cal": _logloss(arr_cal),
-        "auc_cal": _auc(arr_cal),
-    }
+    pred = {"brier_cal": _brier(arr_cal), "logloss_cal": _logloss(arr_cal), "auc_cal": _auc(arr_cal)}
     if arr_raw:
         b_raw = _brier(arr_raw)
         b_cal = _brier(arr_cal)
         pred.update({
-            "brier_raw": b_raw,
+            "brier_raw": _brier(arr_raw),
             "logloss_raw": _logloss(arr_raw),
             "auc_raw": _auc(arr_raw),
             "improvement_brier": (b_raw - b_cal) if (b_raw is not None and b_cal is not None) else None,
         })
+
     # reliability
     rel_cal = _reliability_bins(arr_cal, bins=bins)
     rel_raw = _reliability_bins(arr_raw, bins=bins) if arr_raw else {"points": [], "ece": None}
@@ -777,20 +802,27 @@ def api_metrics():
     fallback_ratio = sum(int(r.get("used_market_fallback",0)) for r in rows)/max(1,len(rows))
     avg_spread = sum(float(r.get("spread_bps",0.0)) for r in rows)/max(1,len(rows))
     avg_atr = sum(float(r.get("atr_now",0.0)) for r in rows)/max(1,len(rows))
-    execq = {
-        "entry_maker_ratio": maker_ratio,
-        "market_fallback_ratio": fallback_ratio,
-        "avg_spread_bps": avg_spread,
-        "avg_atr": avg_atr,
-    }
+    execq = {"entry_maker_ratio": maker_ratio, "market_fallback_ratio": fallback_ratio,
+             "avg_spread_bps": avg_spread, "avg_atr": avg_atr}
 
-    # EV ex-ante (if present)
+    # EV ex-ante (with aliases)
     ev_perc_vals = [float(r.get("ev_perc")) for r in rows if str(r.get("ev_perc")) not in ("", "nan")]
     ev_usd_vals  = [float(r.get("ev_usd"))  for r in rows if str(r.get("ev_usd"))  not in ("", "nan")]
     ev_stats = {
         "ev_ex_ante_perc_avg": (sum(ev_perc_vals)/len(ev_perc_vals)) if ev_perc_vals else None,
         "ev_ex_ante_usd_sum": sum(ev_usd_vals) if ev_usd_vals else None,
         "n_with_ev": len(ev_perc_vals),
+    }
+    # ★ 사양 호환 별칭
+    if ev_stats["ev_ex_ante_perc_avg"] is not None:
+        ev_stats["ex_ante_perc"] = ev_stats["ev_ex_ante_perc_avg"]
+    if ev_stats["ev_ex_ante_usd_sum"] is not None:
+        ev_stats["ex_ante_usd"] = ev_stats["ev_ex_ante_usd_sum"]
+
+    ev_out = {
+    **ev_stats,
+    "ex_ante_perc": ev_stats.get("ev_ex_ante_perc_avg"),
+    "ex_ante_usd": ev_stats.get("ev_ex_ante_usd_sum"),
     }
 
     # per-symbol rollup
@@ -803,13 +835,13 @@ def api_metrics():
         per_sym[s]["wins"] += 1 if _coerce_label(r.get("status",""), float(r.get("pnl",0.0)))==1 else 0
     for s,v in per_sym.items():
         v["win_rate"] = v["wins"]/max(1,v["n"])
-
+    
     return _json_ok(
         summary=summary,
         prediction=pred,
         reliability={"calibrated": rel_cal, "raw": rel_raw},
         execution=execq,
-        ev=ev_stats,
+        ev=ev_out,
         per_symbol=per_sym,
         sample_size=len(rows),
     )

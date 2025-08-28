@@ -986,13 +986,19 @@ def _settle_by_orders(symbol: str) -> bool:
         if idx is None or ts_ms is None:
             log_event("settle.skip", symbol=symbol, reason="no_open_row")
             return False
-    info = find_recent_exit_fill(symbol, since_ms=int(ts_ms))
+    # 🔽 명시적으로 back_ms 적용 (기본 3시간 = 10,800,000ms 권장)
+    try:
+        back_ms = int(os.getenv("EXIT_SEARCH_BACK_MS", "10800000"))
+    except Exception:
+        back_ms = 10800000
+    info = find_recent_exit_fill(symbol, since_ms=int(ts_ms), back_ms=back_ms)
     if not info or not info.get("price"):
-        log_event("settle.no_exit_found", symbol=symbol, since_ms=int(ts_ms))
+        log_event("settle.no_exit_found", symbol=symbol, since_ms=int(ts_ms), back_ms=back_ms)
         return False
     typ = str(info.get("type","")).upper()
     rsn = "closed_tp" if "TAKE_PROFIT" in typ else ("closed_sl" if "STOP" in typ else "closed")
     return _journal_close_last(symbol, float(info["price"]), reason=rsn)
+
 
 def maintain_positions(symbol: str) -> Dict[str, Any]:
     try:

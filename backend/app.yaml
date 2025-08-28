@@ -21,7 +21,7 @@ env_variables:
   GEMINI_MODEL: "gemini-2.5-flash-lite"
   USE_CALIBRATED_PROB: "true"              # ★ 명시
   PROB_CALIBRATION_PATH: "/tmp/trading_bot/calibration.json"
-  CALIB_MIN_SAMPLES: "150"
+  CALIB_MIN_SAMPLES: "50"
   CALIB_BINS: "10"
 
   # --- 로그/GCS ---
@@ -59,8 +59,8 @@ env_variables:
   ENTRY_POST_ONLY: "true"                  # ★ 패치-1로 활성화
   LIMIT_TTL_SEC: "20"
   LIMIT_POLL_SEC: "1.0"
-  LIMIT_MAX_REPRICES: "2"
-  LIMIT_MAX_SLIPPAGE_BPS: "2.0"
+  LIMIT_MAX_REPRICES: "3"
+  LIMIT_MAX_SLIPPAGE_BPS: "3.0"
   LIMIT_FAILOVER_TO_MARKET: "true"
   LIMIT_TTL_FALLBACK_TO_MARKET: "true"
 
