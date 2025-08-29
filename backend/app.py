@@ -59,6 +59,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+
 def setup_logging(log_path: Optional[str] = None) -> logging.Logger:
     """
     환경변수:
@@ -112,6 +113,7 @@ def setup_logging(log_path: Optional[str] = None) -> logging.Logger:
     logging.getLogger("helpers.predictor").setLevel(level)
 
     return logging.getLogger(__name__)
+
 # Initialize logging ASAP so /api/logs shows event/journal lines
 logger = setup_logging(LOG_PATH)
 logger.info("setup_logging initialized", extra={"log_path": LOG_PATH})

@@ -64,3 +64,5 @@ pnpm-debug.log*
 # Mytools
 
 /Mytools
+
+검증.ps1

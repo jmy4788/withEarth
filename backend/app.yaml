@@ -12,48 +12,46 @@ env_variables:
   # --- 런타임/로깅 ---
   TZ: "Asia/Seoul"
   LOG_LEVEL: "INFO"
+  LOG_DIR: "/tmp/trading_bot"
 
   # --- 실행/심볼 ---
-  EXECUTE_TRADES: "true"
+  EXECUTE_TRADES: "true"              # ← 드라이런 우선
   SYMBOLS: "BTCUSDT,ETHUSDT"
 
-  # --- 모델 ---
+  # --- 모델/칼리브 ---
   GEMINI_MODEL: "gemini-2.5-flash-lite"
   SHADOW_MODELS: "gemini-2.5-flash"
-  USE_CALIBRATED_PROB: "true"              # ★ 명시
+  USE_CALIBRATED_PROB: "true"
   PROB_CALIBRATION_PATH: "/tmp/trading_bot/calibration.json"
   CALIB_MIN_SAMPLES: "150"
   CALIB_BINS: "10"
+  MIN_VOL_FRAC: "0.0005"               # LLM 호출 문턱
 
-  # --- EV게이트 및 동적 ATR ---
-  EV_MIN_PERC: 0.0
-  DYN_ATR_LEVELS: true
-  VOL_TRANQ_RATIO: 0.70
-  VOL_TURB_RATIO: 1.30
-  TP_FUDGE_TRANQ: 1.10
-  SL_FUDGE_TRANQ: 0.90
-  TP_FUDGE_TURB: 0.90
-  SL_FUDGE_TURB: 1.10
-
-  # --- 로그/GCS ---
-  GCS_BUCKET: "tothemoon-v2-logs-vaulted-scholar-466013-r5-seoul"
-  GCS_PREFIX: "trading_bot"
-
-  # --- 리스크/게이팅 ---
-  MIN_PROB: "0.65"
+  # --- EV/RR/게이트 ---
+  RR_GATE_MODE: "expected"             # ← 명시 추가 (worst|expected|best)
+  MIN_PROB: "0.62"                     # 초기 완화(보정 후 조정)
   PROB_RELAX_THRESHOLD: "0.78"
-  RR_MIN: "1.2"
+  RR_MIN: "1.20"
   RR_MIN_HIGH_PROB: "1.08"
-  RR_EVAL_WITH_FEES: "true"              # ★ 패치-2로 활성화
+  RR_EVAL_WITH_FEES: "true"
+  EV_MIN_PERC: "0.0000"                # 초기 0.0 → 튜닝 후 상향
   MAX_SPREAD_BPS: "1.5"
   HORIZON_MIN: "30"
   TIME_BARRIER_ENABLED: "true"
-  MIN_VOL_FRAC: "0.0005"
 
-  # --- MTF/쇼크/쿨다운 게이트(★ 모두 활성화) ---
+  # --- 동적 ATR / 변동성 ---
+  DYN_ATR_LEVELS: "true"
+  VOL_TRANQ_RATIO: "0.70"
+  VOL_TURB_RATIO: "1.30"
+  TP_FUDGE_TRANQ: "1.10"
+  SL_FUDGE_TRANQ: "0.90"
+  TP_FUDGE_TURB: "0.90"
+  SL_FUDGE_TURB: "1.10"
+
+  # --- MTF/쇼크/쿨다운 ---
   MTF_ALIGN_ENABLED: "true"
-  MTF_RSI_LONG_MIN: "55"
-  MTF_RSI_SHORT_MAX: "45"
+  MTF_RSI_LONG_MIN: "52"               # ← 55→52 (표본 확보)
+  MTF_RSI_SHORT_MAX: "48"              # ← 45→48
   SHOCK_BPS: "30"
   SHOCK_ATR_MULT: "1.8"
   ENTRY_COOLDOWN_MIN: "15"
@@ -61,37 +59,49 @@ env_variables:
   # --- 손절/익절 ---
   ATR_MULT_SL: "1.2"
   ATR_MULT_TP: "2.2"
-  TP_ORDER_TYPE: "LIMIT"                   # 필요 시 MARKET로 A/B
-  SL_ORDER_TYPE: "STOP_MARKET"             # ★ STOP_LIMIT 시험시 변경
-  SL_LIMIT_SLIPPAGE_BPS: "10"              # ★ STOP_LIMIT 사용 시만 관여
+  TP_ORDER_TYPE: "LIMIT"
+  SL_ORDER_TYPE: "STOP_MARKET"
+  SL_LIMIT_SLIPPAGE_BPS: "10"          # STOP_LIMIT일 때만 사용됨
 
   # --- 집행/주문 ---
   ENTRY_MODE: "LIMIT"
-  ENTRY_POST_ONLY: "true"                  # ★ 패치-1로 활성화
+  ENTRY_POST_ONLY: "true"
   LIMIT_TTL_SEC: "20"
   LIMIT_POLL_SEC: "1.0"
   LIMIT_MAX_REPRICES: "2"
   LIMIT_MAX_SLIPPAGE_BPS: "2.0"
-  LIMIT_FAILOVER_TO_MARKET: "true"
   LIMIT_TTL_FALLBACK_TO_MARKET: "true"
+  LIMIT_FAILOVER_TO_MARKET: "true"     # post-only 생성 에러 시엔 비활성(의도)
 
   # --- BE 트레일링 ---
   BE_TRAILING_ENABLED: "true"
   BE_TRIGGER_R_MULT: "1.0"
   BE_OFFSET_TICKS: "2"
 
-  # --- 포지션/사이징 --- #
-  SIZE_MODE: "USDT"          # USDT | BALANCE_PCT
-  RISK_BAL_PCT: "1.50"              # 지갑의 1.5% 사용
-  SIZE_BAL_INCLUDE_UPNL: "false"    # 미실현손익 포함 여부 (true/false)
+  # --- 포지션/사이징 ---
+  SIZE_MODE: "USDT"                    # USDT | BALANCE_PCT
   RISK_USDT: "50"
+  RISK_BAL_PCT: "1.50"
+  SIZE_BAL_INCLUDE_UPNL: "false"
   LEVERAGE: "5"
   MARGIN_TYPE: "ISOLATED"
   POSITION_MODE: "ONEWAY"
   POSITION_SIDE: "BOTH"
   VOL_SIZE_SCALING: "true"
+  VOL_LOOKBACK: "60"                   # ← 명시(평균/중앙값 기반)
   VOL_SCALAR_MIN: "0.5"
   VOL_SCALAR_MAX: "1.25"
+
+  # --- 메이커 확률 추정 ---
+  MAKER_PROB_LOOKBACK: "200"           # ← 명시 추가
+  MAKER_PROB_PRIOR_A: "3"              # ← 라플라스 prior (베타)
+  MAKER_PROB_PRIOR_B: "3"
+
+  # --- 정산/저널 & GCS ---
+  JOURNAL_SYNC_ON_START: "true"        # ← 명시 권장
+  EXIT_SEARCH_BACK_MS: "10800000"      # ← 3h back-scan (정산 누락 방지)
+  GCS_BUCKET: "tothemoon-v2-logs-vaulted-scholar-466013-r5-seoul"
+  GCS_PREFIX: "trading_bot"
 
   # --- 네트워킹 ---
   BINANCE_HTTP_TIMEOUT_MS: "10000"
@@ -99,13 +109,12 @@ env_variables:
   BINANCE_HTTP_BACKOFF_MS: "1000"
 
   # --- 수수료(bps) ---
-  FEE_MAKER_BPS: "2.0"                     # ★ 패치-2로 사용
+  FEE_MAKER_BPS: "2.0"
   FEE_TAKER_BPS: "4.0"
 
-  # ───────── 프런트 리디렉션(옵션) ─────────
-  FRONTEND_BASE_URL: ""                        # 배포 프런트엔드 URL (없으면 공백)
-  # --- 로깅 ---
-  LOG_DIR: "/tmp/trading_bot"
+  # --- 프런트 리디렉션(옵션) ---
+  FRONTEND_BASE_URL: ""
+
 vpc_access_connector:
   name: projects/vaulted-scholar-466013-r5/locations/asia-northeast3/connectors/appengine-conn2
   egress_setting: all-traffic
