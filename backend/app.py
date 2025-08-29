@@ -112,10 +112,16 @@ def setup_logging(log_path: Optional[str] = None) -> logging.Logger:
     logging.getLogger("helpers.predictor").setLevel(level)
 
     return logging.getLogger(__name__)
+# Initialize logging ASAP so /api/logs shows event/journal lines
+logger = setup_logging(LOG_PATH)
+logger.info("setup_logging initialized", extra={"log_path": LOG_PATH})
 
 # --- imports from helpers ---
 try:
-    from helpers.signals import generate_signal, manage_trade, get_overview as sig_get_overview, maintain_positions, journal_sync  # noqa
+    from helpers.signals import (
+        generate_signal, manage_trade, get_overview as sig_get_overview,
+        maintain_positions, journal_sync, preview_size
+    )  # noqa
 except Exception as e:
     logger.exception("helpers.signals import failed: %s", e)
     def generate_signal(symbol: str) -> Dict[str, Any]:
@@ -463,7 +469,22 @@ def api_overview():
         return _json_ok(overview=ov)
     except Exception as e:
         return _json_err("overview_failed", error=str(e))
-    
+
+@app.route("/api/risk/preview")
+def api_risk_preview():
+    symbol = (request.args.get("symbol") or SYMBOLS[0]).upper()
+    try:
+        entry = float(request.args.get("entry","0"))
+        sl = float(request.args.get("sl","0"))
+        rs = float(request.args.get("risk_scalar","1.0"))
+    except Exception:
+        return _json_err("bad_params")
+    try:
+        out = preview_size(symbol, entry, sl, risk_scalar=rs)
+        return _json_ok(symbol=symbol, **out)
+    except Exception as e:
+        return _json_err("preview_failed", error=str(e))
+
 @app.route("/api/debug/env")
 def api_debug_env():
     # 진단용: 현재 서버가 보고 있는 LOG_DIR, trades.csv 존재 여부, GCS on/off
@@ -967,6 +988,54 @@ def api_metrics_calibration():
         current_sample={"brier": _brier(arr), "rel": _reliability_bins(arr, bins=bins)},
         n=len(rows),
     )
+
+@app.route("/api/metrics/tune_ev_rr")
+def api_metrics_tune_ev_rr():
+    """그때 조건에서 EV/RR/Prob 게이트를 더 엄격/완화했다면? 후향 스캔."""
+    evs_arg = request.args.get("evs","-0.0005,0,0.0005,0.0010")
+    rr_arg = request.args.get("rrmins","1.10,1.20,1.30")
+    symbol = request.args.get("symbol")
+    try:
+        prob_relax = float(request.args.get("prob_relax", os.getenv("PROB_RELAX_THRESHOLD","0.78")))
+        rr_min_high = float(request.args.get("rr_min_high", os.getenv("RR_MIN_HIGH_PROB","1.08")))
+        min_prob = float(request.args.get("min_prob", os.getenv("MIN_PROB","0.60")))
+    except Exception:
+        return _json_err("bad_params")
+    try:
+        evs = [float(x) for x in evs_arg.split(",") if x.strip()!=""]
+        rrs = [float(x) for x in rr_arg.split(",") if x.strip()!=""]
+    except Exception:
+        return _json_err("bad_grid")
+
+    rows = _filter_trades(_read_trades_full(limit=5000), symbol, days=None, include_open=False)
+    combos = []
+    for ev_thr in evs:
+        for rr_thr in rrs:
+            sel = []
+            for r in rows:
+                p = float(r.get("prob",0.0))
+                rr = float(r.get("rr",0.0))
+                evp = r.get("ev_perc") if str(r.get("ev_perc","")) not in ("","nan") else None
+                if evp is None: continue
+                evp = float(evp)
+                if p < min_prob: continue
+                rr_req = rr_min_high if p >= prob_relax else rr_thr
+                if rr < rr_req: continue
+                if evp < ev_thr: continue
+                sel.append(r)
+            stats = _basic_stats(sel)
+            stats["n_selected"] = len(sel)
+            combos.append({
+                "ev_min": ev_thr, "rr_min": rr_thr,
+                "min_prob": min_prob, "prob_relax": prob_relax, "rr_min_high": rr_min_high,
+                "summary": stats
+            })
+    combos_sorted = sorted(
+        combos,
+        key=lambda x: ((x["summary"].get("profit_factor") or 0.0), (x["summary"].get("total_pnl") or 0.0)),
+        reverse=True
+    )
+    return _json_ok(best=combos_sorted[:10], grid=combos_sorted)
 
 # ======================================================================
 

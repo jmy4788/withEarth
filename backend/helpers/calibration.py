@@ -90,10 +90,13 @@ class ProbCalibrator:
         for i in range(self.bins):
             lo, hi = edges[i], edges[i+1]
             mask = (p >= lo) & (p < hi if i < self.bins - 1 else p <= hi)
-            if mask.sum() < 5:
+            cnt = int(mask.sum())
+            if cnt < 5:
                 continue
             px = float(p[mask].mean())
-            py = float(y[mask].mean())
+            pos = int(y[mask].sum())
+            # Beta prior smoothing (Laplace), improves small-sample stability
+            py = float((pos + _PRIOR_A) / (cnt + _PRIOR_A + _PRIOR_B))
             means_x.append(px)
             means_y.append(py)
         if len(means_x) < 3:

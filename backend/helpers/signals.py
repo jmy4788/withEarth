@@ -504,6 +504,10 @@ def _compute_size(symbol: str, entry: float, sl: float, risk_scalar: float = 1.0
             meta["wallet_balance"] = None
     return float(qty), meta
 
+def preview_size(symbol: str, entry: float, sl: float, risk_scalar: float = 1.0) -> Dict[str, Any]:
+    qty, meta = _compute_size(symbol, entry, sl, risk_scalar)
+    return {"qty": float(qty), **meta}
+
 # ---------------------------------
 # Journal checkpoint helpers (NEW)
 # ---------------------------------
@@ -979,8 +983,9 @@ def _rewrite_trades_csv(rows: list, pref_headers: Optional[list] = None) -> None
         "exit","pnl","status","id","prob","rr","entry_maker","tp_type","mode",
         "reprices","used_market_fallback","post_only","spread_bps","atr_now",
         "funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
-        "size_mode","bal_asset","notional","bal_pct","exit_ts",  # NEW
-        "prob_raw","prob_cal","ev_perc","ev_usd"                 # NEW
+        "size_mode","bal_asset","notional","bal_pct","exit_ts",
+        "prob_raw","prob_cal","ev_perc","ev_usd",
+        "ev_ex_ante_perc","ev_ex_ante_usd"
     ]
     headers = [k for k in base if k in keys] + [k for k in sorted(keys) if k not in base]
     import csv, os
@@ -1259,8 +1264,11 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 "bal_asset": str(size_meta.get("bal_asset","")),
                 "notional": f"{float(size_meta.get('notional', float(qty*entry_intent))):.10f}",
                 "bal_pct": f"{float(size_meta.get('bal_pct', 0.0)):.6f}",
-                "ev_perc": f"{float(ev_perc):.10f}",   # NEW
-                "ev_usd": f"{float(ev_usd):.10f}",     # NEW
+                "ev_perc": f"{float(ev_perc):.10f}",
+                "ev_usd":  f"{float(ev_usd):.10f}",
+                # CSV alias for clearer downstream consumption
+                "ev_ex_ante_perc": f"{float(ev_perc):.10f}",
+                "ev_ex_ante_usd":  f"{float(ev_usd):.10f}",
             }
             _journal_append_open(row)
             if gcs_enabled():
@@ -1288,9 +1296,11 @@ def _journal_append_open(row: Dict[str, Any]) -> None:
         "timestamp","symbol","side","qty","entry","entry_intent","tp","sl","exit","pnl","status","id",
         "prob","prob_raw","prob_cal","rr","entry_maker","tp_type","mode","reprices","used_market_fallback","post_only",
         "spread_bps","atr_now","funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
-        "size_mode","bal_asset","notional","bal_pct","exit_ts",  # NEW
-        "ev_perc","ev_usd"                                      # NEW
+        "size_mode","bal_asset","notional","bal_pct","exit_ts",
+        "ev_perc","ev_usd","ev_ex_ante_perc","ev_ex_ante_usd"
     ]
+    row.setdefault("ev_ex_ante_perc", row.get("ev_perc",""))
+    row.setdefault("ev_ex_ante_usd",  row.get("ev_usd",""))
     if "exit_ts" not in row: row["exit_ts"] = ""
     if not os.path.exists(TRADES_CSV):
         with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
