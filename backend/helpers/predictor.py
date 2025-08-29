@@ -61,6 +61,7 @@ def _system_note() -> str:
         "Semantics:\n"
         "- The field 'prob' must approximate the probability that, within the provided horizon (minutes),\n"
         "  a server-side bracket with TP/SL (ATR- and SR-derived) will touch TP BEFORE SL.\n"
+        "- Report 'prob' as a NUMBER with **two decimal places (0.01 precision)**. Do not snap to coarse steps like 0.05.\n"
         "- Do not invent data; do not output text beyond JSON."
     )
 

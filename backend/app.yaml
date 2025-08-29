@@ -19,12 +19,12 @@ env_variables:
   SYMBOLS: "BTCUSDT,ETHUSDT"
 
   # --- 모델/칼리브 ---
-  GEMINI_MODEL: "gemini-2.5-flash-lite"
-  SHADOW_MODELS: "gemini-2.5-flash"
+  GEMINI_MODEL: "gemini-2.5-flash"
+  SHADOW_MODELS: "gemini-2.5-flash-lite"
   USE_CALIBRATED_PROB: "true"
   PROB_CALIBRATION_PATH: "/tmp/trading_bot/calibration.json"
-  CALIB_MIN_SAMPLES: "150"
-  CALIB_BINS: "10"
+  CALIB_MIN_SAMPLES: "200"
+  CALIB_BINS: "20"
   MIN_VOL_FRAC: "0.0005"               # LLM 호출 문턱
 
   # --- EV/RR/게이트 ---

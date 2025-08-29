@@ -173,6 +173,7 @@ class SignalOut:
         }
 
 # ============== helpers ==============
+    
 def _now_utc() -> datetime:
     return datetime.now(tz=timezone.utc)
 
@@ -203,6 +204,20 @@ def _ob_stats_to_dict(stats: Any) -> Dict[str, float]:
     except Exception:
         return {"imbalance": 0.0, "spread": 0.0, "mid": 0.0, "microprice": 0.0, "micro_dislocation_bps": 0.0}
 
+def _quantize_prob(p: float, decimals_env_primary: str = "PROB_DECIMALS_POST") -> float:
+    """
+    캘리브레이션 이후 게이트에 들어가는 확률을 지정 소수점 자리까지 확정.
+    - PROB_DECIMALS_POST 가 없으면 PROB_DECIMALS, 그마저 없으면 2(=0.01) 사용
+    """
+    try:
+        d = int(os.getenv(decimals_env_primary, os.getenv("PROB_DECIMALS", "2")))
+    except Exception:
+        d = 2
+    try:
+        return float(f"{float(p):.{d}f}")
+    except Exception:
+        return round(float(p), d)
+    
 def _best_quotes(symbol: str) -> Tuple[Optional[float], Optional[float]]:
     try:
         ob = fetch_orderbook(symbol, limit=5)
@@ -581,7 +596,7 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
             direction, prob = direction_rb, prob_rb
             prob_raw = float(prob_rb)
             prob_cal = float(calibrate_prob(prob_raw)) if USE_CALIBRATED_PROB else float(prob_raw)
-            prob = prob_cal
+            prob = _quantize_prob(prob_cal)
             llm_support = None; llm_resistance = None
         else:
             return {"symbol":symbol,"action":"hold","direction":"hold","entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
@@ -591,7 +606,7 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         direction = str(llm_decision.get("direction") or "").lower()
         prob_raw = float(llm_decision.get("prob", 0.0))
         prob_cal = float(calibrate_prob(prob_raw)) if USE_CALIBRATED_PROB else float(prob_raw)
-        prob = prob_cal
+        prob = _quantize_prob(prob_cal)
         llm_support = llm_decision.get("support")
         llm_resistance = llm_decision.get("resistance")
 
