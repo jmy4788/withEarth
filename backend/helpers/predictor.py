@@ -311,6 +311,35 @@ def get_gemini_prediction(payload: Dict[str, Any], symbol: str = "") -> Dict[str
         pass
     return decision
 
+# helpers/predictor.py — add below the existing functions
+def run_shadow_models(payload: Dict[str, Any], symbol: str = "") -> None:
+    """
+    환경변수 SHADOW_MODELS="gemini-2.5-flash,gemini-2.5-pro" 등으로 지정.
+    주 모델 결과에는 영향 없이, 섀도우 모델의 {direction, prob}만 로깅.
+    """
+    models = os.getenv("SHADOW_MODELS", "").strip()
+    if not models:
+        return
+    if not _GENAI_OK:
+        return
+    client = _get_client()
+    if client is None:
+        return
+    for m in [x.strip() for x in models.split(",") if x.strip()]:
+        try:
+            # 임시로 모델 명만 바꿔 호출
+            resp = client.models.generate_content(model=m, contents=_contents(payload), config=_cfg_json_plain())
+            obj = _parts_to_json(resp) or {}
+            dec = _sanitize_decision(obj if isinstance(obj, dict) else {})
+            log_event("gemini.shadow",
+                      symbol=(symbol or payload.get("pair")),
+                      model=m,
+                      direction=dec.get("direction"),
+                      prob=float(dec.get("prob", 0.0)))
+        except Exception as e:
+            logger.info("shadow model %s failed: %s", m, e)
+
+
 def should_predict(payload_or_df, *, min_vol_frac_env: str = "MIN_VOL_FRAC") -> bool:
     """
     변동성 기반 LLM 호출 여부. (signals.py에서 프리게이트로 사용)

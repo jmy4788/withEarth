@@ -142,6 +142,16 @@ _JOURNAL_LATEST = os.getenv("JOURNAL_LATEST_PATH", f"{GCS_PREFIX}/journal/latest
 _JOURNAL_DAILY_PREFIX = os.getenv("JOURNAL_DAILY_PREFIX", f"{GCS_PREFIX}/journal")
 JOURNAL_SYNC_ON_START = str(os.getenv("JOURNAL_SYNC_ON_START","true")).lower() in ("1","true","yes")
 
+# --- NEW EV gate & dynamic ATR levels ---
+EV_MIN_PERC = float(os.getenv("EV_MIN_PERC", "0.0"))  # EV_perc < EV_MIN_PERC 이면 진입 금지
+DYN_ATR_LEVELS = str(os.getenv("DYN_ATR_LEVELS", "true")).lower() in ("1","true","yes")
+VOL_TRANQ = float(os.getenv("VOL_TRANQ_RATIO", "0.70"))   # 저변동 경계
+VOL_TURB = float(os.getenv("VOL_TURB_RATIO", "1.30"))     # 고변동 경계
+TP_FUDGE_TRANQ = float(os.getenv("TP_FUDGE_TRANQ", "1.10"))
+SL_FUDGE_TRANQ = float(os.getenv("SL_FUDGE_TRANQ", "0.90"))
+TP_FUDGE_TURB = float(os.getenv("TP_FUDGE_TURB", "0.90"))
+SL_FUDGE_TURB = float(os.getenv("SL_FUDGE_TURB", "1.10"))
+
 # =====================
 # Dataclass
 # =====================
@@ -540,7 +550,7 @@ def journal_sync(mode: str = "backup") -> Dict[str, Any]:
 
 # ---------------------------------
 # Signal generation
-# ---------------------------------
+# ---------------------------------# helpers/signals.py — replace this whole function
 def generate_signal(symbol: str) -> Dict[str, Any]:
     payload, ohlcv, ob = _build_payload(symbol)
     spread_bps_gate = float((payload.get("extra") or {}).get("orderbook_spread", 0.0))
@@ -580,18 +590,48 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         prob = prob_cal
         llm_support = llm_decision.get("support")
         llm_resistance = llm_decision.get("resistance")
+
     entry = float((payload.get("entry_5m") or {}).get("close") or 0.0)
     extra = payload.get("extra") or {}
     spread_bps = float(extra.get("orderbook_spread") or 0.0)
     if direction not in ("long","short") or entry <= 0:
         log_event("signal.decision", symbol=symbol, direction="hold", prob=prob, entry=entry, tp=0.0, sl=0.0, rr=0.0, risk_ok=False)
         return {"symbol":symbol,"action":"hold","direction":"hold","entry":entry,"tp":0.0,"sl":0.0,"prob":prob,"risk_ok":False,"rr":0.0,"reason":"invalid_direction_or_entry"}
+
+    # === NEW: ATR 동적 배수 산출 ===
+    k_tp_env = float(os.getenv("ATR_MULT_TP", str(ATR_MULT_TP)))
+    k_sl_env = float(os.getenv("ATR_MULT_SL", str(ATR_MULT_SL)))
+    k_tp, k_sl = k_tp_env, k_sl_env
+    cur_atr, med_atr = 0.0, 0.0
+    try:
+        if _df_ok(ohlcv):
+            atr_series = compute_atr(ohlcv, window=14)
+            cur_atr = float(atr_series.iloc[-1]) if len(atr_series) else 0.0
+            med_atr = float(atr_series.tail(VOL_LOOKBACK).median()) if len(atr_series) else 0.0
+            if DYN_ATR_LEVELS and cur_atr > 0 and med_atr > 0:
+                ratio = cur_atr / med_atr
+                if ratio >= VOL_TURB:
+                    # 고변동: SL 넓히고 TP 약간 가깝게
+                    k_tp = k_tp_env * TP_FUDGE_TURB
+                    k_sl = k_sl_env * SL_FUDGE_TURB
+                elif ratio <= VOL_TRANQ:
+                    # 저변동: TP 더 멀리, SL 약간 가깝게
+                    k_tp = k_tp_env * TP_FUDGE_TRANQ
+                    k_sl = k_sl_env * SL_FUDGE_TRANQ
+    except Exception:
+        k_tp, k_sl = k_tp_env, k_sl_env
+
     sr_high = float(extra.get("recent_high_5m") or 0.0)
     sr_low  = float(extra.get("recent_low_5m") or 0.0)
-    tp, sl = _tp_sl_with_sr_clamp(direction, entry, float(extra.get("ATR_5m") or 0.0), sr_high, sr_low, llm_support, llm_resistance,
-                                  k_tp=float(os.getenv("ATR_MULT_TP", str(ATR_MULT_TP))), k_sl=float(os.getenv("ATR_MULT_SL", str(ATR_MULT_SL))))
+    tp, sl = _tp_sl_with_sr_clamp(
+        direction, entry, float(extra.get("ATR_5m") or 0.0),
+        sr_high, sr_low, llm_support, llm_resistance,
+        k_tp=k_tp, k_sl=k_sl
+    )
+
     rr_net = _rr_with_fee_mode(direction, entry, tp, sl)
     rr_req = RR_MIN_HIGH_PROB if prob >= PROB_RELAX_THRESHOLD else RR_MIN
+
     reasons: List[str] = []
     if prob < MIN_PROB: reasons.append("prob_below_threshold")
     if not _spread_ok(spread_bps): reasons.append(f"wide_spread({spread_bps:.2f}bps)")
@@ -602,6 +642,13 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
     cd_active2, cd_left2 = _cooldown_active(symbol)
     if cd_active2: reasons.append(f"entry_cooldown({cd_left2}m_left)")
     if rr_net <= 0 or rr_net < rr_req: reasons.append(f"rr_net_below_min({rr_net:.2f}<{rr_req:.2f})")
+
+    # === NEW: EV gate ===
+    ev_perc = _compute_ev_perc(prob, direction, entry, tp, sl)
+    if ev_perc < EV_MIN_PERC:
+        reasons.append(f"ev_below_threshold({ev_perc:.4f}<{EV_MIN_PERC:.4f})")
+
+    # === sizing risk_scalar(원래 로직) ===
     risk_scalar = 1.0
     try:
         if VOL_SIZE_SCALING and _df_ok(ohlcv):
@@ -612,9 +659,12 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
                 risk_scalar = max(VOL_SCALAR_MIN, min(VOL_SCALAR_MAX, med / cur))
     except Exception:
         risk_scalar = 1.0
+
     risk_ok = (len(reasons) == 0)
     log_event("signal.gate", symbol=symbol, direction=direction, prob=float(prob), spread_bps=float(spread_bps),
-              rr=float(rr_net), rr_req=float(rr_req), rr_mode=RR_GATE_MODE, reasons=";".join(reasons) if reasons else "ok")
+              rr=float(rr_net), rr_req=float(rr_req), rr_mode=RR_GATE_MODE, ev_perc=float(ev_perc),
+              reasons=";".join(reasons) if reasons else "ok")
+
     telemetry = {
         "spread_bps": float(spread_bps),
         "atr_now": float(extra.get("ATR_5m") or 0.0),
@@ -622,7 +672,10 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         "maker_prob_est": _estimate_p_maker_from_journal(),
         "rr_gate_mode": RR_GATE_MODE,
         "sizing_mode": SIZE_MODE,
+        "ev_perc": float(ev_perc),   # NEW for observability
+        "k_tp": float(k_tp), "k_sl": float(k_sl), "atr_ratio": (cur_atr/med_atr if (cur_atr>0 and med_atr>0) else 0.0),
     }
+
     out = {
         "symbol": symbol,
         "action": "enter" if risk_ok else "hold",
@@ -630,7 +683,7 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         "entry": float(entry),
         "tp": float(tp),
         "sl": float(sl),
-        "prob": float(prob),             # calibrated if USE_CALIBRATED_PROB else raw
+        "prob": float(prob),
         "prob_raw": float(prob_raw if 'prob_raw' in locals() else prob),
         "prob_cal": float(prob if 'prob' in locals() else prob),
         "rr": float(rr_net),
@@ -936,7 +989,7 @@ def _rewrite_trades_csv(rows: list, pref_headers: Optional[list] = None) -> None
         w = csv.DictWriter(f, fieldnames=headers)
         w.writeheader()
         for r in rows: w.writerow(r)
-
+# helpers/signals.py — replace _journal_close_last() body with the following edits near 'r.update({...})'
 def _journal_close_last(symbol: str, exit_price: float, reason: str) -> bool:
     idx, ts_ms, rows = _last_open_row_index_and_ts(symbol)
     if idx is None or not rows: return False
@@ -956,22 +1009,30 @@ def _journal_close_last(symbol: str, exit_price: float, reason: str) -> bool:
         gross = (float(exit_price) - entry) * sgn * qty
         fees = entry * qty * fee_e + float(exit_price) * qty * fee_x
         pnl = float(gross - fees)
+
+        # NEW: if reason=='closed', infer TP/SL by entry vs exit
+        final_reason = reason
+        if final_reason == "closed":
+            if side.lower() == "long":
+                final_reason = "closed_tp" if float(exit_price) >= entry else "closed_sl"
+            else:
+                final_reason = "closed_tp" if float(exit_price) <= entry else "closed_sl"
+
         now_iso = _now_utc().isoformat()
         r.update({
             "exit": f"{float(exit_price):.10f}",
             "pnl": f"{pnl:.10f}",
-            "status": reason,
-            "close_reason": reason,
-            "exit_ts": now_iso,     # NEW
+            "status": final_reason,        # <- changed
+            "close_reason": final_reason,  # <- changed
+            "exit_ts": now_iso,
         })
         rows[idx] = r
         _rewrite_trades_csv(rows)
-        log_event("journal.close", symbol=symbol, exit=float(exit_price), pnl=float(pnl), reason=reason)
+        log_event("journal.close", symbol=symbol, exit=float(exit_price), pnl=float(pnl), reason=final_reason)
         if gcs_enabled():
             try: gcs_append_csv_row("trades_close", list(r.keys()), r)
             except Exception: pass
-            # NEW: close 후 전체본 체크포인트 백업
-            try: _journal_backup_to_gcs(tag=reason)
+            try: _journal_backup_to_gcs(tag=final_reason)
             except Exception: pass
         return True
     except Exception as e:

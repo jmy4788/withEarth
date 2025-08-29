@@ -53,43 +53,65 @@ except Exception:
     LOG_DIR = _ensure_dir_writable(LOG_DIR_ENV)
 LOG_PATH = str(Path(LOG_DIR) / "bot.log")
 
-# app.py
-def setup_logging() -> logging.Logger:
+# app.py# app.py — replace setup_logging() entirely
+import os
+import logging
+from pathlib import Path
+from typing import Optional
+
+def setup_logging(log_path: Optional[str] = None) -> logging.Logger:
+    """
+    환경변수:
+      - LOG_LEVEL: DEBUG/INFO/WARNING/ERROR/CRITICAL (기본 INFO)
+      - LOG_PATH : 로그 파일 경로 (인자가 None일 때만 사용, 기본 ./logs/bot.log)
+    반환:
+      - 현재 모듈 로거 (logging.getLogger(__name__))
+    """
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
+    fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
-    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    if log_path is None:
+        log_path = os.getenv("LOG_PATH", "./logs/bot.log")
 
-    # root 초기화
     root = logging.getLogger()
-    for h in list(root.handlers):
+
+    # 기존 핸들러 닫고 제거 (FD 누수 방지)
+    for h in root.handlers[:]:
+        try:
+            h.close()
+        except Exception:
+            pass
         root.removeHandler(h)
+
     root.setLevel(level)
 
-    # 콘솔 핸들러
+    # 콘솔 핸들러 (stderr)
     sh = logging.StreamHandler()
     sh.setLevel(level)
-    sh.setFormatter(fmt)
+    sh.setFormatter(logging.Formatter(fmt))
     root.addHandler(sh)
 
-    # 파일 핸들러 (/api/logs가 tail하는 경로)
+    # 파일 핸들러
     try:
-        Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_path, encoding="utf-8")
         fh.setLevel(level)
-        fh.setFormatter(fmt)
+        fh.setFormatter(logging.Formatter(fmt))
         root.addHandler(fh)
     except Exception as e:
-        root.info("File logging setup failed: %s", e)
+        root.warning("file handler setup failed: %s", e)
 
-    # 서브로거 레벨
+    # 'event' 로거는 root로 전파(파일/콘솔 모두 기록)
+    evt = logging.getLogger("event")
+    evt.setLevel(level)
+    evt.propagate = True
+
+    # 서브모듈 레벨
     logging.getLogger("helpers.signals").setLevel(level)
     logging.getLogger("helpers.predictor").setLevel(level)
-    logging.getLogger("event").setLevel(level)  # log_event가 쓰는 로거
 
     return logging.getLogger(__name__)
-
-logger = setup_logging()
 
 # --- imports from helpers ---
 try:
@@ -846,6 +868,67 @@ def api_metrics():
         sample_size=len(rows),
     )
 
+@app.route("/api/trades_full")
+def api_trades_full():
+    try:
+        limit = int(request.args.get("limit","5000"))
+    except Exception:
+        limit = 5000
+    rows = _read_trades_full(limit=limit)
+    return _json_ok(n=len(rows), rows=rows)
+
+@app.route("/api/metrics/diagnostics")
+def api_metrics_diagnostics():
+    try: limit = int(request.args.get("limit","5000"))
+    except Exception: limit = 5000
+    symbol = request.args.get("symbol")
+    try: days = int(request.args.get("days","0"))
+    except Exception: days = 0
+    rows = _filter_trades(_read_trades_full(limit=5000)[-limit:], symbol, days, include_open=True)
+
+    # 1) gate reason counts
+    from collections import Counter, defaultdict
+    rc = Counter()
+    for r in rows:
+        rs = str(r.get("reasons","") or "").strip()
+        if not rs: continue
+        for tok in rs.split(";"):
+            tok = tok.strip()
+            if tok: rc[tok] += 1
+
+    # 2) side / symbol breakdown
+    side_cnt = Counter(str(r.get("side","")).lower() for r in rows)
+    pnl_by_sym_side = defaultdict(lambda: defaultdict(float))
+    for r in rows:
+        s = r.get("symbol","")
+        sd = str(r.get("side","")).lower()
+        pnl_by_sym_side[s][sd] += float(r.get("pnl",0.0))
+
+    # 3) PnL by hour-of-day (UTC)
+    import pandas as _pd
+    pnl_by_hour = [0.0]*24
+    for r in rows:
+        ts = str(r.get("timestamp",""))
+        try:
+            dt = _pd.to_datetime(ts, utc=True)
+            pnl_by_hour[int(dt.hour)] += float(r.get("pnl",0.0))
+        except Exception:
+            continue
+
+    # 4) EV vs realized (closed only, ev_usd present)
+    closed = [r for r in rows if str(r.get("status","")).lower()!="open"]
+    ev_sum = sum(float(r.get("ev_usd",0.0) or 0.0) for r in closed if str(r.get("ev_usd","")) not in ("","nan"))
+    pnl_sum = sum(float(r.get("pnl",0.0)) for r in closed)
+    ev_gap = pnl_sum - ev_sum  # realized - ex-ante
+
+    return _json_ok(
+        n=len(rows),
+        reason_counts=rc,
+        side_counts=side_cnt,
+        pnl_by_symbol_side={sym: dict(val) for sym,val in pnl_by_sym_side.items()},
+        pnl_by_hour=pnl_by_hour,
+        ev_vs_realized={"ev_usd_sum": ev_sum, "pnl_sum": pnl_sum, "gap": ev_gap},
+    )
 @app.route("/api/metrics/curve")
 def api_metrics_curve():
     try: limit = int(request.args.get("limit","500"))
