@@ -60,14 +60,13 @@ from pathlib import Path
 from typing import Optional
 
 
+# app.py — replace setup_logging() entirely
+import os
+import logging
+from pathlib import Path
+from typing import Optional
+
 def setup_logging(log_path: Optional[str] = None) -> logging.Logger:
-    """
-    환경변수:
-      - LOG_LEVEL: DEBUG/INFO/WARNING/ERROR/CRITICAL (기본 INFO)
-      - LOG_PATH : 로그 파일 경로 (인자가 None일 때만 사용, 기본 ./logs/bot.log)
-    반환:
-      - 현재 모듈 로거 (logging.getLogger(__name__))
-    """
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -76,24 +75,17 @@ def setup_logging(log_path: Optional[str] = None) -> logging.Logger:
         log_path = os.getenv("LOG_PATH", "./logs/bot.log")
 
     root = logging.getLogger()
-
-    # 기존 핸들러 닫고 제거 (FD 누수 방지)
     for h in root.handlers[:]:
-        try:
-            h.close()
-        except Exception:
-            pass
+        try: h.close()
+        except Exception: pass
         root.removeHandler(h)
-
     root.setLevel(level)
 
-    # 콘솔 핸들러 (stderr)
     sh = logging.StreamHandler()
     sh.setLevel(level)
     sh.setFormatter(logging.Formatter(fmt))
     root.addHandler(sh)
 
-    # 파일 핸들러
     try:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_path, encoding="utf-8")
@@ -103,16 +95,14 @@ def setup_logging(log_path: Optional[str] = None) -> logging.Logger:
     except Exception as e:
         root.warning("file handler setup failed: %s", e)
 
-    # 'event' 로거는 root로 전파(파일/콘솔 모두 기록)
     evt = logging.getLogger("event")
     evt.setLevel(level)
     evt.propagate = True
 
-    # 서브모듈 레벨
     logging.getLogger("helpers.signals").setLevel(level)
     logging.getLogger("helpers.predictor").setLevel(level)
-
     return logging.getLogger(__name__)
+
 
 # Initialize logging ASAP so /api/logs shows event/journal lines
 logger = setup_logging(LOG_PATH)
@@ -527,9 +517,11 @@ def api_signals():
 def api_signals_latest():
     symbol = (request.args.get("symbol") or SYMBOLS[0]).upper()
     try:
-        sig = generate_signal(symbol)
-        out = sig.get("result") if isinstance(sig, dict) else None
-        return _json_ok(symbol=symbol, **({"result": out} if out else {"raw": sig}))
+        sig = generate_signal(symbol)  # helpers.signals.generate_signal
+        # sig는 {"action","direction","entry","tp","sl","prob","reason","telemetry","result":{...}} 구조
+        if isinstance(sig, dict) and sig.get("result"):
+            return _json_ok(symbol=symbol, result=sig.get("result"), reason=sig.get("reason"), telemetry=sig.get("telemetry"))
+        return _json_ok(symbol=symbol, raw=sig)
     except Exception as e:
         return _json_err("signal_failed", error=str(e))
 

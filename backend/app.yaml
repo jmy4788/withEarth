@@ -19,8 +19,8 @@ env_variables:
   SYMBOLS: "BTCUSDT,ETHUSDT"
 
   # --- 모델/칼리브 ---
-  GEMINI_MODEL: "gemini-2.5-flash"
-  SHADOW_MODELS: "gemini-2.5-flash-lite"
+  GEMINI_MODEL: "gemini-2.5-flash-lite"
+  SHADOW_MODELS: "gemini-2.5-flash"
   USE_CALIBRATED_PROB: "true"
   PROB_CALIBRATION_PATH: "/tmp/trading_bot/calibration.json"
   CALIB_MIN_SAMPLES: "200"

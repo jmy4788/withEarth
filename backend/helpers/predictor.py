@@ -59,11 +59,15 @@ def _system_note() -> str:
         "Use ONLY numeric features from the provided JSON.\n"
         "Return exactly ONE JSON object matching the schema.\n"
         "Semantics:\n"
-        "- The field 'prob' must approximate the probability that, within the provided horizon (minutes),\n"
-        "  a server-side bracket with TP/SL (ATR- and SR-derived) will touch TP BEFORE SL.\n"
-        "- Report 'prob' as a NUMBER with **two decimal places (0.01 precision)**. Do not snap to coarse steps like 0.05.\n"
-        "- Do not invent data; do not output text beyond JSON."
-    )
+        "- 'prob' ≡ P(TP before SL within the given horizon), on [0,1].\n"
+        "- Monotonicity hints (use numeric trends only):\n"
+        " Higher RR proxy (TP distance vs SL distance using ATR/SR) → higher 'prob' in the chosen direction.\n"
+        " Larger |RSI−50| in the chosen direction → higher 'prob'; opposite-direction RSI → lower 'prob'.\n"
+        " Wider orderbook spread or adverse imbalance → lower 'prob'.\n"
+        " Stronger alignment of higher-timeframe signals (if provided) → higher 'prob'.\n"
+        " The 'direction' is 'long' or 'short' unless the setup is nearly neutral (|prob−0.5|<0.02), in which case use 'hold'.\n"
+        " Do not invent data; respond with JSON only."
+        )
 
 def _user_intro(payload: Dict[str, Any]) -> str:
     pair = payload.get("pair", "")
@@ -303,11 +307,13 @@ def get_gemini_prediction(payload: Dict[str, Any], symbol: str = "") -> Dict[str
 
     _dump_debug(f"{symbol or 'unknown'}_decision", decision)
     try:
-        log_event("gemini.response", symbol=(symbol or payload.get("pair")),
-                  direction=decision.get("direction"),
-                  prob=float(decision.get("prob", 0.0)),
-                  support=decision.get("support"), resistance=decision.get("resistance"),
-                  entry=(payload.get("entry_5m") or {}).get("close"))
+        log_event("gemini.response",
+                symbol=(symbol or payload.get("pair")),
+                direction=decision.get("direction"),
+                prob=float(decision.get("prob", 0.0)),
+                support=decision.get("support"), resistance=decision.get("resistance"),
+                entry=(payload.get("entry_5m") or {}).get("close"),
+                reasoning=str(decision.get("reasoning",""))[:400])
     except Exception:
         pass
     return decision

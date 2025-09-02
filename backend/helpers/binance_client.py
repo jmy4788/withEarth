@@ -293,15 +293,7 @@ def list_all_orders(symbol: str, limit: int = 100, start_time_ms: Optional[int] 
         logger.info("list_all_orders failed for %s: %s", symbol, e)
         return []
 
-# --- REPLACE THIS WHOLE FUNCTION in helpers/binance_client.py ---# --- REPLACE THIS WHOLE FUNCTION in helpers/binance_client.py ---
 def find_recent_exit_fill(symbol: str, since_ms: int, *, back_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    """
-    'open'으로 남아있는 엔트리의 timestamp(since_ms) 근방에서 체결된 TP/SL fill을 추적.
-    개선점:
-      - 시간 여유(back_ms, 기본 15분) 도입 → 거래소/SDK 타임스탬프 드리프트 방어
-      - 트리거 후 최종 체결이 LIMIT/MARKET(+reduceOnly) 으로만 표기되는 케이스 폴백 허용
-    반환: {"type": <str>, "price": <float>, "time": <ms>} | None
-    """
     try:
         tol = int(os.getenv("EXIT_SEARCH_BACK_MS", str(back_ms if back_ms is not None else 15 * 60_000)))
     except Exception:
@@ -334,22 +326,17 @@ def find_recent_exit_fill(symbol: str, since_ms: int, *, back_ms: Optional[int] 
         t = str(_get(o, "type") or "").upper()
         st = str(_get(o, "status") or "").upper()
         ro = _get(o, "reduceOnly", "reduce_only")
-        # 표준 TP/SL 타입
         std_exit = t in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET")
-        # 폴백: 트리거 후 최종이 LIMIT/MARKET인데 reduceOnly=True로만 표기되는 경우
         fb_exit = (t in ("LIMIT", "MARKET") and (str(ro).lower() == "true"))
         return (st in ("FILLED", "PARTIALLY_FILLED")) and (std_exit or fb_exit)
 
-    # 시간 필터: start(= since_ms - tol) 이후만 허용
     cands = [o for o in orders if _is_exit(o) and _ms(o) >= start]
     if not cands:
         return None
 
-    cands.sort(key=_ms)  # 최신 순
+    cands.sort(key=_ms)
     o = cands[-1]
     typ = str(_get(o, "type") or "").upper()
-
-    # 가격 추출(우선순위: avgPrice > price > stopPrice > activate/triggerPrice)
     px = _get(o, "avgPrice", "avg_price", "price", "stopPrice", "stop_price",
               "activatePrice", "triggerPrice", "activate_price", "trigger_price")
     try:
@@ -358,7 +345,6 @@ def find_recent_exit_fill(symbol: str, since_ms: int, *, back_ms: Optional[int] 
         pxf = 0.0
 
     return {"type": typ, "price": pxf, "time": _ms(o)}
-
 
 # ==========================
 # Account & overview helpers

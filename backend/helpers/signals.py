@@ -558,14 +558,12 @@ def _journal_backup_to_gcs(tag: str = "auto") -> bool:
     return bool(ok1 or ok2)
 
 def journal_sync(mode: str = "backup") -> Dict[str, Any]:
-    """
-    /tasks/journal_sync에서 호출용: "restore" 또는 "backup"
-    """
     if mode == "restore":
         ok = _journal_restore_from_gcs_if_needed()
         return {"action":"restore","ok":bool(ok)}
     ok = _journal_backup_to_gcs(tag="cron")
     return {"action":"backup","ok":bool(ok)}
+
 
 # ---------------------------------
 # Signal generation
