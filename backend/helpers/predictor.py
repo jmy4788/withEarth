@@ -59,25 +59,27 @@ def _system_note() -> str:
         "Use ONLY numeric features from the provided JSON.\n"
         "Return exactly ONE JSON object matching the schema.\n"
         "Semantics:\n"
-        "- 'prob' ≡ P(TP before SL within the given horizon), on [0,1].\n"
-        "- Monotonicity hints (use numeric trends only):\n"
-        " Higher RR proxy (TP distance vs SL distance using ATR/SR) → higher 'prob' in the chosen direction.\n"
-        " Larger |RSI−50| in the chosen direction → higher 'prob'; opposite-direction RSI → lower 'prob'.\n"
-        " Wider orderbook spread or adverse imbalance → lower 'prob'.\n"
-        " Stronger alignment of higher-timeframe signals (if provided) → higher 'prob'.\n"
-        " The 'direction' is 'long' or 'short' unless the setup is nearly neutral (|prob−0.5|<0.02), in which case use 'hold'.\n"
-        " Do not invent data; respond with JSON only."
-        )
+        "- We provide explicit bracket levels: entry, and for each direction {long, short}, a TP and SL.\n"
+        "- If you choose 'direction' = long, 'prob' must be the probability that, within 'horizon_min' minutes,\n"
+        "  the LONG bracket's TP is reached BEFORE its SL. If you choose 'short', use the SHORT bracket.\n"
+        "- Use the provided bracket numbers EXACTLY; do not invent or renormalize TP/SL.\n"
+        "- Report 'prob' as a NUMBER in [0,1] with two decimal places when possible.\n"
+        "- Do not invent data; do not output text beyond JSON."
+    )
 
 def _user_intro(payload: Dict[str, Any]) -> str:
     pair = payload.get("pair", "")
-    entry = payload.get("entry_5m", {}).get("close", 0.0)
-    spread = payload.get("extra", {}).get("orderbook_spread", 0.0)
-    rsi = payload.get("entry_5m", {}).get("rsi", 50.0)
     hz = payload.get("horizon_min", 30)
+    b = payload.get("bracket", {}) or {}
+    entry = b.get("entry", (payload.get("entry_5m") or {}).get("close", 0.0))
+    bl = b.get("long", {}) or {}
+    bs = b.get("short", {}) or {}
+    spread = (payload.get("extra") or {}).get("orderbook_spread", 0.0)
+    rsi = (payload.get("entry_5m") or {}).get("rsi", 50.0)
     return (
-        f"Pair={pair}, entry_close_5m={entry}, spread_bps={spread}, rsi_5m={rsi}, horizon_min={hz}. "
-        "Decide using ONLY numeric features from the JSON below."
+        f"Pair={pair}, horizon_min={hz}, spread_bps={spread}, rsi_5m={rsi}. "
+        f"Bracket: entry={entry}, long(tp={bl.get('tp',0.0)}, sl={bl.get('sl',0.0)}), short(tp={bs.get('tp',0.0)}, sl={bs.get('sl',0.0)}). "
+        "Return probability for the chosen direction's bracket."
     )
 
 def _response_schema() -> "types.Schema":
@@ -145,11 +147,18 @@ def _coerce_direction(x: Any) -> str:
 def _sanitize_decision(d: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     out["direction"] = _coerce_direction(d.get("direction", "hold"))
+    # Accept prob in [0,1] and optionally prob_pct in [0,100]
+    p: float
     try:
-        prob = float(d.get("prob", 0.5))
+        if d.get("prob_pct") is not None:
+            p = float(d.get("prob_pct", 0.0)) / 100.0
+        else:
+            p = float(d.get("prob", 0.5))
+            if p > 1.0 and p <= 100.0:
+                p = p / 100.0
     except Exception:
-        prob = 0.5
-    out["prob"] = max(0.0, min(1.0, prob))
+        p = 0.5
+    out["prob"] = max(0.0, min(1.0, float(p)))
     out["reasoning"] = str(d.get("reasoning",""))[:800]
     # SR 정리
     for k in ("support","resistance"):
@@ -246,6 +255,11 @@ def get_gemini_prediction(payload: Dict[str, Any], symbol: str = "") -> Dict[str
             "pair": payload.get("pair"),
             "entry_5m": payload.get("entry_5m"),
             "mtf_keys": sorted(list((payload.get("extra") or {}).keys()))[:8],
+            "bracket_preview": {
+                "entry": (payload.get("bracket") or {}).get("entry"),
+                "long": (payload.get("bracket") or {}).get("long"),
+                "short": (payload.get("bracket") or {}).get("short"),
+            },
         }
         log_event("gemini.request",
                   symbol=(symbol or payload.get("pair")),

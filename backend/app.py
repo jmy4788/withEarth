@@ -557,6 +557,12 @@ def api_orderbook():
 
 @app.route("/api/open_orders", methods=["GET"])
 def api_open_orders():
+    # Optional read protection via READ_API_KEY (query param ?key= or header X-Api-Key)
+    rk = os.getenv("READ_API_KEY", "").strip()
+    if rk:
+        provided = request.args.get("key") or request.headers.get("X-Api-Key")
+        if not provided or provided != rk:
+            return jsonify({"error": "forbidden"}), 403
     symbol = request.args.get("symbol")
     try:
         orders = get_open_orders(symbol)

@@ -27,6 +27,24 @@ try:
     import requests  # type: ignore
 except Exception:  # pragma: no cover
     requests = None  # type: ignore
+try:  # optional retry support; if unavailable, behavior remains unchanged
+    from tenacity import (
+        retry,
+        stop_after_attempt,
+        wait_exponential,
+        retry_if_exception_type,
+    )
+except Exception:  # pragma: no cover
+    def retry(*args, **kwargs):  # type: ignore
+        def _wrap(fn):
+            return fn
+        return _wrap
+    def stop_after_attempt(*args, **kwargs):  # type: ignore
+        return None
+    def wait_exponential(*args, **kwargs):  # type: ignore
+        return None
+    def retry_if_exception_type(*args, **kwargs):  # type: ignore
+        return None
 
 # ----------------------------------------------------------------------------
 # Binance modular SDK glue (optional)
@@ -50,6 +68,32 @@ HTTP_TIMEOUT = int(os.getenv("BINANCE_HTTP_TIMEOUT_MS", "10000")) / 1000.0
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# ----------------------------------------------------------------------------
+# HTTP helper with bounded retries (429/5xx + network errors only)
+# ----------------------------------------------------------------------------
+class _TransientHTTPError(Exception):
+    pass
+
+if requests is not None:
+    # reuse a single Session for connection pooling
+    _SESSION = requests.Session()  # type: ignore[attr-defined]
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=5.0),
+        retry=retry_if_exception_type((requests.RequestException, _TransientHTTPError)),  # type: ignore[arg-type]
+    )
+    def _rest_get_json(url: str, params: Dict[str, Any], timeout: float) -> Any:
+        r = _SESSION.get(url, params=params, timeout=timeout)  # type: ignore[name-defined]
+        # Retry on 429/5xx; otherwise raise or pass through
+        if r.status_code in (429, 500, 502, 503):
+            raise _TransientHTTPError(f"transient status={r.status_code}")
+        r.raise_for_status()
+        return r.json()
+else:
+    def _rest_get_json(url: str, params: Dict[str, Any], timeout: float) -> Any:  # type: ignore[no-redef]
+        raise RuntimeError("requests not available")
 
 # ----------------------------------------------------------------------------
 # Interval map & helpers
@@ -188,9 +232,7 @@ def _rest_fetch_klines(symbol: str, interval: str, limit: int = 200,
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
+        data = _rest_get_json(url, params=params, timeout=HTTP_TIMEOUT)
         return _kline_to_df(data)
     except Exception as e:
         logger.info("REST klines fetch failed: %s", e)
@@ -213,9 +255,7 @@ def fetch_orderbook(symbol: str, limit: int = 50) -> Dict[str, Any]:
     base = FAPI_TESTNET_BASE if USE_TESTNET else FAPI_BASE
     url = f"{base}/fapi/v1/depth"
     try:
-        r = requests.get(url, params={"symbol": symbol, "limit": int(limit)}, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
+        data = _rest_get_json(url, params={"symbol": symbol, "limit": int(limit)}, timeout=HTTP_TIMEOUT)
         bids = [[_to_float(p), _to_float(q)] for p, q in data.get("bids", [])]
         asks = [[_to_float(p), _to_float(q)] for p, q in data.get("asks", [])]
         return {"bids": bids, "asks": asks, "timestamp": _now_ms()}
@@ -230,9 +270,7 @@ def fetch_funding_rate(symbol: str) -> float:
     base = FAPI_TESTNET_BASE if USE_TESTNET else FAPI_BASE
     url = f"{base}/fapi/v1/fundingRate"
     try:
-        r = requests.get(url, params={"symbol": symbol, "limit": 1}, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
+        data = _rest_get_json(url, params={"symbol": symbol, "limit": 1}, timeout=HTTP_TIMEOUT)
         if isinstance(data, list) and data:
             rate = float(data[-1].get("fundingRate", 0.0))
             return rate * 100.0  # percentage

@@ -369,16 +369,18 @@ def _tp_sl_with_sr_clamp(direction: str, entry: float, atr5: float, sr_high: flo
 def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[Dict[str, Any]]]:
     base = fetch_data(symbol, interval="5m", ohlcv_limit=200, orderbook_limit=50, include_orderbook=True)
     ohlcv = base.get("ohlcv") if isinstance(base.get("ohlcv"), pd.DataFrame) else pd.DataFrame()
-    if not _df_ok(ohlcv): ohlcv = add_indicators(None)
+    if not _df_ok(ohlcv):
+        ohlcv = add_indicators(None)
     last = ohlcv.iloc[-1] if _df_ok(ohlcv) else pd.Series({})
     ob = base.get("orderbook") if isinstance(base, dict) else None
 
+    # --- MTF/extra -----------------------------------------------------
     mtf = fetch_mtf_raw(symbol)
     extra: Dict[str, Any] = {}
     for tf, df in mtf.items():
         ind = add_indicators(df)
         atr = float(compute_atr(df, window=14).iloc[-1]) if _df_ok(df) else 0.0
-        key = {"1h":"_1h","4h":"_4h","1d":"_1d"}.get(tf, "")
+        key = {"1h": "_1h", "4h": "_4h", "1d": "_1d"}.get(tf, "")
         if _df_ok(ind):
             extra.update({
                 f"RSI{key}": float(ind["RSI"].iloc[-1]) if "RSI" in ind else 50.0,
@@ -390,12 +392,16 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
                 f"recent_low{key}": float(df["low"].tail(50).min()) if _df_ok(df) else 0.0,
             })
 
-    price_seq = compute_recent_price_sequence(ohlcv, n=10) if _df_ok(ohlcv) else [0.0]*10
+    # --- base indicators on 5m ----------------------------------------
+    price_seq = compute_recent_price_sequence(ohlcv, n=10) if _df_ok(ohlcv) else [0.0] * 10
     atr5_series = compute_atr(ohlcv, window=14) if _df_ok(ohlcv) else None
     atr5 = float(atr5_series.iloc[-1]) if getattr(atr5_series, "size", 0) else 0.0
-    sr5 = {"recent_high": float(ohlcv["high"].tail(50).max()) if _df_ok(ohlcv) else 0.0,
-           "recent_low": float(ohlcv["low"].tail(50).min()) if _df_ok(ohlcv) else 0.0}
-    raw_stats = compute_orderbook_stats(ob) if isinstance(ob, dict) else {"imbalance":0.0,"spread":0.0,"microprice":0.0,"mid":0.0,"micro_dislocation_bps":0.0}
+    sr_high = float(ohlcv["high"].tail(50).max()) if _df_ok(ohlcv) else 0.0
+    sr_low = float(ohlcv["low"].tail(50).min()) if _df_ok(ohlcv) else 0.0
+
+    raw_stats = compute_orderbook_stats(ob) if isinstance(ob, dict) else {
+        "imbalance": 0.0, "spread": 0.0, "microprice": 0.0, "mid": 0.0, "micro_dislocation_bps": 0.0
+    }
     ob_stats = _ob_stats_to_dict(raw_stats)
     trend = compute_trend_filter(ohlcv) if _df_ok(ohlcv) else {"daily_uptrend": False, "trend_strength": 0.0}
 
@@ -404,10 +410,36 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     except Exception:
         funding_pct = 0.0
 
+    entry = float(last.get("close", 0.0)) if _df_ok(ohlcv) else 0.0
+
+    # --- Dynamic ATR multipliers (same logic as generate_signal) ------
+    k_tp_env = float(os.getenv("ATR_MULT_TP", str(ATR_MULT_TP)))
+    k_sl_env = float(os.getenv("ATR_MULT_SL", str(ATR_MULT_SL)))
+    k_tp, k_sl = k_tp_env, k_sl_env
+    try:
+        if _df_ok(ohlcv):
+            atr_series = compute_atr(ohlcv, window=14)
+            cur_atr = float(atr_series.iloc[-1]) if len(atr_series) else 0.0
+            med_atr = float(atr_series.tail(VOL_LOOKBACK).median()) if len(atr_series) else 0.0
+            if DYN_ATR_LEVELS and cur_atr > 0 and med_atr > 0:
+                ratio = cur_atr / med_atr
+                if ratio >= VOL_TURB:
+                    k_tp = k_tp_env * TP_FUDGE_TURB
+                    k_sl = k_sl_env * SL_FUDGE_TURB
+                elif ratio <= VOL_TRANQ:
+                    k_tp = k_tp_env * TP_FUDGE_TRANQ
+                    k_sl = k_sl_env * SL_FUDGE_TRANQ
+    except Exception:
+        k_tp, k_sl = k_tp_env, k_sl_env
+
+    # --- Brackets for BOTH directions (SR clamp without LLM SR) -------
+    long_tp, long_sl = _tp_sl_with_sr_clamp("long", entry, atr5, sr_high, sr_low, None, None, k_tp=k_tp, k_sl=k_sl)
+    short_tp, short_sl = _tp_sl_with_sr_clamp("short", entry, atr5, sr_high, sr_low, None, None, k_tp=k_tp, k_sl=k_sl)
+
     payload = {
         "pair": symbol,
         "entry_5m": {
-            "close": float(last.get("close", 0.0)),
+            "close": float(entry),
             "rsi": float(ohlcv["RSI"].iloc[-1]) if _df_ok(ohlcv) and "RSI" in ohlcv else 50.0,
             "volatility": float(ohlcv["volatility"].iloc[-1]) if _df_ok(ohlcv) and "volatility" in ohlcv else 0.0,
             "sma20": float(ohlcv["SMA_20"].iloc[-1]) if _df_ok(ohlcv) and "SMA_20" in ohlcv else 0.0,
@@ -420,8 +452,8 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
         "extra": {
             "ATR_5m": float(atr5),
             "relative_volume_5m": float(compute_relative_volume(ohlcv)) if _df_ok(ohlcv) else 1.0,
-            "recent_high_5m": sr5["recent_high"],
-            "recent_low_5m": sr5["recent_low"],
+            "recent_high_5m": float(sr_high),
+            "recent_low_5m": float(sr_low),
             "orderbook_imbalance": float(ob_stats.get("imbalance", 0.0)),
             "orderbook_spread": float(ob_stats.get("spread", 0.0)),
             "microprice": float(ob_stats.get("microprice", 0.0)),
@@ -430,10 +462,22 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
         },
         "times": base.get("times", {}),
         "price_sequence": price_seq,
-        "sr_levels": sr5,
+        "sr_levels": {"recent_high": float(sr_high), "recent_low": float(sr_low)},
         "relative_volume": float(compute_relative_volume(ohlcv)) if _df_ok(ohlcv) else 1.0,
         "trend_filter": trend,
         "horizon_min": HORIZON_MIN,
+        # === NEW: explicit bracket passed to LLM ===
+        "bracket": {
+            "entry": float(entry),
+            "k_tp": float(k_tp),
+            "k_sl": float(k_sl),
+            "atr": float(atr5),
+            "sr_high": float(sr_high),
+            "sr_low": float(sr_low),
+            "long": {"tp": float(long_tp), "sl": float(long_sl)},
+            "short": {"tp": float(short_tp), "sl": float(short_sl)},
+        },
+        "fees": {"maker_bps": float(FEE_MAKER_BPS), "taker_bps": float(FEE_TAKER_BPS)},
     }
     return payload, ohlcv, ob
 
@@ -610,6 +654,7 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
 
     entry = float((payload.get("entry_5m") or {}).get("close") or 0.0)
     extra = payload.get("extra") or {}
+    br = payload.get("bracket") or {}
     spread_bps = float(extra.get("orderbook_spread") or 0.0)
     if direction not in ("long","short") or entry <= 0:
         log_event("signal.decision", symbol=symbol, direction="hold", prob=prob, entry=entry, tp=0.0, sl=0.0, rr=0.0, risk_ok=False)
@@ -645,6 +690,17 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         sr_high, sr_low, llm_support, llm_resistance,
         k_tp=k_tp, k_sl=k_sl
     )
+
+    # If explicit bracket was provided in the payload, use it to align LLM view and execution
+    try:
+        if direction == "long" and isinstance(br.get("long"), dict):
+            tp = float((br.get("long") or {}).get("tp") or tp)
+            sl = float((br.get("long") or {}).get("sl") or sl)
+        elif direction == "short" and isinstance(br.get("short"), dict):
+            tp = float((br.get("short") or {}).get("tp") or tp)
+            sl = float((br.get("short") or {}).get("sl") or sl)
+    except Exception:
+        pass
 
     rr_net = _rr_with_fee_mode(direction, entry, tp, sl)
     rr_req = RR_MIN_HIGH_PROB if prob >= PROB_RELAX_THRESHOLD else RR_MIN
@@ -690,7 +746,9 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         "rr_gate_mode": RR_GATE_MODE,
         "sizing_mode": SIZE_MODE,
         "ev_perc": float(ev_perc),   # NEW for observability
-        "k_tp": float(k_tp), "k_sl": float(k_sl), "atr_ratio": (cur_atr/med_atr if (cur_atr>0 and med_atr>0) else 0.0),
+        "k_tp": float((br.get("k_tp") if isinstance(br, dict) else None) or k_tp),
+        "k_sl": float((br.get("k_sl") if isinstance(br, dict) else None) or k_sl),
+        "atr_ratio": (cur_atr/med_atr if (cur_atr>0 and med_atr>0) else 0.0),
     }
 
     out = {
@@ -989,8 +1047,13 @@ def _reconcile_open_from_gcs(symbol: str, max_scan: int = 500) -> bool:
         return False
 
 def _rewrite_trades_csv(rows: list, pref_headers: Optional[list] = None) -> None:
+    """
+    Rewrite trades.csv atomically using a temp file in the same directory,
+    then replace(). Headers follow the existing preference order.
+    """
     keys = set()
-    for r in rows: keys.update(r.keys())
+    for r in rows:
+        keys.update(r.keys())
     base = [
         "timestamp","symbol","side","qty","entry","entry_intent","tp","sl",
         "exit","pnl","status","id","prob","rr","entry_maker","tp_type","mode",
@@ -1000,13 +1063,29 @@ def _rewrite_trades_csv(rows: list, pref_headers: Optional[list] = None) -> None
         "prob_raw","prob_cal","ev_perc","ev_usd",
         "ev_ex_ante_perc","ev_ex_ante_usd"
     ]
-    headers = [k for k in base if k in keys] + [k for k in sorted(keys) if k not in base]
-    import csv, os
-    os.makedirs(os.path.dirname(TRADES_CSV), exist_ok=True)
-    with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
+    headers = [k for k in (pref_headers or base) if k in keys] + [
+        k for k in sorted(keys) if k not in (pref_headers or base)
+    ]
+    import csv, os, tempfile
+    from pathlib import Path
+    dst = Path(TRADES_CSV)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # write to a temp file in the same directory for atomic replace
+    with tempfile.NamedTemporaryFile("w", newline="", delete=False, encoding="utf-8", dir=str(dst.parent)) as tf:
+        tmp_path = Path(tf.name)
+        w = csv.DictWriter(tf, fieldnames=headers)
         w.writeheader()
-        for r in rows: w.writerow(r)
+        for r in rows:
+            w.writerow(r)
+    try:
+        tmp_path.replace(dst)
+    except Exception:
+        # fallback to direct write if replace fails
+        with open(dst, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
 # helpers/signals.py — replace _journal_close_last() body with the following edits near 'r.update({...})'
 def _journal_close_last(symbol: str, exit_price: float, reason: str) -> bool:
     idx, ts_ms, rows = _last_open_row_index_and_ts(symbol)
