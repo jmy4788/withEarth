@@ -34,8 +34,8 @@ env_variables:
   RR_MIN: "1.20"
   RR_MIN_HIGH_PROB: "1.08"
   RR_EVAL_WITH_FEES: "true"
-  EV_MIN_PERC: "0.0000"                # 초기 0.0 → 튜닝 후 상향
-  MAX_SPREAD_BPS: "1.5"
+  EV_MIN_PERC: "0.0002"                # 초기 0.0 → 튜닝 후 상향
+  MAX_SPREAD_BPS: "2.5"
   HORIZON_MIN: "30"
   TIME_BARRIER_ENABLED: "true"
 

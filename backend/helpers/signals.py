@@ -374,7 +374,7 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     last = ohlcv.iloc[-1] if _df_ok(ohlcv) else pd.Series({})
     ob = base.get("orderbook") if isinstance(base, dict) else None
 
-    # --- MTF/extra -----------------------------------------------------
+    # --- MTF / extra ---
     mtf = fetch_mtf_raw(symbol)
     extra: Dict[str, Any] = {}
     for tf, df in mtf.items():
@@ -383,22 +383,23 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
         key = {"1h": "_1h", "4h": "_4h", "1d": "_1d"}.get(tf, "")
         if _df_ok(ind):
             extra.update({
-                f"RSI{key}": float(ind["RSI"].iloc[-1]) if "RSI" in ind else 50.0,
-                f"volatility{key}": float(ind["volatility"].iloc[-1]) if "volatility" in ind else 0.0,
-                f"SMA20{key}": float(ind["SMA_20"].iloc[-1]) if "SMA_20" in ind else 0.0,
+                f"RSI{key}": float(ind.get("RSI").iloc[-1]) if "RSI" in ind else 50.0,
+                f"volatility{key}": float(ind.get("volatility").iloc[-1]) if "volatility" in ind else 0.0,
+                f"SMA20{key}": float(ind.get("SMA_20").iloc[-1]) if "SMA_20" in ind else 0.0,
                 f"ATR{key}": float(atr),
                 f"relative_volume{key}": float(compute_relative_volume(df)) if _df_ok(df) else 1.0,
-                f"recent_high{key}": float(df["high"].tail(50).max()) if _df_ok(df) else 0.0,
-                f"recent_low{key}": float(df["low"].tail(50).min()) if _df_ok(df) else 0.0,
+                f"recent_high{key}": float(df.get("high").tail(50).max()) if _df_ok(df) else 0.0,
+                f"recent_low{key}": float(df.get("low").tail(50).min()) if _df_ok(df) else 0.0,
             })
 
-    # --- base indicators on 5m ----------------------------------------
     price_seq = compute_recent_price_sequence(ohlcv, n=10) if _df_ok(ohlcv) else [0.0] * 10
     atr5_series = compute_atr(ohlcv, window=14) if _df_ok(ohlcv) else None
     atr5 = float(atr5_series.iloc[-1]) if getattr(atr5_series, "size", 0) else 0.0
-    sr_high = float(ohlcv["high"].tail(50).max()) if _df_ok(ohlcv) else 0.0
-    sr_low = float(ohlcv["low"].tail(50).min()) if _df_ok(ohlcv) else 0.0
 
+    sr5 = {
+        "recent_high": float(ohlcv["high"].tail(50).max()) if _df_ok(ohlcv) else 0.0,
+        "recent_low": float(ohlcv["low"].tail(50).min()) if _df_ok(ohlcv) else 0.0,
+    }
     raw_stats = compute_orderbook_stats(ob) if isinstance(ob, dict) else {
         "imbalance": 0.0, "spread": 0.0, "microprice": 0.0, "mid": 0.0, "micro_dislocation_bps": 0.0
     }
@@ -410,9 +411,32 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     except Exception:
         funding_pct = 0.0
 
-    entry = float(last.get("close", 0.0)) if _df_ok(ohlcv) else 0.0
+    entry = float(last.get("close", 0.0))
+    extra_common = {
+        "ATR_5m": float(atr5),
+        "relative_volume_5m": float(compute_relative_volume(ohlcv)) if _df_ok(ohlcv) else 1.0,
+        "recent_high_5m": sr5["recent_high"],
+        "recent_low_5m": sr5["recent_low"],
+        "orderbook_imbalance": float(ob_stats.get("imbalance", 0.0)),
+        "orderbook_spread": float(ob_stats.get("spread", 0.0)),
+        "microprice": float(ob_stats.get("microprice", 0.0)),
+        "micro_dislocation_bps": float(ob_stats.get("micro_dislocation_bps", 0.0)),
+        "funding_rate_pct": float(funding_pct),
+    }
 
-    # --- Dynamic ATR multipliers (same logic as generate_signal) ------
+    # ---- LLM용 브래킷 계산: tick 라운딩 + (선택) 표기 소수 고정 ----
+    # normalize_price_for_side: SELL=올림, BUY=내림 (tickSize 준수)
+    def _llm_px(px: float, exit_side: str) -> float:
+        v = normalize_price_for_side(symbol, float(px), side=exit_side)
+        dec = os.getenv("LLM_PRICE_DECIMALS", "")
+        if dec.strip() != "":
+            try:
+                v = float(f"{v:.{int(dec)}f}")
+            except Exception:
+                pass
+        return float(v)
+
+    # 동적 ATR 보정(현재/중앙값 비율로 fudge) — 실행 로직과 동일한 파라미터 사용
     k_tp_env = float(os.getenv("ATR_MULT_TP", str(ATR_MULT_TP)))
     k_sl_env = float(os.getenv("ATR_MULT_SL", str(ATR_MULT_SL)))
     k_tp, k_sl = k_tp_env, k_sl_env
@@ -432,14 +456,54 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     except Exception:
         k_tp, k_sl = k_tp_env, k_sl_env
 
-    # --- Brackets for BOTH directions (SR clamp without LLM SR) -------
-    long_tp, long_sl = _tp_sl_with_sr_clamp("long", entry, atr5, sr_high, sr_low, None, None, k_tp=k_tp, k_sl=k_sl)
-    short_tp, short_sl = _tp_sl_with_sr_clamp("short", entry, atr5, sr_high, sr_low, None, None, k_tp=k_tp, k_sl=k_sl)
+    # LLM 입력용: long/short 양방향 브래킷(정규화)
+    sr_high = float(extra_common["recent_high_5m"])  # type: ignore[index]
+    sr_low  = float(extra_common["recent_low_5m"])   # type: ignore[index]
+
+    def _mk_bracket(direction: str) -> Dict[str, float]:
+        tp_raw, sl_raw = _tp_sl_with_sr_clamp(direction, entry, atr5, sr_high, sr_low,
+                                              llm_support=None, llm_resistance=None,
+                                              k_tp=k_tp, k_sl=k_sl)
+        exit_side = "SELL" if direction == "long" else "BUY"
+        tp_q = _llm_px(tp_raw, exit_side)
+        sl_q = _llm_px(sl_raw, exit_side)
+        if direction == "long":
+            d_tp_bps = (tp_q - entry) / max(1e-12, entry) * 1e4
+            d_sl_bps = (entry - sl_q) / max(1e-12, entry) * 1e4
+        else:
+            d_tp_bps = (entry - tp_q) / max(1e-12, entry) * 1e4
+            d_sl_bps = (sl_q - entry) / max(1e-12, entry) * 1e4
+        rr_net = _rr_with_fee_mode(direction, entry, tp_q, sl_q)
+        return {
+            "tp": float(tp_q),
+            "sl": float(sl_q),
+            "tp_delta_bps": float(d_tp_bps),
+            "sl_delta_bps": float(d_sl_bps),
+            "rr_net": float(rr_net),
+        }
+
+    brackets = {
+        "entry": float(entry),
+        "long": _mk_bracket("long") if entry > 0 and atr5 > 0 else {"tp": 0.0, "sl": 0.0},
+        "short": _mk_bracket("short") if entry > 0 and atr5 > 0 else {"tp": 0.0, "sl": 0.0},
+    }
+
+    # legacy bracket for backward-compat with existing code paths
+    legacy_bracket = {
+        "entry": float(entry),
+        "k_tp": float(k_tp),
+        "k_sl": float(k_sl),
+        "atr": float(atr5),
+        "sr_high": float(sr_high),
+        "sr_low": float(sr_low),
+        "long": {"tp": float((brackets.get("long") or {}).get("tp", 0.0)), "sl": float((brackets.get("long") or {}).get("sl", 0.0))},
+        "short": {"tp": float((brackets.get("short") or {}).get("tp", 0.0)), "sl": float((brackets.get("short") or {}).get("sl", 0.0))},
+    }
 
     payload = {
         "pair": symbol,
         "entry_5m": {
-            "close": float(entry),
+            "close": float(last.get("close", 0.0)),
             "rsi": float(ohlcv["RSI"].iloc[-1]) if _df_ok(ohlcv) and "RSI" in ohlcv else 50.0,
             "volatility": float(ohlcv["volatility"].iloc[-1]) if _df_ok(ohlcv) and "volatility" in ohlcv else 0.0,
             "sma20": float(ohlcv["SMA_20"].iloc[-1]) if _df_ok(ohlcv) and "SMA_20" in ohlcv else 0.0,
@@ -449,34 +513,18 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
             "volume": float(last.get("volume", 0.0)),
             "timestamp": str(last.get("timestamp", "")),
         },
-        "extra": {
-            "ATR_5m": float(atr5),
-            "relative_volume_5m": float(compute_relative_volume(ohlcv)) if _df_ok(ohlcv) else 1.0,
-            "recent_high_5m": float(sr_high),
-            "recent_low_5m": float(sr_low),
-            "orderbook_imbalance": float(ob_stats.get("imbalance", 0.0)),
-            "orderbook_spread": float(ob_stats.get("spread", 0.0)),
-            "microprice": float(ob_stats.get("microprice", 0.0)),
-            "micro_dislocation_bps": float(ob_stats.get("micro_dislocation_bps", 0.0)),
-            "funding_rate_pct": float(funding_pct),
-        },
+        "extra": extra_common,
         "times": base.get("times", {}),
         "price_sequence": price_seq,
-        "sr_levels": {"recent_high": float(sr_high), "recent_low": float(sr_low)},
+        "sr_levels": sr5,
         "relative_volume": float(compute_relative_volume(ohlcv)) if _df_ok(ohlcv) else 1.0,
         "trend_filter": trend,
         "horizon_min": HORIZON_MIN,
-        # === NEW: explicit bracket passed to LLM ===
-        "bracket": {
-            "entry": float(entry),
-            "k_tp": float(k_tp),
-            "k_sl": float(k_sl),
-            "atr": float(atr5),
-            "sr_high": float(sr_high),
-            "sr_low": float(sr_low),
-            "long": {"tp": float(long_tp), "sl": float(long_sl)},
-            "short": {"tp": float(short_tp), "sl": float(short_sl)},
-        },
+        # LLM이 사용할 결정적 수치 피처: 브래킷
+        "brackets": brackets,
+        # keep legacy key for compatibility
+        "bracket": legacy_bracket,
+        # informational
         "fees": {"maker_bps": float(FEE_MAKER_BPS), "taker_bps": float(FEE_TAKER_BPS)},
     }
     return payload, ohlcv, ob

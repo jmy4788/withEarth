@@ -255,12 +255,14 @@ def get_gemini_prediction(payload: Dict[str, Any], symbol: str = "") -> Dict[str
             "pair": payload.get("pair"),
             "entry_5m": payload.get("entry_5m"),
             "mtf_keys": sorted(list((payload.get("extra") or {}).keys()))[:8],
-            "bracket_preview": {
-                "entry": (payload.get("bracket") or {}).get("entry"),
-                "long": (payload.get("bracket") or {}).get("long"),
-                "short": (payload.get("bracket") or {}).get("short"),
-            },
         }
+        br = payload.get("brackets") or {}
+        if isinstance(br, dict):
+            preview["bracket_preview"] = {
+                "entry": br.get("entry"),
+                "long": {k: (br.get("long") or {}).get(k) for k in ("tp", "sl")},
+                "short": {k: (br.get("short") or {}).get(k) for k in ("tp", "sl")},
+            }
         log_event("gemini.request",
                   symbol=(symbol or payload.get("pair")),
                   model=MODEL,
