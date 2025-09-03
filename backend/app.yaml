@@ -34,7 +34,7 @@ env_variables:
   RR_MIN: "1.20"
   RR_MIN_HIGH_PROB: "1.08"
   RR_EVAL_WITH_FEES: "true"
-  EV_MIN_PERC: "0.0002"                # 초기 0.0 → 튜닝 후 상향
+  EV_MIN_PERC: "0.0001"                # 초기 0.0 → 튜닝 후 상향
   MAX_SPREAD_BPS: "2.5"
   HORIZON_MIN: "30"
   TIME_BARRIER_ENABLED: "true"
@@ -54,11 +54,11 @@ env_variables:
   MTF_RSI_SHORT_MAX: "48"              # ← 45→48
   SHOCK_BPS: "30"
   SHOCK_ATR_MULT: "1.8"
-  ENTRY_COOLDOWN_MIN: "15"
+  ENTRY_COOLDOWN_MIN: "10"
 
   # --- 손절/익절 ---
-  ATR_MULT_SL: "1.2"
-  ATR_MULT_TP: "2.2"
+  ATR_MULT_SL: "1.1"
+  ATR_MULT_TP: "2.4"
   TP_ORDER_TYPE: "LIMIT"
   SL_ORDER_TYPE: "STOP_MARKET"
   SL_LIMIT_SLIPPAGE_BPS: "10"          # STOP_LIMIT일 때만 사용됨
@@ -66,7 +66,7 @@ env_variables:
   # --- 집행/주문 ---
   ENTRY_MODE: "LIMIT"
   ENTRY_POST_ONLY: "true"
-  LIMIT_TTL_SEC: "20"
+  LIMIT_TTL_SEC: "25"
   LIMIT_POLL_SEC: "1.0"
   LIMIT_MAX_REPRICES: "2"
   LIMIT_MAX_SLIPPAGE_BPS: "2.0"

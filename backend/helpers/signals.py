@@ -130,6 +130,12 @@ ENTRY_COOLDOWN_MIN = int(os.getenv("ENTRY_COOLDOWN_MIN", "10"))
 RR_GATE_MODE = os.getenv("RR_GATE_MODE", "expected").lower()  # worst | expected | best
 MAKER_PROB_LOOKBACK = int(os.getenv("MAKER_PROB_LOOKBACK", "200"))
 
+# --- EV-override knobs (NEW) ---
+EV_OVERRIDE_ENABLED = str(os.getenv("EV_OVERRIDE_ENABLED", "true")).lower() in ("1","true","yes")
+EV_OVERRIDE_MIN_PERC = float(os.getenv("EV_OVERRIDE_MIN_PERC", "0.0005"))  # EV_perc가 이 이상이면 확률 완화 고려
+EV_OVERRIDE_MIN_PROB = float(os.getenv("EV_OVERRIDE_MIN_PROB", "0.54"))   # 완화 허용 최소 확률
+MTF_RELAX_WITH_EV = str(os.getenv("MTF_RELAX_WITH_EV", "true")).lower() in ("1","true","yes")
+
 # --- sizing mode (NEW) ---
 SIZE_MODE = os.getenv("SIZE_MODE", "USDT").upper()              # USDT | BALANCE_PCT
 RISK_USDT = float(os.getenv("RISK_USDT", "100"))                # legacy (SIZE_MODE=USDT)
@@ -793,6 +799,22 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
     except Exception:
         risk_scalar = 1.0
 
+    # --- EV-based override (NEW) ---
+    if EV_OVERRIDE_ENABLED:
+        override_ok = (
+            (prob < MIN_PROB) and (prob >= EV_OVERRIDE_MIN_PROB) and
+            (rr_net >= rr_req) and (ev_perc >= EV_OVERRIDE_MIN_PERC) and
+            _spread_ok(spread_bps) and (not sg_block) and (not cd_active2)
+        )
+        if override_ok:
+            # 확률 컷만 제거(+선택적으로 MTF 불일치도 제거)
+            reasons = [r for r in reasons if r != "prob_below_threshold"]
+            if MTF_RELAX_WITH_EV:
+                # our reasons include details like f"{mtf_reason}(...)"; relax by prefix match
+                reasons = [r for r in reasons if not (str(mtf_reason) and str(r).startswith(str(mtf_reason)))]
+            log_event("signal.override_ev",
+                      symbol=symbol, prob=float(prob), rr=float(rr_net),
+                      ev_perc=float(ev_perc), reasons=";".join(reasons) or "ok")
     risk_ok = (len(reasons) == 0)
 
     # gate log with MTF numeric fields (observability)
