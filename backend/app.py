@@ -492,6 +492,37 @@ def api_debug_env():
         gcs_on = False
     return _json_ok(LOG_DIR=LOG_DIR, trades_csv_exists=ok, gcs_enabled=gcs_on)
 
+@app.route("/api/debug/knobs")
+def api_debug_knobs():
+    try:
+        import helpers.signals as S  # read module-level knobs actually loaded
+        knobs = {
+            "MIN_PROB": S.MIN_PROB,
+            "RR_MIN": S.RR_MIN,
+            "PROB_RELAX_THRESHOLD": S.PROB_RELAX_THRESHOLD,
+            "RR_MIN_HIGH_PROB": S.RR_MIN_HIGH_PROB,
+            "EV_MIN_PERC": S.EV_MIN_PERC,
+            "RR_GATE_MODE": S.RR_GATE_MODE,
+            "FEE_MAKER_BPS": S.FEE_MAKER_BPS,
+            "FEE_TAKER_BPS": S.FEE_TAKER_BPS,
+            "MAX_SPREAD_BPS": S.MAX_SPREAD_BPS,
+            "MTF_ALIGN_ENABLED": S.MTF_ALIGN_ENABLED,
+            "MTF_RSI_LONG_MIN": S.MTF_RSI_LONG_MIN,
+            "MTF_RSI_SHORT_MAX": S.MTF_RSI_SHORT_MAX,
+            "HORIZON_MIN": S.HORIZON_MIN,
+            "TIME_BARRIER_ENABLED": S.TIME_BARRIER_ENABLED,
+            "ENTRY_COOLDOWN_MIN": S.ENTRY_COOLDOWN_MIN,
+            "DYN_ATR_LEVELS": S.DYN_ATR_LEVELS,
+            "ATR_MULT_TP": S.ATR_MULT_TP,
+            "ATR_MULT_SL": S.ATR_MULT_SL,
+            "TP_ORDER_TYPE": S.TP_ORDER_TYPE,
+            "SL_ORDER_TYPE": S.SL_ORDER_TYPE,
+            "SIZE_MODE": S.SIZE_MODE,
+        }
+        return _json_ok(**knobs)
+    except Exception as e:
+        return _json_err("knobs_read_failed", error=str(e))
+
 @app.route("/api/trades")
 def api_trades():
     try: limit = int(request.args.get("limit","200"))

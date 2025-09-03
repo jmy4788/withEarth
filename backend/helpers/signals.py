@@ -659,17 +659,21 @@ def journal_sync(mode: str = "backup") -> Dict[str, Any]:
 
 # ---------------------------------
 # Signal generation
-# ---------------------------------# helpers/signals.py — replace this whole function
+# ---------------------------------# helpers/signals.py — replace this whole function# helpers/signals.py — generate_signal() REPLACE WHOLE FUNCTION
 def generate_signal(symbol: str) -> Dict[str, Any]:
     payload, ohlcv, ob = _build_payload(symbol)
     spread_bps_gate = float((payload.get("extra") or {}).get("orderbook_spread", 0.0))
     proceed_basic = should_predict(payload, min_vol_frac_env="MIN_VOL_FRAC") and _spread_ok(spread_bps_gate)
     dir_hint, _ = _rule_backup(ohlcv, payload.get("trend_filter") or {})
     atr5 = float((payload.get("extra") or {}).get("ATR_5m") or 0.0)
+
     cd_active, cd_left = _cooldown_active(symbol)
     if cd_active:
-        return {"symbol": symbol, "action":"hold","direction":"hold","entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
-                "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,"reason": f"pre_gate_cooldown({cd_left}m_left)"}
+        return {"symbol": symbol, "action":"hold","direction":"hold",
+                "entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
+                "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,
+                "reason": f"pre_gate_cooldown({cd_left}m_left)"}
+
     sg_long, bpsL, multL, _ = _shock_guard_block("long", ohlcv, atr5)
     sg_short, bpsS, multS, _ = _shock_guard_block("short", ohlcv, atr5)
     if (sg_long or sg_short):
@@ -677,38 +681,43 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         shock_dir = "long" if candle_up else "short"
         if not (dir_hint in ("long","short") and dir_hint == shock_dir):
             bps = max(bpsL, bpsS); mult = max(multL, multS)
-            return {"symbol":symbol,"action":"hold","direction":"hold","entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
-                    "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,"reason": f"pre_gate_shock({bps:.1f}bps,{mult:.2f}ATR)"}
+            return {"symbol":symbol,"action":"hold","direction":"hold",
+                    "entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
+                    "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,
+                    "reason": f"pre_gate_shock({bps:.1f}bps,{mult:.2f}ATR)"}
+
+    # ---- LLM or rule-backup path
     if not proceed_basic:
         trend = payload.get("trend_filter") or {}
         direction_rb, prob_rb = _rule_backup(ohlcv, trend)
         if direction_rb in ("long","short"):
-            direction, prob = direction_rb, prob_rb
-            prob_raw = float(prob_rb)
-            prob_cal = float(calibrate_prob(prob_raw)) if USE_CALIBRATED_PROB else float(prob_raw)
-            prob = _quantize_prob(prob_cal)
-            llm_support = None; llm_resistance = None
+            direction, prob_raw = direction_rb, float(prob_rb)
         else:
-            return {"symbol":symbol,"action":"hold","direction":"hold","entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
+            return {"symbol":symbol,"action":"hold","direction":"hold",
+                    "entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
                     "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,"reason":"pre_gate_block"}
+        llm_support = None; llm_resistance = None
     else:
         llm_decision = get_gemini_prediction(payload, symbol=symbol)
         direction = str(llm_decision.get("direction") or "").lower()
         prob_raw = float(llm_decision.get("prob", 0.0))
-        prob_cal = float(calibrate_prob(prob_raw)) if USE_CALIBRATED_PROB else float(prob_raw)
-        prob = _quantize_prob(prob_cal)
         llm_support = llm_decision.get("support")
         llm_resistance = llm_decision.get("resistance")
+
+    # ---- calibration & quantize
+    prob_cal = float(calibrate_prob(prob_raw)) if USE_CALIBRATED_PROB else float(prob_raw)
+    prob = _quantize_prob(prob_cal)
 
     entry = float((payload.get("entry_5m") or {}).get("close") or 0.0)
     extra = payload.get("extra") or {}
     br = payload.get("bracket") or {}
     spread_bps = float(extra.get("orderbook_spread") or 0.0)
+
     if direction not in ("long","short") or entry <= 0:
         log_event("signal.decision", symbol=symbol, direction="hold", prob=prob, entry=entry, tp=0.0, sl=0.0, rr=0.0, risk_ok=False)
         return {"symbol":symbol,"action":"hold","direction":"hold","entry":entry,"tp":0.0,"sl":0.0,"prob":prob,"risk_ok":False,"rr":0.0,"reason":"invalid_direction_or_entry"}
 
-    # === NEW: ATR 동적 배수 산출 ===
+    # ---- dynamic ATR levels (tranq/turb) same as execution side
     k_tp_env = float(os.getenv("ATR_MULT_TP", str(ATR_MULT_TP)))
     k_sl_env = float(os.getenv("ATR_MULT_SL", str(ATR_MULT_SL)))
     k_tp, k_sl = k_tp_env, k_sl_env
@@ -721,11 +730,9 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
             if DYN_ATR_LEVELS and cur_atr > 0 and med_atr > 0:
                 ratio = cur_atr / med_atr
                 if ratio >= VOL_TURB:
-                    # 고변동: SL 넓히고 TP 약간 가깝게
                     k_tp = k_tp_env * TP_FUDGE_TURB
                     k_sl = k_sl_env * SL_FUDGE_TURB
                 elif ratio <= VOL_TRANQ:
-                    # 저변동: TP 더 멀리, SL 약간 가깝게
                     k_tp = k_tp_env * TP_FUDGE_TRANQ
                     k_sl = k_sl_env * SL_FUDGE_TRANQ
     except Exception:
@@ -739,7 +746,7 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         k_tp=k_tp, k_sl=k_sl
     )
 
-    # If explicit bracket was provided in the payload, use it to align LLM view and execution
+    # align with explicit bracket if present
     try:
         if direction == "long" and isinstance(br.get("long"), dict):
             tp = float((br.get("long") or {}).get("tp") or tp)
@@ -753,23 +760,28 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
     rr_net = _rr_with_fee_mode(direction, entry, tp, sl)
     rr_req = RR_MIN_HIGH_PROB if prob >= PROB_RELAX_THRESHOLD else RR_MIN
 
+    # ---- MTF check with numeric exposure
+    r1h = float(extra.get("RSI_1h", 50.0))
+    r4h = float(extra.get("RSI_4h", 50.0))
+    mtf_ok, mtf_reason = _mtf_align_ok(direction, extra)
+
     reasons: List[str] = []
     if prob < MIN_PROB: reasons.append("prob_below_threshold")
     if not _spread_ok(spread_bps): reasons.append(f"wide_spread({spread_bps:.2f}bps)")
-    mtf_ok, mtf_reason = _mtf_align_ok(direction, extra)
-    if not mtf_ok: reasons.append(mtf_reason)
+    if not mtf_ok:
+        reasons.append(f"{mtf_reason}(r1h={r1h:.1f},r4h={r4h:.1f},long_min={MTF_RSI_LONG_MIN:.0f},short_max={MTF_RSI_SHORT_MAX:.0f})")
     sg_block, sg_bps, sg_mult, sg_reason = _shock_guard_block(direction, ohlcv, float(extra.get("ATR_5m") or 0.0))
     if sg_block: reasons.append(sg_reason)
     cd_active2, cd_left2 = _cooldown_active(symbol)
     if cd_active2: reasons.append(f"entry_cooldown({cd_left2}m_left)")
     if rr_net <= 0 or rr_net < rr_req: reasons.append(f"rr_net_below_min({rr_net:.2f}<{rr_req:.2f})")
 
-    # === NEW: EV gate ===
+    # ---- EV gate
     ev_perc = _compute_ev_perc(prob, direction, entry, tp, sl)
     if ev_perc < EV_MIN_PERC:
         reasons.append(f"ev_below_threshold({ev_perc:.4f}<{EV_MIN_PERC:.4f})")
 
-    # === sizing risk_scalar(원래 로직) ===
+    # volatility-weighted sizing (risk_scalar)
     risk_scalar = 1.0
     try:
         if VOL_SIZE_SCALING and _df_ok(ohlcv):
@@ -782,8 +794,11 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         risk_scalar = 1.0
 
     risk_ok = (len(reasons) == 0)
+
+    # gate log with MTF numeric fields (observability)
     log_event("signal.gate", symbol=symbol, direction=direction, prob=float(prob), spread_bps=float(spread_bps),
               rr=float(rr_net), rr_req=float(rr_req), rr_mode=RR_GATE_MODE, ev_perc=float(ev_perc),
+              rsi_1h=float(r1h), rsi_4h=float(r4h),
               reasons=";".join(reasons) if reasons else "ok")
 
     telemetry = {
@@ -793,10 +808,13 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         "maker_prob_est": _estimate_p_maker_from_journal(),
         "rr_gate_mode": RR_GATE_MODE,
         "sizing_mode": SIZE_MODE,
-        "ev_perc": float(ev_perc),   # NEW for observability
+        "ev_perc": float(ev_perc),
         "k_tp": float((br.get("k_tp") if isinstance(br, dict) else None) or k_tp),
         "k_sl": float((br.get("k_sl") if isinstance(br, dict) else None) or k_sl),
         "atr_ratio": (cur_atr/med_atr if (cur_atr>0 and med_atr>0) else 0.0),
+        "rsi_1h": float(r1h),
+        "rsi_4h": float(r4h),
+        "mtf_ok": bool(mtf_ok),
     }
 
     out = {
@@ -807,15 +825,14 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         "tp": float(tp),
         "sl": float(sl),
         "prob": float(prob),
-        "prob_raw": float(prob_raw if 'prob_raw' in locals() else prob),
-        "prob_cal": float(prob if 'prob' in locals() else prob),
+        "prob_raw": float(prob_raw),
+        "prob_cal": float(prob),
         "rr": float(rr_net),
         "risk_ok": bool(risk_ok),
         "reason": "ok" if risk_ok else ";".join(reasons) or "no_trade_conditions",
         "result": {
             "direction": direction, "entry": float(entry), "tp": float(tp), "sl": float(sl),
-            "prob": float(prob), "prob_raw": float(prob_raw if 'prob_raw' in locals() else prob),
-            "prob_cal": float(prob if 'prob' in locals() else prob),
+            "prob": float(prob), "prob_raw": float(prob_raw), "prob_cal": float(prob),
             "rr": float(rr_net), "risk_ok": bool(risk_ok), "risk_scalar": float(risk_scalar),
         },
         "telemetry": telemetry,

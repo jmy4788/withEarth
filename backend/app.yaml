@@ -29,7 +29,7 @@ env_variables:
 
   # --- EV/RR/게이트 ---
   RR_GATE_MODE: "expected"             # ← 명시 추가 (worst|expected|best)
-  MIN_PROB: "0.62"                     # 초기 완화(보정 후 조정)
+  MIN_PROB: "0.60"                     # 초기 완화(보정 후 조정)
   PROB_RELAX_THRESHOLD: "0.78"
   RR_MIN: "1.20"
   RR_MIN_HIGH_PROB: "1.08"
