@@ -38,11 +38,14 @@ try:
 except Exception as e:  # pragma: no cover
     raise
 
-# --- predictor (Gemini) ---
+# --- predictor (router) ---
 try:
-    from .predictor import get_gemini_prediction, should_predict  # type: ignore
-except Exception as e:  # pragma: no cover
-    raise
+    from .predictor_router import get_prediction  # type: ignore
+except Exception:
+    def get_prediction(payload, symbol=""):
+        from .predictor import get_gemini_prediction  # type: ignore
+        return get_gemini_prediction(payload, symbol=symbol)
+from .predictor import should_predict  # type: ignore
 
 # --- Binance client wrapper ---
 try:
@@ -80,6 +83,7 @@ DEFAULT_LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 POSITION_MODE = os.getenv("POSITION_MODE", "ONEWAY").upper()
 MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "1.5"))
+MIN_VOL_FRAC_ENV = float(os.getenv("MIN_VOL_FRAC", "0.0005"))
 
 HORIZON_MIN = int(os.getenv("HORIZON_MIN", "30"))
 TIME_BARRIER_ENABLED = str(os.getenv("TIME_BARRIER_ENABLED", "true")).lower() in ("1","true","yes")
@@ -130,11 +134,13 @@ ENTRY_COOLDOWN_MIN = int(os.getenv("ENTRY_COOLDOWN_MIN", "10"))
 RR_GATE_MODE = os.getenv("RR_GATE_MODE", "expected").lower()  # worst | expected | best
 MAKER_PROB_LOOKBACK = int(os.getenv("MAKER_PROB_LOOKBACK", "200"))
 
-# --- EV-override knobs (NEW) ---
-EV_OVERRIDE_ENABLED = str(os.getenv("EV_OVERRIDE_ENABLED", "true")).lower() in ("1","true","yes")
-EV_OVERRIDE_MIN_PERC = float(os.getenv("EV_OVERRIDE_MIN_PERC", "0.0005"))  # EV_perc가 이 이상이면 확률 완화 고려
-EV_OVERRIDE_MIN_PROB = float(os.getenv("EV_OVERRIDE_MIN_PROB", "0.54"))   # 완화 허용 최소 확률
-MTF_RELAX_WITH_EV = str(os.getenv("MTF_RELAX_WITH_EV", "true")).lower() in ("1","true","yes")
+# Safer defaults (can still be opened via env)
+EV_OVERRIDE_ENABLED = str(os.getenv("EV_OVERRIDE_ENABLED", "false")).lower() in ("1","true","yes")
+EV_OVERRIDE_MIN_PROB = float(os.getenv("EV_OVERRIDE_MIN_PROB", "0.58"))
+EV_OVERRIDE_MIN_PERC = float(os.getenv("EV_OVERRIDE_MIN_PERC", "0.0015"))
+MTF_RELAX_WITH_EV   = str(os.getenv("MTF_RELAX_WITH_EV", "false")).lower() in ("1","true","yes")
+OVR_SPREAD_MAX_BPS  = float(os.getenv("OVR_SPREAD_MAX_BPS", "1.8"))
+OVR_RR_EXTRA        = float(os.getenv("OVR_RR_EXTRA", "0.05"))
 
 # --- sizing mode (NEW) ---
 SIZE_MODE = os.getenv("SIZE_MODE", "USDT").upper()              # USDT | BALANCE_PCT
@@ -662,6 +668,153 @@ def journal_sync(mode: str = "backup") -> Dict[str, Any]:
     ok = _journal_backup_to_gcs(tag="cron")
     return {"action":"backup","ok":bool(ok)}
 
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+def _journal_headers() -> list[str]:
+    # _journal_append_open() header order to keep downstream safe
+    return [
+        "timestamp","symbol","side","qty","entry","entry_intent","tp","sl","exit","pnl","status","id",
+        "prob","prob_raw","prob_cal","rr","entry_maker","tp_type","mode","reprices","used_market_fallback","post_only",
+        "spread_bps","atr_now","funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
+        "size_mode","bal_asset","notional","bal_pct","exit_ts",
+        "ev_perc","ev_usd","ev_ex_ante_perc","ev_ex_ante_usd"
+    ]
+
+def _any_open_rows_in_journal() -> bool:
+    try:
+        import csv, os
+        if not os.path.exists(TRADES_CSV):
+            return False
+        with open(TRADES_CSV, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if str(row.get("status","")) .strip().lower() == "open":
+                    return True
+    except Exception:
+        return False
+    return False
+
+def _dt_start_of_today_utc() -> "datetime":
+    # Respect TZ env (default UTC). e.g., Asia/Seoul
+    tz = os.getenv("TZ", "UTC")
+    local = datetime.now(ZoneInfo(tz))
+    sod_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return sod_local.astimezone(timezone.utc)
+
+def _parse_keep_from(keep_from: Optional[str]) -> Optional["datetime"]:
+    if not keep_from:
+        return None
+    k = keep_from.strip().lower()
+    if k in ("today", "오늘"):
+        return _dt_start_of_today_utc()
+    # YYYY-MM-DD or ISO-like
+    try:
+        # date-only -> interpret as local TZ midnight then to UTC
+        if len(keep_from.strip()) == 10:
+            tz = os.getenv("TZ", "UTC")
+            local = datetime.fromisoformat(keep_from.strip() + "T00:00:00")
+            local = local.replace(tzinfo=ZoneInfo(tz))
+            return local.astimezone(timezone.utc)
+        # otherwise parse ISO
+        dt = datetime.fromisoformat(keep_from.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+def journal_reset(
+    *,
+    confirm: bool = False,
+    backup: bool = True,
+    require_no_open: bool = True,
+    keep_from: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Journal reset/trim:
+      - confirm=False -> dry-run (no changes)
+      - keep_from=None -> full reset (headers only)
+      - keep_from='today' or 'YYYY-MM-DD' -> keep rows since that (local TZ 00:00) in UTC
+      - backup=True -> pre-backup to GCS latest and daily dir
+      - require_no_open=True -> block if any 'open' rows present
+    Returns: {"action": str, "path": TRADES_CSV, "backup_ok": bool, "gcs_latest_ok": bool, "kept": int, "dropped": int}
+    """
+    p = Path(TRADES_CSV)
+    exists = p.exists()
+    size = int(p.stat().st_size) if exists else 0
+    has_open = _any_open_rows_in_journal()
+
+    cut_utc = _parse_keep_from(keep_from)
+
+    plan = {
+        "exists": bool(exists),
+        "size_bytes": size,
+        "open_rows_present": bool(has_open),
+        "keep_from": (cut_utc.isoformat() if cut_utc else None),
+        "gcs_enabled": bool(gcs_enabled()),
+        "path": str(p),
+    }
+
+    if not confirm:
+        return {"action": "reset_dryrun", **plan}
+    if require_no_open and has_open:
+        return {"action": "blocked", "reason": "open_rows_present", **plan}
+
+    backed = False
+    if backup and exists:
+        try:
+            backed = _journal_backup_to_gcs(tag="pre_reset")
+        except Exception:
+            backed = False
+
+    kept_rows: list = []
+    dropped = 0
+    headers = _journal_headers()
+
+    if cut_utc is not None and exists:
+        import csv
+        with open(TRADES_CSV, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                ts = _parse_iso(row.get("timestamp",""))
+                if ts is None or ts.tzinfo is None:
+                    dropped += 1
+                    continue
+                if ts >= cut_utc:
+                    kept_rows.append(row)
+                else:
+                    dropped += 1
+        _rewrite_trades_csv(kept_rows, pref_headers=headers)
+        log_event("journal.trim", kept=len(kept_rows), dropped=int(dropped), since=cut_utc.isoformat())
+    else:
+        import csv, os
+        os.makedirs(os.path.dirname(TRADES_CSV), exist_ok=True)
+        with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+        kept_rows = []
+        dropped = -1
+
+    gcs_latest_ok = False
+    try:
+        gcs_latest_ok = _journal_backup_to_gcs(tag=("reset_trim" if cut_utc else "reset_empty"))
+    except Exception:
+        gcs_latest_ok = False
+
+    out = {
+        "action": ("reset_trim" if cut_utc else "reset_empty"),
+        "backup_ok": bool(backed),
+        "gcs_latest_ok": bool(gcs_latest_ok),
+        "kept": len(kept_rows),
+        "dropped": int(dropped) if dropped >= 0 else None,
+        "path": str(p),
+    }
+    log_event("journal.reset", **out)
+    return out
+
 
 # ---------------------------------
 # Signal generation
@@ -670,6 +823,9 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
     payload, ohlcv, ob = _build_payload(symbol)
     spread_bps_gate = float((payload.get("extra") or {}).get("orderbook_spread", 0.0))
     proceed_basic = should_predict(payload, min_vol_frac_env="MIN_VOL_FRAC") and _spread_ok(spread_bps_gate)
+    # pre-gate diagnostics (observability): capture current vol/spread
+    vol_last = float((payload.get("entry_5m") or {}).get("volatility", 0.0))
+    spread_bps = float((payload.get("extra") or {}).get("orderbook_spread", 0.0))
     dir_hint, _ = _rule_backup(ohlcv, payload.get("trend_filter") or {})
     atr5 = float((payload.get("extra") or {}).get("ATR_5m") or 0.0)
 
@@ -699,12 +855,16 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         if direction_rb in ("long","short"):
             direction, prob_raw = direction_rb, float(prob_rb)
         else:
+            reason = (
+                f"pre_gate_block(vol={vol_last:.6f}<{MIN_VOL_FRAC_ENV:.6f},"
+                f"spread_bps={spread_bps:.2f}<=max({MAX_SPREAD_BPS:.2f}))"
+            )
             return {"symbol":symbol,"action":"hold","direction":"hold",
                     "entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
-                    "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,"reason":"pre_gate_block"}
+                    "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,"reason": reason}
         llm_support = None; llm_resistance = None
     else:
-        llm_decision = get_gemini_prediction(payload, symbol=symbol)
+        llm_decision = get_prediction(payload, symbol=symbol)
         direction = str(llm_decision.get("direction") or "").lower()
         prob_raw = float(llm_decision.get("prob", 0.0))
         llm_support = llm_decision.get("support")
@@ -815,6 +975,20 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
             log_event("signal.override_ev",
                       symbol=symbol, prob=float(prob), rr=float(rr_net),
                       ev_perc=float(ev_perc), reasons=";".join(reasons) or "ok")
+    # Enforce stricter EV override guard
+    override_ok_strict = (
+        EV_OVERRIDE_ENABLED
+        and (prob < MIN_PROB) and (prob >= EV_OVERRIDE_MIN_PROB)
+        and (ev_perc >= EV_OVERRIDE_MIN_PERC)
+        and (rr_net >= (rr_req + OVR_RR_EXTRA))
+        and (spread_bps <= min(MAX_SPREAD_BPS, OVR_SPREAD_MAX_BPS))
+        and (not sg_block)
+        and (not cd_active2)
+        and mtf_ok
+    )
+    if (prob < MIN_PROB) and (not override_ok_strict):
+        if "prob_below_threshold" not in reasons:
+            reasons.append("prob_below_threshold")
     risk_ok = (len(reasons) == 0)
 
     # gate log with MTF numeric fields (observability)
@@ -1350,7 +1524,7 @@ def _compute_ev_perc(prob: float, direction: str, entry: float, tp: float, sl: f
 
 # ---------------------------------
 # Manage trade (entry + journaling)
-# ---------------------------------
+# ---------------------------------# helpers/signals.py — REPLACE WHOLE FUNCTION manage_trade()
 def manage_trade(symbol: str) -> Dict[str, Any]:
     try:
         # NEW: 필요 시 부팅 직후 복원
@@ -1360,6 +1534,7 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         sig = generate_signal(symbol)
         if "result" not in sig or not isinstance(sig["result"], dict):
             return {"symbol": symbol, "error": "no_signal"}
+
         res = sig["result"]
         telemetry = sig.get("telemetry") or {}
         direction = res.get("direction", "hold")
@@ -1373,22 +1548,47 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         risk_ok = bool(res.get("risk_ok", False))
         reason = sig.get("reason", "")
         risk_scalar = float(res.get("risk_scalar", 1.0)) if "risk_scalar" in res else float(res.get("risk_scalar", 1.0))
+
+        # 0) 기본 유효성
         if direction not in ("long","short") or not risk_ok or entry_intent <= 0 or tp <= 0 or sl <= 0:
             return {"symbol": symbol, "action": "hold", "direction": direction,
                     "entry": entry_intent, "tp": tp, "sl": sl, "prob": prob,
                     "risk_ok": False, "rr": rr, "reason": reason or "no_trade_conditions"}
-        if prob < float(os.getenv("MIN_PROB", "0.60")):
+
+        # 1) MIN_PROB 보수적 재검사 + EV override 정합
+        MIN_PROB_LOCAL = float(os.getenv("MIN_PROB", "0.60"))
+        EV_OVERRIDE_ENABLED = str(os.getenv("EV_OVERRIDE_ENABLED", "true")).lower() in ("1","true","yes")
+        EV_OVERRIDE_MIN_PERC = float(os.getenv("EV_OVERRIDE_MIN_PERC", "0.0005"))
+        EV_OVERRIDE_MIN_PROB = float(os.getenv("EV_OVERRIDE_MIN_PROB", "0.54"))
+
+        ev_perc = telemetry.get("ev_perc", None)
+        override_ok = False
+        try:
+            if EV_OVERRIDE_ENABLED and (prob < MIN_PROB_LOCAL) and (prob >= EV_OVERRIDE_MIN_PROB):
+                if ev_perc is not None:
+                    ep = float(ev_perc)
+                    override_ok = (ep >= EV_OVERRIDE_MIN_PERC)
+        except Exception:
+            override_ok = False
+
+        if (prob < MIN_PROB_LOCAL) and (not override_ok):
             return {"symbol": symbol, "action": "hold", "direction": direction,
                     "entry": entry_intent, "tp": tp, "sl": sl, "prob": prob,
                     "risk_ok": False, "rr": rr, "reason": "prob_below_threshold"}
+
+        # 2) 포지션/레버리지/마진 모드 셋업 (best-effort)
         try: set_position_mode(POSITION_MODE)
         except Exception as e: logger.warning("set_position_mode: %s", e)
         try: set_margin_type(symbol, MARGIN_TYPE)
         except Exception as e: logger.warning("set_margin_type: %s", e)
         try: set_leverage(symbol, DEFAULT_LEVERAGE)
         except Exception as e: logger.warning("set_leverage: %s", e)
+
+        # 3) 사이징
         qty, size_meta = _compute_size(symbol, entry_intent, sl, risk_scalar)
         side = "BUY" if direction == "long" else "SELL"
+
+        # 4) 집행 (LIMIT 우선 → TTL/reprice → MARKET 폴백)
         if ENTRY_MODE == "MARKET":
             entry_res = place_market_order(symbol, side, quantity=qty)
             bracket_res = place_bracket_orders(symbol, side, quantity=qty, take_profit=tp, stop_loss=sl)
@@ -1398,6 +1598,8 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         else:
             exec_res = _enter_limit_then_brackets(symbol, side, qty, desired_entry=entry_intent, tp=tp, sl=sl)
             mode = "LIMIT"
+
+        # 5) 엔트리 체결가 보정
         entry_actual = float(exec_res.get("entry_price") or 0.0)
         if entry_actual <= 0:
             try:
@@ -1405,10 +1607,11 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 entry_actual = float(pos.get("entryPrice") or 0.0) or entry_intent
             except Exception:
                 entry_actual = entry_intent
+
+        # 6) EV 로깅(Ex-ante)
         try:
-            # NEW: EV logging (fees+maker/taker 기대 반영, prob_cal 사용)
-            ev_perc = _compute_ev_perc(prob_cal, direction, entry_intent, tp, sl)
-            ev_usd  = ev_perc * float(size_meta.get('notional', float(qty*entry_intent)))
+            ev_perc2 = _compute_ev_perc(prob_cal, direction, entry_intent, tp, sl)
+            ev_usd  = ev_perc2 * float(size_meta.get('notional', float(qty*entry_intent)))
             row = {
                 "timestamp": _now_utc().isoformat(),
                 "symbol": symbol,
@@ -1443,30 +1646,31 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 "bal_asset": str(size_meta.get("bal_asset","")),
                 "notional": f"{float(size_meta.get('notional', float(qty*entry_intent))):.10f}",
                 "bal_pct": f"{float(size_meta.get('bal_pct', 0.0)):.6f}",
-                "ev_perc": f"{float(ev_perc):.10f}",
+                "ev_perc": f"{float(ev_perc2):.10f}",
                 "ev_usd":  f"{float(ev_usd):.10f}",
-                # CSV alias for clearer downstream consumption
-                "ev_ex_ante_perc": f"{float(ev_perc):.10f}",
+                "ev_ex_ante_perc": f"{float(ev_perc2):.10f}",
                 "ev_ex_ante_usd":  f"{float(ev_usd):.10f}",
             }
             _journal_append_open(row)
             if gcs_enabled():
                 gcs_append_csv_row("trades", list(row.keys()), row)
-                # NEW: 엔트리 직후 최신본 백업(선택)
                 try: _journal_backup_to_gcs(tag="entry")
                 except Exception: pass
         except Exception as e:
             logger.info("journal append failed: %s", e)
+
         try:
             log_event("order.size_meta", symbol=symbol, **{k: v for k, v in size_meta.items() if k in ("size_mode","bal_asset","wallet_balance","notional","bal_pct","include_upnl","risk_scalar")})
         except Exception:
             pass
+
         return {"symbol": symbol, "action": "enter", "direction": direction,
                 "entry": entry_actual, "tp": tp, "sl": sl, "prob": prob,
                 "risk_ok": True, "rr": rr, "order": exec_res, "mode": mode}
     except Exception as e:
         logger.exception("manage_trade failed for %s", symbol)
         return {"symbol": symbol, "error": str(e)}
+
     
 def _journal_append_open(row: Dict[str, Any]) -> None:
     import csv, os
@@ -1500,3 +1704,14 @@ def get_overview() -> Dict[str, Any]:
     except Exception as e:
         logger.info("get_overview passthrough failed: %s", e)
         return {"balances": [], "positions": []}
+
+# Public exports
+__all__ = [
+    "generate_signal",
+    "manage_trade",
+    "get_overview",
+    "maintain_positions",
+    "journal_sync",
+    "preview_size",
+    "journal_reset",
+]

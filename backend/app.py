@@ -112,7 +112,7 @@ logger.info("setup_logging initialized", extra={"log_path": LOG_PATH})
 try:
     from helpers.signals import (
         generate_signal, manage_trade, get_overview as sig_get_overview,
-        maintain_positions, journal_sync, preview_size
+        maintain_positions, journal_sync, preview_size, journal_reset
     )  # noqa
 except Exception as e:
     logger.exception("helpers.signals import failed: %s", e)
@@ -124,6 +124,8 @@ except Exception as e:
         return {"balances": [], "positions": []}
     def journal_sync(mode: str = "backup") -> Dict[str, Any]:
         return {"action": mode, "ok": False}
+    def journal_reset(**kwargs) -> Dict[str, Any]:
+        return {"action": "reset_unavailable", "ok": False}
 
 try:
     from helpers.data_fetch import fetch_ohlcv, fetch_orderbook  # noqa
@@ -415,6 +417,22 @@ def tasks_journal_sync():
     except Exception as e:
         return jsonify({"status":"error","message":str(e)}), 200
 
+@trader_bp.route("/tasks/journal_reset", methods=["GET","POST"])
+def tasks_journal_reset():
+    if not _is_cron(request):
+        return jsonify({"error":"forbidden"}), 403
+    confirm = str(request.args.get("confirm","false")).lower() in ("1","true","yes")
+    backup = str(request.args.get("backup","true")).lower() in ("1","true","yes")
+    require_no_open = str(request.args.get("require_no_open","true")).lower() in ("1","true","yes")
+    keep_from = request.args.get("keep_from")  # e.g., 'today' or '2025-09-03'
+    try:
+        res = journal_reset(confirm=confirm, backup=backup, require_no_open=require_no_open, keep_from=keep_from)
+        log_event("tasks.journal_reset", **res)
+        status = 200 if res.get("action") not in ("blocked","reset_unavailable") else 409
+        return jsonify({"status":"ok", **res}), status
+    except Exception as e:
+        return jsonify({"status":"error","message":str(e)}), 500
+
 # ======================================================================
 # Flask app & API routes
 # ======================================================================
@@ -497,6 +515,8 @@ def api_debug_knobs():
     try:
         import helpers.signals as S  # read module-level knobs actually loaded
         knobs = {
+            "PREDICTOR_IMPL": os.getenv("PREDICTOR_IMPL", "GEMINI").upper(),
+            "PREDICTOR_BACKEND": os.getenv("PREDICTOR_BACKEND", os.getenv("PREDICTOR_IMPL", "GEMINI")).upper(),
             "MIN_PROB": S.MIN_PROB,
             "RR_MIN": S.RR_MIN,
             "PROB_RELAX_THRESHOLD": S.PROB_RELAX_THRESHOLD,
@@ -510,6 +530,22 @@ def api_debug_knobs():
             "FEE_MAKER_BPS": S.FEE_MAKER_BPS,
             "FEE_TAKER_BPS": S.FEE_TAKER_BPS,
             "MAX_SPREAD_BPS": S.MAX_SPREAD_BPS,
+            # pre-gate and execution knobs for observability
+            "MIN_VOL_FRAC": float(os.getenv("MIN_VOL_FRAC", "0.0005")),
+            "ENTRY_MODE": S.ENTRY_MODE,
+            "ENTRY_POST_ONLY": S.ENTRY_POST_ONLY,
+            "LIMIT_TTL_SEC": S.LIMIT_TTL_SEC,
+            "LIMIT_MAX_REPRICES": S.LIMIT_MAX_REPRICES,
+            "LIMIT_TTL_FALLBACK_TO_MARKET": S.LIMIT_TTL_FALLBACK_TO_MARKET,
+            "OVR_SPREAD_MAX_BPS": getattr(S, "OVR_SPREAD_MAX_BPS", None),
+            "OVR_RR_EXTRA": getattr(S, "OVR_RR_EXTRA", None),
+            # dynamic ATR / volatility knobs
+            "VOL_TRANQ_RATIO": os.getenv("VOL_TRANQ_RATIO", None),
+            "VOL_TURB_RATIO": os.getenv("VOL_TURB_RATIO", None),
+            "TP_FUDGE_TRANQ": os.getenv("TP_FUDGE_TRANQ", None),
+            "SL_FUDGE_TRANQ": os.getenv("SL_FUDGE_TRANQ", None),
+            "TP_FUDGE_TURB": os.getenv("TP_FUDGE_TURB", None),
+            "SL_FUDGE_TURB": os.getenv("SL_FUDGE_TURB", None),
             "MTF_ALIGN_ENABLED": S.MTF_ALIGN_ENABLED,
             "MTF_RSI_LONG_MIN": S.MTF_RSI_LONG_MIN,
             "MTF_RSI_SHORT_MAX": S.MTF_RSI_SHORT_MAX,

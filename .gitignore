@@ -30,6 +30,7 @@ logs/
 **/logs/
 logs/*.log
 **/*.log
+json/
 # CSV는 로그에 한정 (전역 *.csv는 너무 공격적)
 logs/*.csv
 **/logs/*.csv
