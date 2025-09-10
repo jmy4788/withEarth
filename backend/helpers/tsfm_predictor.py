@@ -76,16 +76,27 @@ def _simulate_first_hit(mu: float, sigma: float, entry: float, tp: float, sl: fl
 
 
 def _predict_quantiles_remote(inputs, params) -> Optional[Dict[str, Any]]:
+    """
+    Call Cloud Run TSFM endpoint using helpers.tsfm_remote_client,
+    and normalize to legacy shape: {TSFM_ENDPOINT_FIELD: [[q05],[q50],[q95]]}
+    """
     if not TSFM_ENDPOINT_URL:
         return None
     try:
-        import urllib.request
-        payload = json.dumps({"inputs": inputs, "parameters": params}).encode("utf-8")
-        req = urllib.request.Request(TSFM_ENDPOINT_URL, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            txt = resp.read().decode("utf-8", "ignore")
-        obj = json.loads(txt)
-        return obj
+        from .tsfm_remote_client import call_tsfm_remote  # type: ignore
+        # Inputs: [{"target": series}], params: {prediction_length, quantiles}
+        if not inputs or not isinstance(inputs, list):
+            return None
+        series = inputs[0].get("target") if isinstance(inputs[0], dict) else None
+        if not isinstance(series, list) or len(series) == 0:
+            return None
+        H = int((params or {}).get("prediction_length", 1))
+        qs = (params or {}).get("quantiles", [0.05, 0.5, 0.95])
+        res = call_tsfm_remote(series, horizon=H, quantiles=qs)
+        q05 = res.get("q05") or []
+        q50 = res.get("q50") or []
+        q95 = res.get("q95") or []
+        return {TSFM_ENDPOINT_FIELD: [[q05, q50, q95]]}
     except Exception as e:
         logger.info("TSFM remote error: %s", e)
         return None
@@ -137,7 +148,11 @@ def get_tsfm_prediction(payload: Dict[str, Any], symbol: str = "") -> Dict[str, 
             obj = _predict_quantiles_remote(
                 [{"target": seq}], {"prediction_length": steps, "quantiles": [0.05, 0.50, 0.95]}
             )
-            q_fore = obj.get(TSFM_ENDPOINT_FIELD) if isinstance(obj, dict) else None
+            if isinstance(obj, dict) and TSFM_ENDPOINT_FIELD in obj:
+                q_fore = obj[TSFM_ENDPOINT_FIELD]
+                # Normalize shape: allow [[q05,q50,q95]] or [q05,q50,q95]
+                if isinstance(q_fore, list) and q_fore and all(isinstance(x, list) for x in q_fore) and len(q_fore) == 3:
+                    q_fore = [q_fore]
         if q_fore is None and TSFM_BACKEND == "CHRONOS":
             out = _predict_quantiles_local_chronos(seq, pred_len=steps)
             if out and isinstance(out, list):
@@ -191,4 +206,3 @@ def get_tsfm_prediction(payload: Dict[str, Any], symbol: str = "") -> Dict[str, 
     except Exception as e:
         logger.info("get_tsfm_prediction error: %s", e)
         return {"direction": "hold", "prob": 0.5, "reasoning": "tsfm_exception"}
-

@@ -1,0 +1,5 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+timesfm[torch]==1.2.6
+numpy
+scipy

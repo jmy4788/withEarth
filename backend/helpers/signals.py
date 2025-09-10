@@ -56,6 +56,7 @@ try:
         place_market_order, place_limit_order, place_bracket_orders,
         get_position, get_open_orders, get_last_price,
         replace_stop_loss_to_price, find_recent_exit_fill,
+        cancel_orders_by_type,
     )  # type: ignore
 except Exception as e:  # pragma: no cover
     raise
@@ -99,6 +100,9 @@ PROB_RELAX_THRESHOLD = float(os.getenv("PROB_RELAX_THRESHOLD", "0.78"))
 RR_MIN_HIGH_PROB = float(os.getenv("RR_MIN_HIGH_PROB", "1.08"))
 TP_ORDER_TYPE = os.getenv("TP_ORDER_TYPE", "LIMIT").upper()
 SL_ORDER_TYPE = os.getenv("SL_ORDER_TYPE", "STOP_MARKET").upper()
+
+# Bracket reset toggle (default on)
+BRACKETS_RESET_ON_FILL = str(os.getenv("BRACKETS_RESET_ON_FILL", "true")).lower() in ("1","true","yes")
 
 # --- Break-even trailing ---
 BE_TRAILING_ENABLED = str(os.getenv("BE_TRAILING_ENABLED", "true")).lower() in ("1","true","yes")
@@ -320,13 +324,21 @@ def _shock_guard_block(direction: str, ohlcv: pd.DataFrame, atr5: float) -> Tupl
     return block, float(chg_bps), float(atr_mult), reason
 
 def _mtf_align_ok(direction: str, extra: Dict[str, Any]) -> Tuple[bool, str]:
-    if not MTF_ALIGN_ENABLED or direction not in ("long","short"): return True, ""
-    r1h = float(extra.get("RSI_1h", 50.0)); r4h = float(extra.get("RSI_4h", 50.0))
+    # Observability: distinguish missing vs mismatch while keeping conservative logic
+    if not MTF_ALIGN_ENABLED or direction not in ("long","short"):
+        return True, ""
+    has1 = "RSI_1h" in extra
+    has4 = "RSI_4h" in extra
+    if not (has1 or has4):
+        # No MTF context at all -> block and mark explicitly
+        return False, "mtf_rsi_missing"
+    r1h = float(extra.get("RSI_1h", 50.0)) if has1 else 50.0
+    r4h = float(extra.get("RSI_4h", 50.0)) if has4 else 50.0
     if direction == "long":
-        ok = (r1h >= MTF_RSI_LONG_MIN) and (r4h >= MTF_RSI_LONG_MIN)
+        ok = (r1h >= MTF_RSI_LONG_MIN) and (r4h >= MTF_RSI_LONG_MIN if has4 else True)
     else:
-        ok = (r1h <= MTF_RSI_SHORT_MAX) and (r4h <= MTF_RSI_SHORT_MAX)
-    return ok, "mtf_rsi_mismatch"
+        ok = (r1h <= MTF_RSI_SHORT_MAX) and (r4h <= MTF_RSI_SHORT_MAX if has4 else True)
+    return ok, ("mtf_rsi_mismatch" if (has1 or has4) else "mtf_rsi_missing")
 
 # === last-open timestamp (restored) ===
 def _last_open_trade_timestamp(symbol: str) -> Optional[datetime]:
@@ -435,6 +447,8 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
         "micro_dislocation_bps": float(ob_stats.get("micro_dislocation_bps", 0.0)),
         "funding_rate_pct": float(funding_pct),
     }
+    # Merge MTF-derived features into extra for downstream checks (e.g., RSI_1h/RSI_4h)
+    extra_common.update(extra)
 
     # ---- LLM용 브래킷 계산: tick 라운딩 + (선택) 표기 소수 고정 ----
     # normalize_price_for_side: SELL=올림, BUY=내림 (tickSize 준수)
@@ -1069,8 +1083,38 @@ def _limit_price_for_side(symbol: str, side: str, desired_entry: float, prev_sub
         px = normalize_price_for_side(symbol, px, side=side)
     return float(px)
 
+def _reset_brackets(symbol: str, side: str, tp: float, sl: float) -> Dict[str, Any]:
+    """
+    기존 TP/SL(RO) 전부 취소 후, '현재 포지션 잔고' 전량 기준으로 브래킷(TP/SL) 1쌍만 재배치.
+    side: 엔트리 방향("BUY"/"SELL") 그대로 전달.
+    """
+    # 1) 기존 브래킷류 취소
+    try:
+        cancel_orders_by_type(symbol, ["TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET"])
+        log_event("brackets.reset.cancelled", symbol=symbol)
+    except Exception as e:
+        logger.info("brackets cancel failed for %s: %s", symbol, e)
+
+    # 2) 현재 포지션 잔고 조회 → 전량
+    qty = 0.0
+    try:
+        pos = get_position(symbol) or {}
+        amt = float(pos.get("positionAmt") or pos.get("positionAmount") or 0.0)
+        qty = abs(amt)
+    except Exception:
+        qty = 0.0
+
+    if qty <= 1e-12:
+        log_event("brackets.reset.skip", symbol=symbol, reason="no_position")
+        return {"take_profit": None, "stop_loss": None, "skipped": True}
+
+    # 3) 브래킷 1쌍 재배치
+    out = place_bracket_orders(symbol, side, qty, take_profit=float(tp), stop_loss=float(sl))
+    log_event("brackets.reset.placed", symbol=symbol, qty=float(qty), tp=float(tp), sl=float(sl))
+    return out if isinstance(out, dict) else {"raw": out}
+
 def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
-                               desired_entry: float, tp: float, sl: float) -> Dict[str, Any]:
+                                desired_entry: float, tp: float, sl: float) -> Dict[str, Any]:
     side = side.upper()
     tif = "GTX" if ENTRY_POST_ONLY else "GTC"
     last_submitted: Optional[float] = None
@@ -1132,7 +1176,12 @@ def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
     brackets = {"take_profit": None, "stop_loss": None}
     if filled > 0:
         try:
-            brackets = place_bracket_orders(symbol, side, filled, take_profit=tp, stop_loss=sl)
+            if BRACKETS_RESET_ON_FILL:
+                # 전량 기준 1쌍만 배치
+                brackets = _reset_brackets(symbol, side, tp, sl)
+            else:
+                # 기존 동작(추가 누적) 유지 옵션
+                brackets = place_bracket_orders(symbol, side, filled, take_profit=tp, stop_loss=sl)
         except Exception as e:
             logger.info("placing brackets failed: %s", e)
     fill_px = 0.0
@@ -1476,6 +1525,41 @@ def maintain_positions(symbol: str) -> Dict[str, Any]:
             settled = _settle_by_orders(symbol)
             if settled: return {"action": "settled"}
             return {"action": "none"}
+        # --- brackets de-dupe on maintain ---
+        try:
+            orders = get_open_orders(symbol) or []
+        except Exception:
+            orders = []
+        tp_cnt = sum(1 for o in orders if str((o.get("type") if isinstance(o, dict) else getattr(o, "type",""))).upper() in ("TAKE_PROFIT","TAKE_PROFIT_MARKET"))
+        sl_cnt = sum(1 for o in orders if str((o.get("type") if isinstance(o, dict) else getattr(o, "type",""))).upper() in ("STOP","STOP_MARKET"))
+        if tp_cnt > 1 or sl_cnt > 1:
+            # try restore tp/sl from journal's last open row
+            tp_val, sl_val = None, None
+            try:
+                idx, _, rows = _last_open_row_index_and_ts(symbol)
+                if idx is not None:
+                    last = rows[idx]
+                    tp_val = float(last.get("tp") or 0.0) or None
+                    sl_val = float(last.get("sl") or 0.0) or None
+            except Exception:
+                pass
+            # estimate current side from position
+            try:
+                p = get_position(symbol) or {}
+                amt2 = float(p.get("positionAmt") or p.get("positionAmount") or 0.0)
+                side2 = "BUY" if amt2 > 0 else "SELL"
+            except Exception:
+                side2 = "BUY"
+            if tp_val and sl_val:
+                _reset_brackets(symbol, side2, tp_val, sl_val)
+                log_event("cleanup.brackets_deduped", symbol=symbol, tp=tp_val, sl=sl_val, tp_cnt=tp_cnt, sl_cnt=sl_cnt)
+            else:
+                # if no tp/sl, cancel current brackets once; they will be re-created by next entry
+                try:
+                    cancel_orders_by_type(symbol, ["TAKE_PROFIT","TAKE_PROFIT_MARKET","STOP","STOP_MARKET"])
+                    log_event("cleanup.brackets_cancelled", symbol=symbol, reason="dedupe_no_levels")
+                except Exception as e:
+                    logger.info("cleanup cancel failed for %s: %s", symbol, e)
         return {"action": "none"}
     except Exception as e:
         logger.info("maintain_positions error for %s: %s", symbol, e)
@@ -1591,8 +1675,15 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         # 4) 집행 (LIMIT 우선 → TTL/reprice → MARKET 폴백)
         if ENTRY_MODE == "MARKET":
             entry_res = place_market_order(symbol, side, quantity=qty)
-            bracket_res = place_bracket_orders(symbol, side, quantity=qty, take_profit=tp, stop_loss=sl)
-            exec_res = {"entry_order": entry_res, "brackets": bracket_res, "filled_qty": float(qty),
+            brackets = {"take_profit": None, "stop_loss": None}
+            try:
+                if BRACKETS_RESET_ON_FILL:
+                    brackets = _reset_brackets(symbol, side, tp, sl)
+                else:
+                    brackets = place_bracket_orders(symbol, side, quantity=qty, take_profit=tp, stop_loss=sl)
+            except Exception as e:
+                logger.info("placing brackets failed: %s", e)
+            exec_res = {"entry_order": entry_res, "brackets": brackets, "filled_qty": float(qty),
                         "reprices": 0, "used_market_fallback": True, "entry_price": float(0.0)}
             mode = "MARKET"
         else:
