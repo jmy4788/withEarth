@@ -138,11 +138,15 @@ except Exception as e:
         return {"bids": [], "asks": [], "timestamp": int(time.time()*1000)}
 
 try:
-    from helpers.binance_client import get_open_orders  # noqa
+    from helpers.binance_client import get_open_orders, list_all_orders, find_recent_exit_fill  # noqa
 except Exception as e:
     logger.info("helpers.binance_client.get_open_orders import failed: %s", e)
     def get_open_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
+    def list_all_orders(symbol: str, limit: int = 100, start_time_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+        return []
+    def find_recent_exit_fill(symbol: str, since_ms: int, *, back_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        return None
 
 try:
     from helpers.utils import log_event, gcs_enabled, gcs_list as _gcs_list, gcs_download_text as _gcs_download_text  # noqa
@@ -172,6 +176,19 @@ def _json_err(msg: str, **kwargs): return jsonify(_plainify({"status":"error","m
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try: return float(x)
     except Exception: return default
+
+def _to_ms(ts: str) -> Optional[int]:
+    try:
+        if not ts: return None
+        t = ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
 
 def _tail_file(path: str, lines: int = 200) -> List[str]:
     if not Path(path).exists(): return []
@@ -383,7 +400,10 @@ def tasks_trader():
                 res = manage_trade(sym)
             else:
                 sig = generate_signal(sym)
-                res = {"symbol": sym, "action": "dryrun", "signal": sig}
+                if sig is None:
+                    res = {"symbol": sym, "action": "skip", "signal": None}
+                else:
+                    res = {"symbol": sym, "action": "dryrun", "signal": sig}
         except Exception as e:
             res = {"symbol": sym, "error": str(e)}
         out.append(res)
@@ -529,6 +549,7 @@ def api_debug_knobs():
             "RR_GATE_MODE": S.RR_GATE_MODE,
             "FEE_MAKER_BPS": S.FEE_MAKER_BPS,
             "FEE_TAKER_BPS": S.FEE_TAKER_BPS,
+            "MIN_TP_BPS_NET": getattr(S, "MIN_TP_BPS_NET", None),
             "MAX_SPREAD_BPS": S.MAX_SPREAD_BPS,
             # pre-gate and execution knobs for observability
             "MIN_VOL_FRAC": float(os.getenv("MIN_VOL_FRAC", "0.0005")),
@@ -589,6 +610,8 @@ def api_signals_latest():
     symbol = (request.args.get("symbol") or SYMBOLS[0]).upper()
     try:
         sig = generate_signal(symbol)  # helpers.signals.generate_signal
+        if sig is None:
+            return _json_ok(symbol=symbol, status="no_signal")
         # sig는 {"action","direction","entry","tp","sl","prob","reason","telemetry","result":{...}} 구조
         if isinstance(sig, dict) and sig.get("result"):
             return _json_ok(symbol=symbol, result=sig.get("result"), reason=sig.get("reason"), telemetry=sig.get("telemetry"))
@@ -639,7 +662,27 @@ def api_open_orders():
         orders = get_open_orders(symbol)
         return _json_ok(orders=orders)
     except Exception as e:
-        return _json_err(f"open_orders_failed: {e}")
+        return _json_err("open_orders_failed", error=str(e))
+
+@app.route("/api/orders/history", methods=["GET"])  # raw order history (for diagnostics)
+def api_orders_history():
+    symbol = (request.args.get("symbol") or (SYMBOLS[0] if SYMBOLS else "")).upper()
+    try:
+        limit = int(request.args.get("limit","100"))
+    except Exception:
+        limit = 100
+    start_ms = None
+    try:
+        since = request.args.get("since")  # ISO8601 optional
+        if since:
+            start_ms = _to_ms(since)
+    except Exception:
+        start_ms = None
+    try:
+        items = list_all_orders(symbol, limit=limit, start_time_ms=start_ms)
+        return _json_ok(symbol=symbol, limit=limit, since=start_ms, orders=items)
+    except Exception as e:
+        return _json_err("orders_history_failed", error=str(e))
     
 @app.route("/api/journal/local.csv")
 def api_journal_local_csv():
@@ -1059,6 +1102,96 @@ def api_metrics_calibration():
         current_sample={"brier": _brier(arr), "rel": _reliability_bins(arr, bins=bins)},
         n=len(rows),
     )
+
+@app.route("/api/diagnostics/trade_labels")
+def api_diagnostics_trade_labels():
+    """3-way match: journal rows ↔ exchange exits ↔ price/PnL sign.
+    Returns suspicious rows where label/price/order-type disagree.
+    """
+    try: limit = int(request.args.get("limit","500"))
+    except Exception: limit = 500
+    symbol = request.args.get("symbol")
+    try: days = int(request.args.get("days","0"))
+    except Exception: days = 0
+    verify_ex = str(request.args.get("verify_exchange","true")).lower() in ("1","true","yes")
+    try:
+        back_ms = int(os.getenv("EXIT_SEARCH_BACK_MS", "10800000"))
+    except Exception:
+        back_ms = 10800000
+
+    rows = _filter_trades(_read_trades_full(limit=5000)[-limit:], symbol, days, include_open=False)
+    out = []
+
+    def _label_from_type(typ: str) -> str:
+        t = (typ or "").upper()
+        if "TAKE_PROFIT" in t: return "closed_tp"
+        if "STOP" in t: return "closed_sl"
+        return "closed"
+
+    def _pnl_sign(side: str, entry: float, exitp: float) -> int:
+        s = (side or "").lower()
+        if s == "long":
+            return 1 if exitp > entry else 0
+        if s == "short":
+            return 1 if exitp < entry else 0
+        return 1 if (exitp - entry) > 0 else 0
+
+    suspects = 0
+    for r in rows:
+        st = str(r.get("status",""))
+        if st.lower() == "open":
+            continue
+        sym = r.get("symbol","")
+        side = r.get("side","")
+        entry = float(r.get("entry",0.0))
+        exitp = float(r.get("exit",0.0))
+        pnl = float(r.get("pnl",0.0))
+        ts_iso = str(r.get("timestamp",""))
+        id_ = r.get("id","")
+        ent_ms = _to_ms(ts_iso) or 0
+        ex_info = None
+        ex_type = None
+        ex_px = None
+        ex_ts = None
+        if verify_ex and sym and ent_ms:
+            try:
+                ex_info = find_recent_exit_fill(sym, since_ms=ent_ms, back_ms=back_ms)
+                if isinstance(ex_info, dict):
+                    ex_type = ex_info.get("type")
+                    ex_px = _safe_float(ex_info.get("price"), 0.0)
+                    ex_ts = ex_info.get("time")
+            except Exception:
+                ex_info = None
+        # mismatches
+        issues = []
+        if ex_type:
+            exp_label = _label_from_type(ex_type)
+            if (exp_label not in st.lower()):
+                issues.append(f"label_mismatch(exchange={exp_label}, journal={st})")
+        # price-based sign vs label
+        if exitp > 0 and entry > 0 and side:
+            sign = _pnl_sign(side, entry, exitp)
+            if ("tp" in st.lower() and pnl <= 0) or ("sl" in st.lower() and pnl > 0):
+                issues.append("pnl_sign_vs_label")
+            # optional: geometric sign vs label
+            if ("tp" in st.lower() and sign == 0) or ("sl" in st.lower() and sign == 1):
+                issues.append("price_sign_vs_label")
+        # exit price delta vs exchange
+        if ex_px and exitp:
+            bps = abs(exitp - ex_px) / max(1e-12, exitp) * 1e4
+            if bps > 5.0:  # > 5 bps difference is notable
+                issues.append(f"exit_price_diff_bps({bps:.2f})")
+
+        if issues:
+            suspects += 1
+        out.append({
+            "id": id_, "symbol": sym, "side": side, "timestamp": ts_iso,
+            "entry": entry, "exit": exitp, "pnl": pnl, "status": st,
+            "exchange_exit": {"type": ex_type, "price": ex_px, "time": ex_ts} if ex_type else None,
+            "issues": issues or ["ok"],
+        })
+
+    return _json_ok(n=len(out), suspects=suspects, rows=out)
 
 @app.route("/api/metrics/tune_ev_rr")
 def api_metrics_tune_ev_rr():

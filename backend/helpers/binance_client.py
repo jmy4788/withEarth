@@ -17,6 +17,7 @@ Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/gene
 
 import logging
 import os
+import time, random, string
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, List, Optional, Tuple
@@ -115,6 +116,106 @@ def _call(obj: Any, cand_names: List[str], /, **kwargs):
     if not fn:
         raise AttributeError(f"None of {cand_names} available on {type(obj).__name__}")
     return fn(**kwargs)
+
+# =====================
+# Hedge/idempotent utils
+# =====================
+def _is_hedge_mode() -> bool:
+    try:
+        return str(os.getenv("POSITION_MODE", "ONEWAY")).upper() == "HEDGE"
+    except Exception:
+        return False
+
+def _position_side_for(entry_side: str, reduce_only: bool) -> str:
+    """
+    ONEWAY  : 'BOTH'
+    HEDGE   : 진입/청산 방향에 따라 LONG/SHORT 자동 결정
+      - 진입(BUY)->LONG, 진입(SELL)->SHORT
+      - reduce_only(SELL)->LONG 청산, reduce_only(BUY)->SHORT 청산
+    """
+    if not _is_hedge_mode():
+        return "BOTH"
+    s = str(entry_side).upper()
+    if reduce_only:
+        return "LONG" if s == "SELL" else "SHORT"
+    return "LONG" if s == "BUY" else "SHORT"
+
+def _should_send_reduce_only(order_type: str, reduce_only: bool) -> bool:
+    """
+    HEDGE 모드에서 MARKET/LIMIT 즉시 체결 주문은 positionSide=LONG/SHORT만으로
+    '청산 전용' 의도가 충분히 전달되므로 reduceOnly는 불필요/거부될 수 있다.
+    - ONEWAY(BOTH) 모드: reduceOnly 허용 (true일 때만 전송)
+    - HEDGE 모드:
+        * order_type in {"MARKET","LIMIT"} -> reduceOnly 전송하지 않음
+        * 그 외(예: STOP_MARKET/TAKE_PROFIT[_MARKET])은 기존대로 전송 허용
+    """
+    if not reduce_only:
+        return False
+    try:
+        hedge = (os.getenv("POSITION_MODE", "ONEWAY").upper() == "HEDGE")
+    except Exception:
+        hedge = False
+    if hedge and str(order_type).upper() in ("MARKET", "LIMIT"):
+        return False
+    return True
+
+def _new_client_id(tag: str = "E") -> str:
+    ms = int(time.time() * 1000)
+    rnd = "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(5))
+    return f"{tag}{ms}{rnd}"
+
+def _safe_new_order(client, **payload):
+    """
+    모듈러 SDK의 new_order/newOrder 시그니처 차이를 흡수:
+    - new_client_order_id vs newClientOrderId
+    - position_side vs positionSide
+    - reduce_only vs reduceOnly
+    + 간단 재시도/백오프(네트워크/429/5xx) 2회
+    """
+    fn = _pick(client.rest_api, ["new_order", "newOrder"])
+    if not fn:
+        raise AttributeError("new_order/newOrder not found")
+    # 서명 필터링
+    try:
+        sig = inspect.signature(fn)
+        params = set(sig.parameters.keys())
+    except Exception:
+        params = set()
+
+    def _filter(d: Dict[str, Any]) -> Dict[str, Any]:
+        if not params:
+            return d
+        return {k: v for k, v in d.items() if k in params}
+
+    # 케멀/스네이크 동시 주입 후 필터
+    base = dict(payload)
+    if "new_client_order_id" not in base and "newClientOrderId" not in base:
+        cid = _new_client_id("E")
+        base["new_client_order_id"] = cid
+        base["newClientOrderId"] = cid
+    if "position_side" in base and "positionSide" not in base:
+        base["positionSide"] = base["position_side"]
+    if "reduce_only" in base and "reduceOnly" not in base:
+        base["reduceOnly"] = base["reduce_only"]
+    if "time_in_force" in base and "timeInForce" not in base:
+        base["timeInForce"] = base["time_in_force"]
+    if "stop_price" in base and "stopPrice" not in base:
+        base["stopPrice"] = base["stop_price"]
+    if "working_type" in base and "workingType" not in base:
+        base["workingType"] = base["working_type"]
+
+    # 경미한 재시도(2회)
+    back = [0.25, 0.75]
+    last_err = None
+    for i in range(1 + len(back)):
+        try:
+            return fn(**_filter(base))
+        except Exception as e:
+            last_err = e
+            if i < len(back):
+                time.sleep(back[i])
+                continue
+            raise last_err
 
 # ==================================
 # Exchange info + symbol filter util
@@ -346,6 +447,119 @@ def find_recent_exit_fill(symbol: str, since_ms: int, *, back_ms: Optional[int] 
 
     return {"type": typ, "price": pxf, "time": _ms(o)}
 
+# --- user trades fallback (Plan B) --------------------------------------------
+def list_user_trades(
+    symbol: str,
+    limit: int = 1000,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    USDS-M Futures 사용자 체결 이력 조회 (메서드 명칭 차이 흡수).
+    - 반환: dict 리스트 (SDK/REST 응답을 list[dict]로 정규화)
+    """
+    client = _get_client()
+    candidates = [
+        "user_trades", "get_user_trades", "my_trades",
+        "account_trades", "get_account_trades",
+        "userTrades", "get_userTrades", "get_myTrades",
+    ]
+    fn = _pick(getattr(client, "rest_api", client), candidates)
+    if not fn:
+        return []
+
+    # 시그니처에 존재하는 키만 전달
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+    except Exception:
+        params = {}
+    kwargs: Dict[str, Any] = {}
+    if "symbol" in params:
+        kwargs["symbol"] = symbol
+    if "limit" in params:
+        kwargs["limit"] = int(limit)
+    if start_time_ms is not None:
+        if "start_time" in params:
+            kwargs["start_time"] = int(start_time_ms)
+        if "startTime" in params:
+            kwargs["startTime"] = int(start_time_ms)
+    if end_time_ms is not None:
+        if "end_time" in params:
+            kwargs["end_time"] = int(end_time_ms)
+        if "endTime" in params:
+            kwargs["endTime"] = int(end_time_ms)
+
+    try:
+        resp = fn(**kwargs)
+        data = resp.data() if hasattr(resp, "data") else resp
+        if isinstance(data, (list, tuple)):
+            return [(_as_plain_dict(x) if not isinstance(x, dict) else x) for x in data]
+        return []
+    except Exception as e:
+        logger.info("list_user_trades failed for %s: %s", symbol, e)
+        return []
+
+
+def find_recent_exit_trade(symbol: str, since_ms: int, *, back_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """
+    주문 히스토리 기반 탐색이 실패했을 때를 대비한 '체결 이력' 폴백.
+    - 전략: 엔트리 이후 [since_ms, since_ms + tol + 3분] 사이 체결 중
+            realizedPnL(또는 동의어)이 '0이 아닌' 첫/마지막 체결을 청산으로 간주
+    - 반환: {"type": "USER_TRADE", "price": float, "time": int(ms), "realized": float}
+    """
+    try:
+        tol = int(os.getenv("EXIT_SEARCH_BACK_MS", str(back_ms if back_ms is not None else 15 * 60_000)))
+    except Exception:
+        tol = 15 * 60_000
+    start = max(0, int(since_ms))
+    end = int(since_ms) + int(tol) + 180_000  # +3분 여유
+
+    trades = list_user_trades(symbol, start_time_ms=start, end_time_ms=end, limit=1000)
+    if not trades:
+        return None
+
+    def _get(o: Dict[str, Any], *keys: str):
+        for k in keys:
+            if k in o and o[k] is not None:
+                return o[k]
+        return None
+
+    closings: List[Dict[str, Any]] = []
+    for t in trades:
+        rp = _get(t, "realizedPnl", "realized_pnl", "realizedPNL", "realizedProfit", "realizedPnlUSDT")
+        try:
+            rp_f = float(rp) if rp not in (None, "") else 0.0
+        except Exception:
+            rp_f = 0.0
+        if abs(rp_f) <= 1e-12:
+            continue  # 실현 PnL 0이면 청산으로 보지 않음
+
+        px = _get(t, "price", "avgPrice", "avg_price")
+        try:
+            px_f = float(px) if px not in (None, "") else 0.0
+        except Exception:
+            px_f = 0.0
+
+        tm = _get(t, "time", "T", "transactTime", "transact_time")
+        try:
+            tm_i = int(tm)
+        except Exception:
+            try:
+                tm_i = int(float(tm))
+            except Exception:
+                tm_i = None
+
+        closings.append({"type": "USER_TRADE", "price": px_f, "time": tm_i, "realized": rp_f})
+
+    if not closings:
+        return None
+    closings = [c for c in closings if c["time"] is not None and c["time"] >= start]
+    if not closings:
+        return None
+    closings.sort(key=lambda x: x["time"])
+    return closings[-1]
+
 # ==========================
 # Account & overview helpers
 # ==========================
@@ -567,10 +781,11 @@ def _quantize_qty(symbol: str, qty: float, at_price: float) -> float:
     f = load_symbol_filters(symbol)
     return ensure_min_notional(symbol, qty, price=at_price, filters=f)
 
-def place_market_order(symbol: str, side: str, quantity: float, reduce_only: bool = False) -> Dict[str, Any]:
+def place_market_order(symbol: str, side: str, quantity: float, reduce_only: bool = False,
+                       position_side_override: Optional[str] = None) -> Dict[str, Any]:
     client = _get_client()
     side = side.upper()
-    ps = _position_side()
+    ps = (position_side_override or _position_side_for(side, reduce_only=reduce_only))
 
     try:
         ref = _last_price(symbol)
@@ -588,17 +803,19 @@ def place_market_order(symbol: str, side: str, quantity: float, reduce_only: boo
     if q <= 0:
         raise ValueError("Normalized quantity <= 0")
 
+    order_type = "MARKET"
     payload = {
         "symbol": symbol,
         "side": side,
-        "type": "MARKET",
+        "type": order_type,
         "quantity": str(q),
-        "reduce_only": bool(reduce_only),
         "position_side": ps,
     }
+    if _should_send_reduce_only(order_type, reduce_only):
+        payload["reduce_only"] = True
     log_event("binance.order.request", **payload)
     try:
-        resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
+        resp = _safe_new_order(client, **payload)
         raw = resp.data() if hasattr(resp, "data") else resp
         data = _to_plain(raw)
         log_event("binance.order.response",
@@ -610,6 +827,18 @@ def place_market_order(symbol: str, side: str, quantity: float, reduce_only: boo
                   raw=data)
         return data if isinstance(data, dict) else {"raw": data}
     except Exception as e:
+        msg = str(getattr(e, "message", str(e))).lower()
+        # 서버가 reduceonly가 불필요/금지라고 응답하면 reduce_only 제거 후 1회 재시도
+        if "reduceonly" in msg and "not required" in msg:
+            try:
+                payload.pop("reduce_only", None)
+                log_event("binance.order.retry_no_reduceonly", symbol=symbol, side=side, type=order_type)
+                resp = _safe_new_order(client, **payload)
+                raw = resp.data() if hasattr(resp, "data") else resp
+                data = _to_plain(raw)
+                return data if isinstance(data, dict) else {"raw": data}
+            except Exception:
+                pass
         logger.error("place_market_order error: %s", e)
         raise
 
@@ -618,25 +847,27 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float,
                       post_only: bool = False) -> Dict[str, Any]:
     client = _get_client()
     side = side.upper()
-    ps = _position_side()
+    ps = _position_side_for(side, reduce_only=reduce_only)
 
     px = normalize_price_for_side(symbol, price, side)
     q = _quantize_qty(symbol, quantity, at_price=px)
 
+    order_type = "LIMIT"
     payload = {
         "symbol": symbol,
         "side": side,
-        "type": "LIMIT",
+        "type": order_type,
         "time_in_force": time_in_force,  # GTC | IOC | FOK | GTX(POST-ONLY)
         "price": _format_to_tick_str(symbol, px),
         "quantity": str(q),
-        "reduce_only": bool(reduce_only),
         "position_side": ps,
     }
+    if _should_send_reduce_only(order_type, reduce_only):
+        payload["reduce_only"] = True
 
     log_event("binance.order.request", **payload)
     try:
-        resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
+        resp = _safe_new_order(client, **payload)
         raw = resp.data() if hasattr(resp, "data") else resp
         data = _to_plain(raw)
         log_event("binance.order.response",
@@ -648,6 +879,17 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float,
                   raw=data)
         return data if isinstance(data, dict) else {"raw": data}
     except Exception as e:
+        msg = str(getattr(e, "message", str(e))).lower()
+        if "reduceonly" in msg and "not required" in msg:
+            try:
+                payload.pop("reduce_only", None)
+                log_event("binance.order.retry_no_reduceonly", symbol=symbol, side=side, type=order_type)
+                resp = _safe_new_order(client, **payload)
+                raw = resp.data() if hasattr(resp, "data") else resp
+                data = _to_plain(raw)
+                return data if isinstance(data, dict) else {"raw": data}
+            except Exception:
+                pass
         logger.error("place_limit_order error: %s", e)
         # POST-ONLY 의도일 때는 MARKET 폴백 금지
         if _LIMIT_FAILOVER_TO_MARKET and (not post_only):
@@ -657,7 +899,8 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float,
 
 def place_take_profit(symbol: str, opp_side: str, quantity: float, tp_price: float, order_type: str = "LIMIT") -> Dict[str, Any]:
     client = _get_client()
-    ps = _position_side()
+    opp_side = opp_side.upper()
+    ps = _position_side_for(opp_side, reduce_only=True)
     order_type = (order_type or _TP_ORDER_TYPE).upper()
 
     if order_type == "MARKET":
@@ -686,14 +929,15 @@ def place_take_profit(symbol: str, opp_side: str, quantity: float, tp_price: flo
             "position_side": ps,
         }
     log_event("binance.order.request", **tp_payload)
-    resp = _call(client.rest_api, ["new_order", "newOrder"], **tp_payload)
+    resp = _safe_new_order(client, **tp_payload)
     raw = resp.data() if hasattr(resp, "data") else resp
     data = _to_plain(raw)
     return data if isinstance(data, dict) else {"raw": data}
 
 def place_stop_market(symbol: str, opp_side: str, quantity: float, sl_price: float) -> Dict[str, Any]:
     client = _get_client()
-    ps = _position_side()
+    opp_side = opp_side.upper()
+    ps = _position_side_for(opp_side, reduce_only=True)
     sl_payload = {
         "symbol": symbol,
         "side": opp_side,
@@ -705,7 +949,7 @@ def place_stop_market(symbol: str, opp_side: str, quantity: float, sl_price: flo
         "position_side": ps,
     }
     log_event("binance.order.request", **sl_payload)
-    sl_resp = _call(client.rest_api, ["new_order", "newOrder"], **sl_payload)
+    sl_resp = _safe_new_order(client, **sl_payload)
     raw = sl_resp.data() if hasattr(sl_resp, "data") else sl_resp
     data = _to_plain(raw)
     return data if isinstance(data, dict) else {"raw": data}
@@ -718,8 +962,8 @@ def place_stop_limit(symbol: str, opp_side: str, quantity: float, stop_price: fl
     BUY (숏 청산): limit = stop * (1 + ε)
     """
     client = _get_client()
-    ps = _position_side()
     opp_side = opp_side.upper()
+    ps = _position_side_for(opp_side, reduce_only=True)
     eps = float(limit_slippage_bps) / 1e4
     if opp_side == "SELL":
         limit_px = stop_price * (1.0 - eps)
@@ -740,7 +984,7 @@ def place_stop_limit(symbol: str, opp_side: str, quantity: float, stop_price: fl
         "position_side": ps,
     }
     log_event("binance.order.request", **payload)
-    resp = _call(client.rest_api, ["new_order", "newOrder"], **payload)
+    resp = _safe_new_order(client, **payload)
     raw = resp.data() if hasattr(resp, "data") else resp
     data = _to_plain(raw)
     return data if isinstance(data, dict) else {"raw": data}

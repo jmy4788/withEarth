@@ -1,177 +1,73 @@
-# withEarth_V0 — Crypto Futures Auto Trader (Backend, 2025-08-19, patched)
+withEarth_V0 백엔드는 Binance USDS‑M 선물 거래를 자동화하는 Flask 기반 서비스입니다. 모델 예측(Gemini/TSFM), 리스크 게이트(RR/EV/ATR/스프레드/쿨다운/MTF/쇼크), HEDGE‑safe 주문, Kill Switch(회로차단), 저널링(GCS 백업 포함)을 제공합니다.
 
-Flask 기반 백엔드 API. Binance USDⓈ-M Futures 데이터/주문과 Google Gemini 예측을 결합해 **신호 생성 → RR/ATR/스프레드/게이트 → (옵션) 주문 집행**을 수행합니다. React SPA는 별도 호스팅(옵션)입니다.
+**주요 변경점(2025-09) 요약**
+- Hedge 모드 안전화: LONG/SHORT 자동 지정(BOTH 방지), 주문 멱등키(`newClientOrderId`) 자동 주입, 시그니처 정규화+소폭 재시도.
+- Kill Switch: 일중 손실/연속 손실/누적 MDD 기준 자동 중지.
+- 정산 Plan B: 주문 히스토리 실패 시 사용자 체결 이력(user trades)으로 폴백하여 청산 탐색 안정화.
 
-> **이번 패치(2025‑08‑19)**  
-> - **Step 1 적용:** LLM이 반환한 `support/resistance`를 TP/SL 산출에 실제 반영.  
-> - **Step 3(프리게이팅) 강화:** LLM 호출 전 **쿨다운/쇼크가드**(방향 비종속)로 조기 차단, 필요 시 **MTF 정합**을 규칙 기반 힌트 방향으로 선검사.  
-> - **문서 업데이트:** ENV 최적화 가이드, 튜닝 리포트 스크립트(`scripts/report.py`).
+**구성**
+- 백엔드: Flask + Gunicorn (`backend/app.py`, WSGI `server`)
+- 헬퍼: 거래소/시그널/예측/유틸 (`backend/helpers/*`)
+- 도구: 저널 분석·교정 (`backend/tools/*`)
+- 프런트엔드(선택): `frontend/`
 
----
+**디렉터리**
+- `backend/app.py`: 엔드포인트, 작업 크론, 로깅/메트릭, 캘리브레이션
+- `backend/helpers/binance_client.py`: 거래소 연동(주문/정산/포지션/필터)
+- `backend/helpers/signals.py`: 시그널 생성, 리스크 게이트, 주문/브래킷, 저널
+- `backend/helpers/predictor*.py`: 예측 백엔드(Gemini/TSFM)
+- `backend/helpers/utils.py`: Secret/GCS/로깅/이벤트
+- `backend/tools/*`: `calibrate_from_trades.py`, 분석 스크립트 등
 
-## 아키텍처
+**빠른 실행(로컬)**
+- 필수 키: `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `GOOGLE_API_KEY`
+- 권장: `EXECUTE_TRADES=false`로 시작해 시뮬레이션 확인
+- 명령:
+  - 가상환경: `python -m venv .venv` 후 활성화
+  - 의존성 설치: `pip install -r backend/requirements.txt`
+  - 환경변수 설정(예): `GOOGLE_API_KEY=...`, `BINANCE_API_KEY=...`, `BINANCE_API_SECRET=...`
+  - 서버 실행: `python backend/app.py` → 브라우저에서 `http://localhost:8080/health`
 
-1. **데이터 수집** — 5m 엔트리 + 1h/4h/1d MTF, 오더북 스프레드/불균형, 지표(RSI, SMA20, 변동성), ATR(14) 수집. *부분봉(미종가) 제거.*  
-2. **LLM 예측(Gemini)** — JSON 스키마 강제 `{direction, prob, support, resistance, reasoning}`. 폴백/수선/디버그 덤프.  
-3. **리스크·게이트** — `MIN_PROB`·RR(수수료 반영)·스프레드·MTF·쇼크·쿨다운·호라이즌 → “enter/hold”. RULE_BACKUP(간단 규칙) 내장. BE 트레일링·타임배리어 유지보수.  
-4. **집행** — LIMIT(포스트‑온리 옵션/재호가/TTL) → (옵션) MARKET 폴백. 브래킷: TP(LIMIT|MARKET) + SL(STOP_MARKET 또는 STOP_LIMIT). 틱/스텝/노셔널 정규화.  
-5. **로깅** — 파일 `logs/bot.log`, 저널 `logs/trades.csv`, 페이로드 스냅샷 `logs/payloads/YYYYMMDD/*`. API로 조회 가능.
+**배포(Google App Engine 표준)**
+- 작업 디렉터리: `backend/`
+- 명령:
+  - 배포: `gcloud app deploy app.yaml cron.yaml`
+- 스케줄: `backend/cron.yaml`에서 `/tasks/trader`, `/tasks/maintain`, `/tasks/journal_sync` 등 호출 주기 설정
 
----
+**주요 엔드포인트**
+- 헬스체크: `/health`
+- 트레이더 크론: `/tasks/trader`
+- 유지/정리: `/tasks/maintain`, 저널: `/tasks/journal_sync`, `/tasks/journal_reset`
+- 개요/진단: `/api/overview`, `/api/trades`, `/api/orders/history`, `/api/logs`, `/api/metrics*`
 
-## 폴더 구조
+**핵심 기능**
+- Hedge‑safe 주문: HEDGE 모드에서 진입은 BUY→LONG, SELL→SHORT 자동 지정, 청산(RO)은 반대 사이드 자동 지정. `_safe_new_order`가 `newClientOrderId` 주입, snake/camel 정규화, 짧은 재시도 적용.
+- 리스크 Kill Switch: `MAX_DAILY_LOSS_USD`, `MAX_CONSEC_LOSSES`, `MAX_MDD_USD` 기준 초과 시 `manage_trade`/`maintain_positions`에서 즉시 중지.
+- 정산 Plan B(체결 폴백): 주문 히스토리로 TP/SL Filled 탐색 실패 시, 사용자 체결 이력에서 실현손익이 0이 아닌 최근 체결을 청산으로 간주.
+- EV/RR/ATR/스프레드/쿨다운/MTF/쇼크 게이트와 브래킷(TP/SL) 자동 관리.
+- 저널링: `logs/trades.csv`에 거래 기록, GCS 최신/일별 스냅샷 자동 백업.
 
-- `app.py` — WSGI 엔트리(`app`/`server`), 라우트, 로깅 세팅.  
-- `helpers/`
-  - `binance_client.py` — Binance SDK 래퍼(주문/필터/포지션/브래킷/폴백).  
-  - `data_fetch.py` — OHLCV/오더북/지표/MTF/펀딩 수집(SDK 우선→REST).  
-  - `predictor.py` — Gemini 호출/스키마 강제/폴백/수선/`should_predict` 게이트.  
-  - `signals.py` — 신호 생성, RR(수수료 인지)·ATR·스프레드·MTF/쇼크/쿨다운 게이팅, LIMIT→MARKET 폴백, **BE 트레일링/타임배리어**.  
-  - `utils.py` — Secret Manager/GCS/파일 로깅 유틸.  
-- `scripts/report.py` — 실거래 로그 기반 **체결률/TP·SL 히트/순RR 분포** 및 **확률 보정용 데이터** 요약 스크립트.
+**환경변수(핵심만)**
+- 실행/일반: `EXECUTE_TRADES`, `SYMBOLS`, `TZ`, `LOG_DIR`, `LOG_LEVEL`
+- 거래소/주문: `POSITION_MODE`(HEDGE 권장), `TP_ORDER_TYPE`, `SL_ORDER_TYPE`, `ENTRY_MODE`, `ENTRY_POST_ONLY`, `LIMIT_TTL_SEC`, `LIMIT_MAX_REPRICES`, `LIMIT_TTL_FALLBACK_TO_MARKET`, `FEE_MAKER_BPS`, `FEE_TAKER_BPS`, `MIN_TP_BPS_NET`
+- 리스크/게이트: `MIN_PROB`, `RR_MIN`, `MAX_SPREAD_BPS`, `HORIZON_MIN`, `TIME_BARRIER_ENABLED`, `MTF_ALIGN_ENABLED`, `SHOCK_BPS`, `SHOCK_ATR_MULT`, `ENTRY_COOLDOWN_MIN`, `MAX_DAILY_LOSS_USD`, `MAX_CONSEC_LOSSES`, `MAX_MDD_USD`
+- 예측/캘리브레이션: `GEMINI_MODEL`, `GOOGLE_API_KEY`, `USE_CALIBRATED_PROB`, `CALIB_MIN_SAMPLES`, `CALIB_BINS`, `PROB_CALIBRATION_PATH`
+- GCS 백업: `GCS_BUCKET`, `GCS_PREFIX`, `JOURNAL_SYNC_ON_START`
 
----
+**Hedge 모드 동작 요약**
+- Before: `POSITION_SIDE=BOTH`가 주문에 실려 HEDGE 환경에서 거래소 거절/오작동 가능.
+- After: 진입/청산 맥락에 따라 `position_side`를 LONG/SHORT 자동 지정(ONEWAY는 BOTH 유지), `newClientOrderId`로 중복 방지.
 
-## 주요 ENV (권장값 포함)
+**저널(trades.csv)**
+- 위치: `LOG_DIR/trades.csv`
+- 주요 열: `timestamp,symbol,side,qty,entry,tp,sl,exit,pnl,status,id,...`
+- 백업: 최신/일별 GCS 스냅샷 자동 업로드(복구/트림 기능 포함).
 
-### 런타임/로깅
-```env
-TZ=Asia/Seoul
-LOG_LEVEL=INFO
-EXECUTE_TRADES=true
-SYMBOLS=BTCUSDT,ETHUSDT
-GCS_BUCKET=tothemoon-v2-logs-vaulted-scholar-466013-r5-seoul
-GCS_PREFIX=trading_bot
-```
-### 모델/보정
-```env
-GEMINI_MODEL=gemini-2.5-flash-lite
-USE_CALIBRATED_PROB=true
-PROB_CALIBRATION_PATH=logs/calibration.json
-CALIB_MIN_SAMPLES=150
-CALIB_BINS=10
-```
-### 리스크/게이트
-```env
-MIN_PROB=0.62                 # 보정 후 기준치
-PROB_RELAX_THRESHOLD=0.75
-RR_MIN=1.20
-RR_MIN_HIGH_PROB=1.05
-RR_EVAL_WITH_FEES=true        # 수수료 인지형 RR 게이트
-MAX_SPREAD_BPS=2.0
-HORIZON_MIN=25
-TIME_BARRIER_ENABLED=true
-MIN_VOL_FRAC=0.0007
-# 3중 게이트
-MTF_ALIGN_ENABLED=true
-MTF_RSI_LONG_MIN=48
-MTF_RSI_SHORT_MAX=52
-SHOCK_BPS=30
-SHOCK_ATR_MULT=1.5
-ENTRY_COOLDOWN_MIN=10
-```
-### 손절/익절
-```env
-ATR_MULT_SL=1.2
-ATR_MULT_TP=2.0
-TP_ORDER_TYPE=LIMIT          # 필요 시 MARKET로 A/B
-SL_ORDER_TYPE=STOP_MARKET    # STOP_LIMIT 시험 시 STOP + SL_LIMIT_SLIPPAGE_BPS 사용
-SL_LIMIT_SLIPPAGE_BPS=10
-```
-### 집행/주문
-```env
-ENTRY_MODE=LIMIT
-ENTRY_POST_ONLY=true
-LIMIT_TTL_SEC=15
-LIMIT_POLL_SEC=1.0
-LIMIT_MAX_REPRICES=3
-LIMIT_MAX_SLIPPAGE_BPS=2.0   # POST_ONLY 분기에서는 사용되지 않음(주의)
-LIMIT_FAILOVER_TO_MARKET=true
-LIMIT_TTL_FALLBACK_TO_MARKET=true
-```
-### BE 트레일링
-```env
-BE_TRAILING_ENABLED=true
-BE_TRIGGER_R_MULT=0.7
-BE_OFFSET_TICKS=2
-```
-### 포지션/사이징
-```env
-RISK_USDT=100
-LEVERAGE=5
-MARGIN_TYPE=ISOLATED
-POSITION_MODE=ONEWAY
-VOL_SIZE_SCALING=true
-VOL_SCALAR_MIN=0.5
-VOL_SCALAR_MAX=1.25
-```
-### 네트워킹/수수료
-```env
-BINANCE_HTTP_TIMEOUT_MS=10000
-BINANCE_HTTP_RETRIES=3
-BINANCE_HTTP_BACKOFF_MS=1000
-FEE_MAKER_BPS=2.0
-FEE_TAKER_BPS=4.0
-```
+**로컬 테스트 팁**
+- `EXECUTE_TRADES=false`로 API/게이트/시그널 흐름 점검 후 `true` 전환.
+- Kill Switch 값을 작은 숫자로 두고 동작 확인 후 운영치로 상향.
+- `POSITION_MODE=HEDGE` 설정 후 유지 태스크에서 포지션 모드/레버리지/마진 타입이 베스트에포트로 맞춰지는지 로그 확인.
 
----
+**주의/면책**
+- 본 코드는 투자 조언이 아니며, 실거래 책임은 사용자에게 있습니다. 실서버 투입 전 테스트·리스크 한도 설정을 반드시 진행하세요.
 
-## 무엇이 바뀌었나 (개발자용)
-
-### 1) LLM `support/resistance` 반영 (Step 1)
-- `helpers/signals.py/generate_signal()`에서 모델 응답의 `support/resistance`를 5m SR(`recent_high_5m`/`recent_low_5m`)과 **결합**해 TP/SL 후보에 사용.  
-- 로직:  
-  - Long → `tp=max(resistance, recent_high_5m, entry + k_tp*ATR)`, `sl=min(support, recent_low_5m, entry - k_sl*ATR)`  
-  - Short → `tp=min(support, recent_low_5m, entry - k_tp*ATR)`, `sl=max(resistance, recent_high_5m, entry + k_sl*ATR)`
-
-### 2) 프리게이팅 강화 (Step 3)
-- **LLM 호출 이전**에 다음 사유로 즉시 `hold` 반환:  
-  - **쿨다운 활성** (`ENTRY_COOLDOWN_MIN` 잔여 시간 존재)  
-  - **쇼크 캔들** (최근 5m 변화량이 `SHOCK_BPS` 또는 `SHOCK_ATR_MULT` 초과) — 방향 미지정 시에도 **보수적으로 차단**  
-  - **MTF 정합 실패(선택)** — 규칙 기반 힌트 방향(`RULE_BACKUP`)이 존재하는 경우에 한해 선검사
-
-### 3) 보고서 스크립트 추가 (Step 0)
-- `scripts/report.py` — `logs/trades.csv`와 `logs/payloads/*_decision.json`을 스캔하여 체결률, 승률, R 분포, 확률→성과 상관을 요약.  
-- (데이터가 충분하면) `logs/calibration.json`에 보정 곡선을 기록.
-
----
-
-## 로컬 실행
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export GOOGLE_API_KEY=... BINANCE_API_KEY=... BINANCE_API_SECRET=...
-python app.py
-# http://localhost:8080/health
-```
-
-## GAE 배포
-
-```bash
-gcloud app deploy app.yaml cron.yaml
-```
-
-- `cron.yaml` 예시: 5분 주기
-```yaml
-cron:
-- description: run trader every 5 minutes
-  url: /tasks/trader
-  schedule: every 5 minutes
-  timezone: Asia/Seoul
-  target: default
-```
-
----
-
-## 튜닝 가이드 (운영 중 빠른 레시피)
-
-- **체결률이 낮다** → `LIMIT_TTL_SEC`↑(20~25), `LIMIT_MAX_REPRICES`=2~3, 필요 시 `TP_ORDER_TYPE=MARKET` (체결가 비용↑).  
-- **되돌림 손실** → `HORIZON_MIN`↓(20), `BE_TRIGGER_R_MULT`↓(0.6~0.8), `ATR_MULT_SL`↑(1.3).  
-- **거래가 너무 적다** → `MIN_PROB`↓(0.58~0.60), `RR_MIN`↓(1.10), `MIN_VOL_FRAC`↓(0.0005).  
-- **허위 신호 많다** → `MIN_PROB`↑(0.65), `RR_MIN`↑(1.30), `PROB_RELAX_THRESHOLD`↑(0.80), 펀딩/미시구조 특징 가중치 강화.
-
----
-
-## 주의
-본 코드는 레퍼런스 구현입니다. 실제 운용 시 시장·유동성·레버리지 리스크에 유의하십시오.

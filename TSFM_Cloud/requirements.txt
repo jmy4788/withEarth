@@ -1,5 +1,8 @@
 fastapi==0.115.0
-uvicorn==0.30.6
-timesfm[torch]==1.2.6
-numpy
-scipy
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
+numpy==1.26.4
+pandas==2.2.2
+torch==2.3.1
+# TimesFM from GitHub
+git+https://github.com/google-research/timesfm.git@b810bbdf9f8a1e66396e7bd5cdb3b005e9116d86

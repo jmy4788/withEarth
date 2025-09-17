@@ -31,7 +31,6 @@ def call_tsfm_remote(series: List[float], horizon: int, quantiles=(0.05, 0.5, 0.
         logger.info("TSFM remote call failed: %s", e)
         raise
 
-    # 허용 스키마: {"predictions":[[q05],[q50],[q95]]} 또는 {"q05":[...],"q50":[...],"q95":[...]}
     if isinstance(res, dict):
         if TSFM_ENDPOINT_FIELD in res and isinstance(res[TSFM_ENDPOINT_FIELD], list):
             preds = res[TSFM_ENDPOINT_FIELD]
@@ -40,4 +39,3 @@ def call_tsfm_remote(series: List[float], horizon: int, quantiles=(0.05, 0.5, 0.
         if all(k in res for k in ("q05", "q50", "q95")):
             return {"q05": res["q05"], "q50": res["q50"], "q95": res["q95"]}
     raise RuntimeError("TSFM bad response schema")
-

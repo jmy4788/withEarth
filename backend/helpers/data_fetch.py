@@ -14,9 +14,11 @@ from __future__ import annotations
 """
 
 from typing import Any, Dict, List, Optional, Tuple
+from functools import lru_cache  # optional
 import logging
 import os
 import time
+import time as _time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -281,6 +283,11 @@ def fetch_funding_rate(symbol: str) -> float:
 # ----------------------------------------------------------------------------
 # Indicators
 # ----------------------------------------------------------------------------
+def _rma(series: pd.Series, window: int) -> pd.Series:
+    """Wilder's RMA (alpha=1/window)."""
+    alpha = 1.0 / float(max(1, window))
+    return series.ewm(alpha=alpha, adjust=False, min_periods=window).mean()
+
 def add_indicators(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """RSI(14), SMA_20, 변동성(20) 컬럼을 추가."""
     if df is None or len(df) == 0:
@@ -296,6 +303,18 @@ def add_indicators(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         rs = gain / (loss.replace(0, np.nan))
         rsi = 100.0 - (100.0 / (1.0 + rs))
         out["RSI"] = rsi.bfill().fillna(50.0)
+        # Override RSI with Wilder RMA variant for standardization
+        try:
+            delta2 = close.diff()
+            gain2 = delta2.clip(lower=0.0)
+            loss2 = (-delta2.clip(upper=0.0))
+            avg_gain2 = _rma(gain2, 14)
+            avg_loss2 = _rma(loss2, 14)
+            rs2 = avg_gain2 / avg_loss2.replace(0, np.nan)
+            rsi2 = 100.0 - (100.0 / (1.0 + rs2))
+            out["RSI"] = rsi2.bfill().fillna(out["RSI"]) 
+        except Exception:
+            pass
 
         # SMA_20
         out["SMA_20"] = close.rolling(window=20, min_periods=1).mean()
@@ -323,7 +342,7 @@ def compute_atr(df: Optional[pd.DataFrame], window: int = 14) -> pd.Series:
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-    atr = tr.rolling(window=window, min_periods=1).mean()
+    atr = _rma(tr, window)
     return atr
 
 def compute_orderbook_stats(ob: Optional[Dict[str, Any]]) -> Dict[str, float]:
@@ -471,6 +490,27 @@ def fetch_mtf_raw(symbol: str) -> Dict[str, pd.DataFrame]:
         except Exception as e:
             logger.info("fetch_mtf_raw %s failed: %s", tf, e)
             out[tf] = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    return out
+
+# --- TTL-cached MTF raw fetch (override) ---
+_MTF_CACHE_TTL = int(os.getenv("MTF_CACHE_TTL_SEC", "10"))
+_MTF_CACHE: Dict[str, Tuple[float, Dict[str, pd.DataFrame]]] = {}
+
+def fetch_mtf_raw(symbol: str) -> Dict[str, pd.DataFrame]:
+    """MTF 추천: 1h/4h/1d OHLCV dict 반환. 키는 {"1h","4h","1d"}"""
+    now = _time.time()
+    hit = _MTF_CACHE.get(symbol)
+    if hit and (now - hit[0] <= _MTF_CACHE_TTL):
+        return hit[1]
+    out: Dict[str, pd.DataFrame] = {}
+    for tf in ("1h", "4h", "1d"):
+        try:
+            df = fetch_ohlcv(symbol, interval=tf, limit=200)
+            out[tf] = df if df is not None else pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        except Exception as e:
+            logger.info("fetch_mtf_raw %s failed: %s", tf, e)
+            out[tf] = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    _MTF_CACHE[symbol] = (now, out)
     return out
 
 __all__ = [

@@ -1,130 +1,200 @@
-import os
-import math
-import json
-from typing import Dict, Any, List, Tuple
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
-import uvicorn
+# main.py
+import os, time
+from typing import List, Optional, Literal, Dict, Any
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel, Field
+import numpy as np
+import pandas as pd
+import torch
+import timesfm  # from google-research/timesfm (torch)
 
-# TimesFM 2.0 (PyTorch) - requires: pip install 'timesfm[torch]==1.2.6'
-import timesfm
+API_KEY = os.getenv("TSFM2_API_KEY", "").strip()
+DEVICE = "cpu"  # Cloud Run CPU default
+DT_DEFAULT_SEC = int(os.getenv("TSFM2_DT_SEC", "300"))  # 5m
+MAX_CONTEXT = int(os.getenv("TSFM2_MAX_CONTEXT", "2048"))
+MAX_HORIZON = int(os.getenv("TSFM2_MAX_HORIZON", "512"))
+N_PATHS = int(os.getenv("TSFM2_MC_PATHS", "4000"))
+SEED = int(os.getenv("TSFM2_SEED", "42"))
+HF_REPO = os.getenv("TSFM2_HF_REPO", "google/timesfm-2.5-200m-pytorch")
+PER_CORE_BATCH = int(os.getenv("TSFM2_PER_CORE_BATCH", "32"))
 
-APP_PORT = int(os.getenv("PORT", "8080"))
-MODEL_REPO = os.getenv("TIMESFM_REPO", "google/timesfm-2.0-500m-pytorch")
-BACKEND = os.getenv("TIMESFM_BACKEND", "cpu")  # "cpu" | "gpu"
-CONTEXT_LEN = int(os.getenv("TIMESFM_CONTEXT_LEN", "2048"))
+class ForecastIn(BaseModel):
+    closes: List[float]
+    freq: int = Field(0, description="legacy field; ignored by TimesFM 2.5")
+    horizon_steps: int
+    return_quantiles: bool = False
 
-# Build model once on startup
-# Horizon_len은 "최대 필요 길이"로 잡아도 되고, 요청마다 더 짧게 예측해도 됨.
-DEFAULT_H = int(os.getenv("TIMESFM_DEFAULT_H", "128"))
+class Bracket(BaseModel):
+    entry: float
+    long: Optional[Dict[str, float]] = None  # {tp, sl}
+    short: Optional[Dict[str, float]] = None
 
-tfm = timesfm.TimesFm(
-    hparams=timesfm.TimesFmHparams(
-        backend=BACKEND,
-        context_len=CONTEXT_LEN,
-        horizon_len=DEFAULT_H,
-        per_core_batch_size=4,
-        input_patch_len=32,
-        output_patch_len=128,
-        num_layers=50,
-        model_dims=1280,
-        use_positional_embedding=False,
-    ),
-    checkpoint=timesfm.TimesFmCheckpoint(huggingface_repo_id=MODEL_REPO),
-)
+class ProbGateIn(BaseModel):
+    closes: List[float]
+    freq: int = 0
+    dt_sec: int = DT_DEFAULT_SEC
+    horizon_steps: int
+    bracket: Bracket
+    use_quantiles: bool = False  # TimesFM 2.0 quantiles (legacy compatibility)
+    override_sigma: Optional[float] = None  # per-step sigma override
+    atr_now: Optional[float] = None         # ATR for slippage guard
+    n_paths: int = N_PATHS
 
-app = FastAPI()
+class ForecastOut(BaseModel):
+    point: List[float]
+    quantiles: Optional[Dict[str, List[float]]] = None
 
-@app.get("/")
-def root():
-    return {"ok": True, "model": MODEL_REPO, "backend": BACKEND}
+class ProbGateOut(BaseModel):
+    direction: Literal["long","short","hold"]
+    prob: float
+    diagnostics: Dict[str, Any]
+
+app = FastAPI(title="TimesFM2 Cloud Run Service", version="1.0")
+
+# ---- Load model at startup
+def load_tsfm():
+    model = timesfm.TimesFM_2p5_200M_torch()
+    model.load_checkpoint(hf_repo_id=HF_REPO)
+    fc = timesfm.ForecastConfig(
+        max_context=MAX_CONTEXT,
+        max_horizon=MAX_HORIZON,
+        normalize_inputs=True,
+        per_core_batch_size=PER_CORE_BATCH,
+        use_continuous_quantile_head=True,
+        force_flip_invariance=True,
+        infer_is_positive=True,
+        fix_quantile_crossing=True,
+    )
+    model.compile(fc)
+    return model
+
+TSFM = load_tsfm()
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# Precompute quantile names once to avoid per-request loops
+_QUANT_NAMES = [f"q{i}" for i in range(10)]
+
+def _auth(x_api_key: Optional[str]):
+    if API_KEY and (x_api_key or "").strip() != API_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+def _ensure_horizon(horizon_steps: int) -> int:
+    if horizon_steps <= 0:
+        raise HTTPException(400, "horizon_steps must be > 0")
+    max_supported = getattr(TSFM, "forecast_config", None)
+    if max_supported and horizon_steps > max_supported.max_horizon:
+        raise HTTPException(400, f"horizon_steps must be <= {max_supported.max_horizon}")
+    return horizon_steps
+
+def _point_forecast(closes: List[float], freq: int, horizon_steps: int, want_q=False):
+    horizon = _ensure_horizon(horizon_steps)
+    series = [np.array(closes, dtype=np.float32)]
+    point_arr, quant_arr = TSFM.forecast(horizon, series)
+    point = point_arr[0].astype(float).tolist()
+    quants = None
+    if want_q and quant_arr is not None and quant_arr.ndim == 3:
+        q_count = quant_arr.shape[2]
+        names = _QUANT_NAMES[:q_count]
+        quants = {}
+        for idx, name in enumerate(names):
+            quants[name] = quant_arr[0, :horizon, idx].astype(float).tolist()
+    return point, quants
+
+def _sigma_from_data(closes: np.ndarray) -> float:
+    rets = np.diff(closes) / np.maximum(1e-12, closes[:-1])
+    if len(rets) < 20:
+        return float(np.std(rets)) if len(rets) else 0.0
+    return float(np.std(rets[-200:]))
+
+def _sigma_fallback(atr_now: Optional[float], last_price: float) -> float:
+    if atr_now and last_price > 0:
+        return float((atr_now / last_price))
+    return 0.0
+
+def _first_passage_prob(direction: str, entry: float, tp: float, sl: float,
+                        point_path: np.ndarray, sigma_step: float, n_paths: int) -> float:
+    """Monte Carlo first-passage probability using point forecast as drift."""
+    H = len(point_path)
+    if H == 0 or entry <= 0 or tp <= 0 or sl <= 0:
+        return 0.5
+    means = np.empty(H, dtype=np.float32)
+    prev = entry
+    for t in range(H):
+        means[t] = point_path[t] - prev
+        prev = point_path[t]
+    wins = 0
+    for _ in range(max(1, n_paths)):
+        px = entry
+        hit_tp = False
+        hit_sl = False
+        for t in range(H):
+            inc = np.random.normal(loc=means[t], scale=sigma_step * px)
+            px = px + inc
+            if direction == "long":
+                if px >= tp:
+                    hit_tp = True
+                    break
+                if px <= sl:
+                    hit_sl = True
+                    break
+            else:
+                if px <= tp:
+                    hit_tp = True
+                    break
+                if px >= sl:
+                    hit_sl = True
+                    break
+        if hit_tp and (not hit_sl):
+            wins += 1
+    return float(wins / max(1, n_paths))
 
 @app.get("/health")
-@app.get("/healthz")
 def health():
-    return {"status": "ok"}
+    cfg = getattr(TSFM, "forecast_config", None)
+    horizon = cfg.max_horizon if cfg else MAX_HORIZON
+    return {"status": "ok", "model": "timesfm-2.5-200m", "max_horizon": horizon}
 
-def _nearest_quantile_indices(target_qs: List[float], model_qs: List[float]) -> List[int]:
-    # TimesFM 2.0은 "10개 experimental quantile heads"를 제공(범위는 릴리스에 따라 변동 가능)
-    # 실제 사용 가능한 모델 quantile 순서를 timesfm 라이브러리에서 노출하지 않으므로,
-    # forecast 결과 텐서의 마지막 축을 0..n-1로 가정하고 선형 보간 대신 "근접 인덱스" 선택.
-    # 보수적: 사후 캘리브레이션 전제로 사용.
-    idxs = []
-    for tq in target_qs:
-        # 모델이 반환하는 quantile 리스트가 명시되지 않으면 균등격자 가정(예: 0.05..0.95)
-        # 10개라면 [0.05,0.15,...,0.95]로 간주
-        if len(model_qs) == 0:
-            grid = [0.05 + 0.10*i for i in range(10)]
-        else:
-            grid = model_qs
-        nearest = min(range(len(grid)), key=lambda i: abs(grid[i] - tq))
-        idxs.append(nearest)
-    return idxs
+@app.post("/v1/forecast", response_model=ForecastOut)
+def v1_forecast(inp: ForecastIn, x_api_key: Optional[str] = Header(None)):
+    _auth(x_api_key)
+    if len(inp.closes) < 16:
+        raise HTTPException(400, "need >=16 closes")
+    closes = inp.closes[-MAX_CONTEXT:]
+    point, quants = _point_forecast(closes, inp.freq, inp.horizon_steps, inp.return_quantiles)
+    return {"point": point, "quantiles": quants}
 
-@app.post("/predict")
-async def predict(req: Request):
-    """
-    입력 스키마(우리 클라 호환):
-    {
-      "inputs": [{"target":[...]}],
-      "parameters": {"prediction_length": H, "quantiles":[0.05,0.5,0.95]}
-    }
-    출력 스키마(우리 클라 호환, TSFM_ENDPOINT_FIELD="predictions"):
-    {"predictions":[ [q05_list], [q50_list], [q95_list] ]}
-    """
-    body = await req.json()
-    inputs = body.get("inputs") or []
-    params = (body.get("parameters") or {})
-    if not inputs or not isinstance(inputs, list):
-        return JSONResponse({"error": "inputs must be a non-empty list"}, status_code=400)
+@app.post("/v1/prob_gate", response_model=ProbGateOut)
+def v1_prob_gate(inp: ProbGateIn, x_api_key: Optional[str] = Header(None)):
+    _auth(x_api_key)
+    closes = np.array(inp.closes[-MAX_CONTEXT:], dtype=np.float32)
+    if closes.size < 32:
+        raise HTTPException(400, "need >=32 closes")
+    H = int(inp.horizon_steps)
+    point, _ = _point_forecast(closes.tolist(), inp.freq, H, want_q=False)
 
-    series = inputs[0].get("target")
-    if not isinstance(series, list) or len(series) < 16:
-        return JSONResponse({"error": "inputs[0].target must be a numeric list (len>=16)"}, status_code=400)
+    sigma_data = _sigma_from_data(closes)
+    sigma_atr = _sigma_fallback(inp.atr_now, float(closes[-1]))
+    sigma = float(inp.override_sigma if inp.override_sigma is not None else max(sigma_data, sigma_atr, 1e-6))
 
-    H = int(params.get("prediction_length", DEFAULT_H))
-    req_quantiles = params.get("quantiles", [0.05, 0.5, 0.95])
+    entry = float(inp.bracket.entry)
+    res: Dict[str, Any] = {"sigma_step": sigma, "horizon_steps": H}
 
-    # TimesFM 주파수 인디케이터: 0(high: T, MIN, H, D), 1(weekly/monthly), 2(quarterly+)
-    # 우리는 5분봉이므로 0 사용
-    freq_ind = [0]
+    cand = []
+    if inp.bracket.long and inp.bracket.long.get("tp") and inp.bracket.long.get("sl"):
+        pL = _first_passage_prob("long", entry, float(inp.bracket.long["tp"]), float(inp.bracket.long["sl"]),
+                                 np.array(point, dtype=np.float32), sigma, int(inp.n_paths))
+        cand.append(("long", pL))
+        res["prob_long"] = pL
+    if inp.bracket.short and inp.bracket.short.get("tp") and inp.bracket.short.get("sl"):
+        pS = _first_passage_prob("short", entry, float(inp.bracket.short["tp"]), float(inp.bracket.short["sl"]),
+                                 np.array(point, dtype=np.float32), sigma, int(inp.n_paths))
+        cand.append(("short", pS))
+        res["prob_short"] = pS
 
-    # horizon_len은 hparams의 최대치와 달라도 forecast에서 처리 가능
-    # point_forecast: (B, H), experimental_quantile_forecast: (B, H, Q)
-    point_forecast, quantile_forecast = tfm.forecast(
-        [series], freq=freq_ind, horizon_len=H
-    )
+    if not cand:
+        return {"direction": "hold", "prob": 0.5, "diagnostics": res}
 
-    if quantile_forecast is None:
-        # Quantile heads가 비활성인 경우: 정규 근사 생성 (보수적, 후속 캘리브레이션 권장)
-        # sigma 추정은 간략화를 위해 역사적 1-step 절대변동의 IQR 기반으로 근사
-        import numpy as np
-        arr = np.asarray(series, dtype=float)
-        diffs = np.abs(np.diff(arr))
-        if len(diffs) < 8:
-            diffs = np.ones(8) * (arr[-1] * 0.001)  # 긴급 폴백
-        iqr = np.subtract(*np.percentile(diffs, [75, 25]))
-        sigma = (iqr / 1.349) if iqr > 0 else max(np.std(diffs), 1e-6)
-        mu_path = np.repeat(point_forecast[0], H)
-        from scipy.stats import norm
-        out = []
-        for q in req_quantiles:
-            out.append((mu_path + norm.ppf(q) * sigma).tolist())
-        return {"predictions": out}
-
-    # Quantile heads 사용: 마지막 축이 Q(개수≈10). 타겟 분위수에 근접한 인덱스를 고름.
-    # 모델이 제공하는 실제 q그리드를 timesfm에서 노출하지 않으므로 균등격자 가정.
-    Q = quantile_forecast.shape[-1]
-    model_q_grid = [0.05 + 0.10*i for i in range(Q)]  # 예: 10개면 0.05..0.95
-    idxs = _nearest_quantile_indices(req_quantiles, model_q_grid)
-
-    # shape: (B, H, Q) -> (len(req_quantiles), H)
-    selected = []
-    for qi in idxs:
-        selected.append(quantile_forecast[0, :H, qi].tolist())
-
-    return {"predictions": selected}
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
-
+    cand.sort(key=lambda x: x[1], reverse=True)
+    direction, prob = cand[0]
+    return {"direction": direction, "prob": float(max(0.0, min(1.0, prob))), "diagnostics": res}

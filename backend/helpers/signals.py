@@ -55,7 +55,7 @@ try:
         load_symbol_filters, ensure_min_notional, normalize_price_for_side,
         place_market_order, place_limit_order, place_bracket_orders,
         get_position, get_open_orders, get_last_price,
-        replace_stop_loss_to_price, find_recent_exit_fill,
+        replace_stop_loss_to_price, find_recent_exit_fill, find_recent_exit_trade,
         cancel_orders_by_type,
     )  # type: ignore
 except Exception as e:  # pragma: no cover
@@ -121,11 +121,18 @@ USE_CALIBRATED_PROB = str(os.getenv("USE_CALIBRATED_PROB", "true")).lower() in (
 # journaling
 TRADES_CSV = os.path.join(LOG_DIR, "trades.csv")
 
+# risk kill-switch (off by default)
+MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "0"))  # 0=off
+MAX_CONSEC_LOSSES  = int(os.getenv("MAX_CONSEC_LOSSES", "0"))     # 0=off
+MAX_MDD_USD        = float(os.getenv("MAX_MDD_USD", "0"))          # 0=off
+
 # post-only & fee-aware RR gate
 ENTRY_POST_ONLY = str(os.getenv("ENTRY_POST_ONLY", "true")).lower() in ("1","true","yes")
 RR_EVAL_WITH_FEES = str(os.getenv("RR_EVAL_WITH_FEES", "true")).lower() in ("1","true","yes")
 FEE_MAKER_BPS = float(os.getenv("FEE_MAKER_BPS", "2.0"))
 FEE_TAKER_BPS = float(os.getenv("FEE_TAKER_BPS", "4.0"))
+# Economic viability: enforce minimum TP distance in bps (net)
+MIN_TP_BPS_NET = float(os.getenv("MIN_TP_BPS_NET", "12.0"))
 
 # shock guard & MTF & cooldown
 SHOCK_BPS = float(os.getenv("SHOCK_BPS", "30.0"))
@@ -168,6 +175,54 @@ SL_FUDGE_TRANQ = float(os.getenv("SL_FUDGE_TRANQ", "0.90"))
 TP_FUDGE_TURB = float(os.getenv("TP_FUDGE_TURB", "0.90"))
 SL_FUDGE_TURB = float(os.getenv("SL_FUDGE_TURB", "1.10"))
 
+# === TP 최소폭(순이익 하한) 게이트 ===
+def _tp_bps_gate(direction: str, entry: float, tp: float, spread_bps: float) -> Tuple[bool, str, Dict[str, float]]:
+    """
+    True -> 통과, False -> 차단.
+    기준: TP_bps >= max(MIN_TP_BPS_NET, fee_roundtrip_exp_bps + 2*spread_bps + 2bps)
+    - fee 기대값은 저널 기반 maker 확률로 혼합(코드 일관성 유지).
+    """
+    try:
+        min_tp_bps_net = float(os.getenv("MIN_TP_BPS_NET", "12.0"))
+    except Exception:
+        min_tp_bps_net = 12.0
+
+    e = float(entry); t = float(tp)
+    if e <= 0 or t <= 0:
+        return False, "tp_bps_invalid", {"tp_delta_bps": 0.0, "tp_threshold_bps": min_tp_bps_net, "fee_roundtrip_bps": 0.0,
+                                          "maker_prob_est": float(_estimate_p_maker_from_journal()),
+                                          "spread_bps": float(spread_bps), "min_tp_bps_net": float(min_tp_bps_net)}
+
+    if str(direction).lower() == "long":
+        tp_bps = (t - e) / max(1e-12, e) * 1e4
+    else:
+        tp_bps = (e - t) / max(1e-12, e) * 1e4
+
+    # 기대 수수료(bps)
+    p_maker = float(_estimate_p_maker_from_journal())
+    maker = float(FEE_MAKER_BPS)
+    taker = float(FEE_TAKER_BPS)
+    entry_fee = p_maker*maker + (1.0 - p_maker)*taker
+    tp_fee = maker if TP_ORDER_TYPE == "LIMIT" else taker
+    fee_roundtrip = entry_fee + tp_fee
+
+    try:
+        sbps = float(spread_bps)
+    except Exception:
+        sbps = 0.0
+    threshold = max(min_tp_bps_net, fee_roundtrip + 2.0*sbps + 2.0)
+
+    ok = tp_bps >= threshold
+    reason = ("" if ok else f"tp_bps_too_small(tp={tp_bps:.2f}bps<th={threshold:.2f}bps)")
+    meta = {
+        "tp_delta_bps": float(tp_bps),
+        "tp_threshold_bps": float(threshold),
+        "fee_roundtrip_bps": float(fee_roundtrip),
+        "maker_prob_est": float(p_maker),
+        "spread_bps": float(sbps),
+        "min_tp_bps_net": float(min_tp_bps_net),
+    }
+    return ok, reason, meta
 # =====================
 # Dataclass
 # =====================
@@ -716,6 +771,76 @@ def _dt_start_of_today_utc() -> "datetime":
     sod_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
     return sod_local.astimezone(timezone.utc)
 
+def _risk_circuit_tripped() -> tuple[bool, str, dict]:
+    """
+    일일 손익, 연속 손실, 누적 MDD 기준으로 회로차단.
+    활성화: 각 임계값이 >0일 때만 검사.
+    Returns: (tripped, reason, stats)
+    """
+    import csv
+    stats = {"daily_pnl": 0.0, "consec_losses": 0, "mdd": 0.0}
+    try:
+        if not os.path.exists(TRADES_CSV):
+            return (False, "", stats)
+        with open(TRADES_CSV, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        # 1) Daily PnL
+        try:
+            sod_utc = _dt_start_of_today_utc()
+            dp = 0.0
+            for row in rows:
+                ts = _parse_iso(row.get("timestamp", ""))
+                if not ts or ts < sod_utc:
+                    continue
+                if str(row.get("status", "")).lower() == "open":
+                    continue
+                dp += float(row.get("pnl", 0.0) or 0.0)
+            stats["daily_pnl"] = float(dp)
+            if MAX_DAILY_LOSS_USD > 0 and dp <= -abs(MAX_DAILY_LOSS_USD):
+                return True, f"daily_loss({dp:.2f}≤-{abs(MAX_DAILY_LOSS_USD):.2f})", stats
+        except Exception:
+            pass
+
+        # 2) 연속 손실
+        try:
+            consec = 0
+            for row in reversed(rows):
+                if str(row.get("status", "")).lower() == "open":
+                    continue
+                pnl = float(row.get("pnl", 0.0) or 0.0)
+                if pnl <= 0:
+                    consec += 1
+                else:
+                    break
+            stats["consec_losses"] = int(consec)
+            if MAX_CONSEC_LOSSES > 0 and consec >= int(MAX_CONSEC_LOSSES):
+                return True, f"consec_losses({consec}≥{MAX_CONSEC_LOSSES})", stats
+        except Exception:
+            pass
+
+        # 3) 최대 낙폭(MDD)
+        try:
+            s = 0.0
+            peak = 0.0
+            mdd = 0.0
+            for row in rows:
+                if str(row.get("status", "")).lower() == "open":
+                    continue
+                s += float(row.get("pnl", 0.0) or 0.0)
+                peak = max(peak, s)
+                mdd = max(mdd, peak - s)
+            stats["mdd"] = float(mdd)
+            if MAX_MDD_USD > 0 and mdd >= abs(MAX_MDD_USD):
+                return True, f"max_drawdown({mdd:.2f}≥{abs(MAX_MDD_USD):.2f})", stats
+        except Exception:
+            pass
+
+        return (False, "", stats)
+    except Exception as e:
+        logger.info("risk_circuit check failed: %s", e)
+        return (False, "", stats)
+
 def _parse_keep_from(keep_from: Optional[str]) -> Optional["datetime"]:
     if not keep_from:
         return None
@@ -833,7 +958,7 @@ def journal_reset(
 # ---------------------------------
 # Signal generation
 # ---------------------------------# helpers/signals.py — replace this whole function# helpers/signals.py — generate_signal() REPLACE WHOLE FUNCTION
-def generate_signal(symbol: str) -> Dict[str, Any]:
+def generate_signal(symbol: str) -> Optional[Dict[str, Any]]:
     payload, ohlcv, ob = _build_payload(symbol)
     spread_bps_gate = float((payload.get("extra") or {}).get("orderbook_spread", 0.0))
     proceed_basic = should_predict(payload, min_vol_frac_env="MIN_VOL_FRAC") and _spread_ok(spread_bps_gate)
@@ -879,8 +1004,17 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         llm_support = None; llm_resistance = None
     else:
         llm_decision = get_prediction(payload, symbol=symbol)
+        if not llm_decision:
+            log_event("predictor.timeout", symbol=symbol, reason="no_prediction")
+            return None
+        if not isinstance(llm_decision, dict):
+            log_event("predictor.timeout", symbol=symbol, reason="invalid_prediction_schema")
+            return None
+        if llm_decision.get("error"):
+            log_event("predictor.timeout", symbol=symbol, reason=str(llm_decision.get("error")))
+            return None
         direction = str(llm_decision.get("direction") or "").lower()
-        prob_raw = float(llm_decision.get("prob", 0.0))
+        prob_raw = float(llm_decision.get("prob", 0.0) or 0.0)
         llm_support = llm_decision.get("support")
         llm_resistance = llm_decision.get("resistance")
 
@@ -961,6 +1095,15 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
     if ev_perc < EV_MIN_PERC:
         reasons.append(f"ev_below_threshold({ev_perc:.4f}<{EV_MIN_PERC:.4f})")
 
+    # ---- Economic viability gate (expected fees + 2*spread + buffer)
+    meta_tp: Dict[str, float] = {"tp_delta_bps": 0.0, "tp_threshold_bps": 0.0, "fee_roundtrip_bps": 0.0}
+    try:
+        ok_tp, r_tp, meta_tp = _tp_bps_gate(direction, entry, tp, spread_bps)
+        if not ok_tp and r_tp:
+            reasons.append(r_tp)
+    except Exception:
+        pass
+
     # volatility-weighted sizing (risk_scalar)
     risk_scalar = 1.0
     try:
@@ -1025,6 +1168,9 @@ def generate_signal(symbol: str) -> Dict[str, Any]:
         "rsi_1h": float(r1h),
         "rsi_4h": float(r4h),
         "mtf_ok": bool(mtf_ok),
+        "tp_delta_bps": float(meta_tp.get("tp_delta_bps", 0.0)),
+        "tp_threshold_bps": float(meta_tp.get("tp_threshold_bps", 0.0)),
+        "fee_roundtrip_bps": float(meta_tp.get("fee_roundtrip_bps", 0.0)),
     }
 
     out = {
@@ -1083,7 +1229,7 @@ def _limit_price_for_side(symbol: str, side: str, desired_entry: float, prev_sub
         px = normalize_price_for_side(symbol, px, side=side)
     return float(px)
 
-def _reset_brackets(symbol: str, side: str, tp: float, sl: float) -> Dict[str, Any]:
+def _reset_brackets_old(symbol: str, side: str, tp: float, sl: float) -> Dict[str, Any]:
     """
     기존 TP/SL(RO) 전부 취소 후, '현재 포지션 잔고' 전량 기준으로 브래킷(TP/SL) 1쌍만 재배치.
     side: 엔트리 방향("BUY"/"SELL") 그대로 전달.
@@ -1178,10 +1324,15 @@ def _enter_limit_then_brackets(symbol: str, side: str, qty: float,
         try:
             if BRACKETS_RESET_ON_FILL:
                 # 전량 기준 1쌍만 배치
-                brackets = _reset_brackets(symbol, side, tp, sl)
+                b = _reset_brackets(symbol, side, tp, sl)
+                if isinstance(b, dict) and b.get("skipped"):
+                    brackets = place_bracket_orders(symbol, side, quantity=float(filled), take_profit=float(tp), stop_loss=float(sl))
+                    log_event("brackets.reset.fallback_qty", symbol=symbol, qty=float(filled), tp=float(tp), sl=float(sl))
+                else:
+                    brackets = b
             else:
                 # 기존 동작(추가 누적) 유지 옵션
-                brackets = place_bracket_orders(symbol, side, filled, take_profit=tp, stop_loss=sl)
+                brackets = place_bracket_orders(symbol, side, quantity=float(filled), take_profit=float(tp), stop_loss=float(sl))
         except Exception as e:
             logger.info("placing brackets failed: %s", e)
     fill_px = 0.0
@@ -1237,7 +1388,7 @@ def _current_stop_price(symbol: str) -> Optional[float]:
     mid = sl_prices[len(sl_prices)//2]
     return float(mid)
 
-def _close_position_market(symbol: str) -> Optional[dict]:
+def _close_position_market_old(symbol: str) -> Optional[dict]:
     try:
         p = get_position(symbol) or {}
         amt = float(p.get("positionAmt") or p.get("positionAmount") or 0.0)
@@ -1356,46 +1507,75 @@ def _reconcile_open_from_gcs(symbol: str, max_scan: int = 500) -> bool:
         logger.info("reconcile_from_gcs failed for %s: %s", symbol, e)
         return False
 
+def _atomic_write(path: str, data: str) -> None:
+    from pathlib import Path
+    import tempfile
+    dst = Path(path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=str(dst.parent)) as tf:
+        tf.write(data)
+        tmp = tf.name
+    Path(tmp).replace(dst)
+
+def _lock_file(path: str):
+    """문맥 관리자: POSIX(fcntl)/Windows(msvcrt) 파일락. 실패 시 no-op."""
+    try:
+        import fcntl  # type: ignore
+        class _Lock:
+            def __init__(self, p): self.p = p; self.f = None
+            def __enter__(self):
+                self.f = open(self.p, "a+", encoding="utf-8")
+                fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
+                self.f.seek(0)
+                return self.f
+            def __exit__(self, exc_type, exc, tb):
+                try: fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+                finally: self.f.close()
+        return _Lock(path)
+    except Exception:
+        try:
+            import msvcrt  # type: ignore
+        except Exception:
+            msvcrt = None  # type: ignore
+        class _Lock:
+            def __init__(self, p): self.p = p; self.f = None
+            def __enter__(self):
+                self.f = open(self.p, "a+", encoding="utf-8")
+                if msvcrt is not None:
+                    try: msvcrt.locking(self.f.fileno(), msvcrt.LK_LOCK, 1)
+                    except Exception: pass
+                self.f.seek(0)
+                return self.f
+            def __exit__(self, exc_type, exc, tb):
+                if msvcrt is not None:
+                    try: msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+                    except Exception: pass
+                self.f.close()
+        return _Lock(path)
+
 def _rewrite_trades_csv(rows: list, pref_headers: Optional[list] = None) -> None:
     """
-    Rewrite trades.csv atomically using a temp file in the same directory,
-    then replace(). Headers follow the existing preference order.
+    파일락 하에서 CSV 전체를 원자적으로 재기록한다.
     """
     keys = set()
-    for r in rows:
-        keys.update(r.keys())
+    for r in rows: keys.update(r.keys())
     base = [
         "timestamp","symbol","side","qty","entry","entry_intent","tp","sl",
         "exit","pnl","status","id","prob","rr","entry_maker","tp_type","mode",
         "reprices","used_market_fallback","post_only","spread_bps","atr_now",
         "funding_pct","maker_prob_est","rr_gate_mode","reasons","close_reason",
         "size_mode","bal_asset","notional","bal_pct","exit_ts",
-        "prob_raw","prob_cal","ev_perc","ev_usd",
-        "ev_ex_ante_perc","ev_ex_ante_usd"
+        "prob_raw","prob_cal","ev_perc","ev_usd","ev_ex_ante_perc","ev_ex_ante_usd"
     ]
-    headers = [k for k in (pref_headers or base) if k in keys] + [
-        k for k in sorted(keys) if k not in (pref_headers or base)
-    ]
-    import csv, os, tempfile
-    from pathlib import Path
-    dst = Path(TRADES_CSV)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    # write to a temp file in the same directory for atomic replace
-    with tempfile.NamedTemporaryFile("w", newline="", delete=False, encoding="utf-8", dir=str(dst.parent)) as tf:
-        tmp_path = Path(tf.name)
-        w = csv.DictWriter(tf, fieldnames=headers)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-    try:
-        tmp_path.replace(dst)
-    except Exception:
-        # fallback to direct write if replace fails
-        with open(dst, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers)
-            w.writeheader()
-            for r in rows:
-                w.writerow(r)
+    headers = [k for k in (pref_headers or base) if k in keys] + [k for k in sorted(keys) if k not in (pref_headers or base)]
+    import csv, io
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=headers)
+    w.writeheader()
+    for r in rows: w.writerow(r)
+    text = buf.getvalue()
+    with _lock_file(TRADES_CSV):
+        _atomic_write(TRADES_CSV, text)
 # helpers/signals.py — replace _journal_close_last() body with the following edits near 'r.update({...})'
 def _journal_close_last(symbol: str, exit_price: float, reason: str) -> bool:
     idx, ts_ms, rows = _last_open_row_index_and_ts(symbol)
@@ -1445,6 +1625,21 @@ def _journal_close_last(symbol: str, exit_price: float, reason: str) -> bool:
     except Exception as e:
         logger.info("journal close failed: %s", e); return False
 
+def _find_recent_exit(symbol: str, since_ms: int, back_ms: Optional[int]) -> Optional[Dict[str, Any]]:
+    """
+    1차: 주문 히스토리(find_recent_exit_fill) → 2차: 체결 이력(find_recent_exit_trade) 폴백
+    """
+    try:
+        info = find_recent_exit_fill(symbol, since_ms=int(since_ms), back_ms=back_ms)
+        if info:
+            return info
+    except Exception:
+        pass
+    try:
+        return find_recent_exit_trade(symbol, since_ms=int(since_ms), back_ms=back_ms)
+    except Exception:
+        return None
+
 def _settle_by_orders(symbol: str) -> bool:
     idx, ts_ms, rows = _last_open_row_index_and_ts(symbol)
     if idx is None or ts_ms is None:
@@ -1459,7 +1654,7 @@ def _settle_by_orders(symbol: str) -> bool:
         back_ms = int(os.getenv("EXIT_SEARCH_BACK_MS", "10800000"))
     except Exception:
         back_ms = 10800000
-    info = find_recent_exit_fill(symbol, since_ms=int(ts_ms), back_ms=back_ms)
+    info = _find_recent_exit(symbol, since_ms=int(ts_ms), back_ms=back_ms)
     if not info or not info.get("price"):
         log_event("settle.no_exit_found", symbol=symbol, since_ms=int(ts_ms), back_ms=back_ms)
         return False
@@ -1473,6 +1668,22 @@ def maintain_positions(symbol: str) -> Dict[str, Any]:
         # NEW: 주기 태스크에서도 필요 시 복원
         if JOURNAL_SYNC_ON_START:
             _journal_restore_from_gcs_if_needed()
+
+        # 위험 회로차단: 일중 손실/연속 손실/누적 MDD 초과 시 거래 중지
+        tripped, reason_kill, kstats = _risk_circuit_tripped()
+        if tripped:
+            entry_guess = 0.0
+            try:
+                entry_guess = float(get_last_price(symbol) or 0.0)
+            except Exception:
+                pass
+            return {
+                "symbol": symbol, "action": "hold", "direction": "hold",
+                "entry": entry_guess, "tp": 0.0, "sl": 0.0, "prob": 0.5,
+                "risk_ok": False, "rr": 0.0,
+                "reason": f"risk_circuit_tripped:{reason_kill}",
+                "risk_stats": kstats,
+            }
 
         if _time_barrier_due(symbol):
             od = _close_position_market(symbol)
@@ -1560,6 +1771,30 @@ def maintain_positions(symbol: str) -> Dict[str, Any]:
                     log_event("cleanup.brackets_cancelled", symbol=symbol, reason="dedupe_no_levels")
                 except Exception as e:
                     logger.info("cleanup cancel failed for %s: %s", symbol, e)
+
+        # --- heal: TP 또는 SL 누락 시 복구 ---
+        if (tp_cnt == 0 or sl_cnt == 0):
+            tp_val, sl_val = None, None
+            try:
+                idx, _, rows = _last_open_row_index_and_ts(symbol)
+                if idx is not None:
+                    last = rows[idx]
+                    tp_val = float(last.get("tp") or 0.0) or None
+                    sl_val = float(last.get("sl") or 0.0) or None
+            except Exception:
+                tp_val, sl_val = None, None
+
+            # 현재 포지션 방향 추정
+            try:
+                p = get_position(symbol) or {}
+                amt2 = float(p.get("positionAmt") or p.get("positionAmount") or 0.0)
+                side2 = "BUY" if amt2 > 0 else "SELL"
+            except Exception:
+                side2 = "BUY"
+
+            if tp_val and sl_val:
+                _reset_brackets(symbol, side2, tp_val, sl_val)
+                log_event("heal.brackets_missing_placed", symbol=symbol, tp=tp_val, sl=sl_val, tp_cnt=tp_cnt, sl_cnt=sl_cnt)
         return {"action": "none"}
     except Exception as e:
         logger.info("maintain_positions error for %s: %s", symbol, e)
@@ -1609,13 +1844,33 @@ def _compute_ev_perc(prob: float, direction: str, entry: float, tp: float, sl: f
 # ---------------------------------
 # Manage trade (entry + journaling)
 # ---------------------------------# helpers/signals.py — REPLACE WHOLE FUNCTION manage_trade()
+# helpers/signals.py — REPLACE WHOLE FUNCTION manage_trade()
 def manage_trade(symbol: str) -> Dict[str, Any]:
     try:
-        # NEW: 필요 시 부팅 직후 복원
+        # 필요 시 부팅 직후 복원
         if JOURNAL_SYNC_ON_START:
             _journal_restore_from_gcs_if_needed()
 
+        # 위험 회로차단
+        tripped, reason_kill, kstats = _risk_circuit_tripped()
+        if tripped:
+            entry_guess = 0.0
+            try:
+                entry_guess = float(get_last_price(symbol) or 0.0)
+            except Exception:
+                pass
+            return {
+                "symbol": symbol, "action": "hold", "direction": "hold",
+                "entry": entry_guess, "tp": 0.0, "sl": 0.0, "prob": 0.5,
+                "risk_ok": False, "rr": 0.0,
+                "reason": f"risk_circuit_tripped:{reason_kill}",
+                "risk_stats": kstats,
+            }
+
         sig = generate_signal(symbol)
+        if not sig:
+            log_event("trade.skip", symbol=symbol, reason="predictor_timeout")
+            return {"symbol": symbol, "action": "skip", "reason": "predictor_timeout"}
         if "result" not in sig or not isinstance(sig["result"], dict):
             return {"symbol": symbol, "error": "no_signal"}
 
@@ -1633,13 +1888,13 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         reason = sig.get("reason", "")
         risk_scalar = float(res.get("risk_scalar", 1.0)) if "risk_scalar" in res else float(res.get("risk_scalar", 1.0))
 
-        # 0) 기본 유효성
+        # 기본 유효성
         if direction not in ("long","short") or not risk_ok or entry_intent <= 0 or tp <= 0 or sl <= 0:
             return {"symbol": symbol, "action": "hold", "direction": direction,
                     "entry": entry_intent, "tp": tp, "sl": sl, "prob": prob,
                     "risk_ok": False, "rr": rr, "reason": reason or "no_trade_conditions"}
 
-        # 1) MIN_PROB 보수적 재검사 + EV override 정합
+        # MIN_PROB 재검사 + EV override 정합
         MIN_PROB_LOCAL = float(os.getenv("MIN_PROB", "0.60"))
         EV_OVERRIDE_ENABLED = str(os.getenv("EV_OVERRIDE_ENABLED", "true")).lower() in ("1","true","yes")
         EV_OVERRIDE_MIN_PERC = float(os.getenv("EV_OVERRIDE_MIN_PERC", "0.0005"))
@@ -1660,7 +1915,7 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                     "entry": entry_intent, "tp": tp, "sl": sl, "prob": prob,
                     "risk_ok": False, "rr": rr, "reason": "prob_below_threshold"}
 
-        # 2) 포지션/레버리지/마진 모드 셋업 (best-effort)
+        # 포지션/레버리지/마진 모드
         try: set_position_mode(POSITION_MODE)
         except Exception as e: logger.warning("set_position_mode: %s", e)
         try: set_margin_type(symbol, MARGIN_TYPE)
@@ -1668,17 +1923,23 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
         try: set_leverage(symbol, DEFAULT_LEVERAGE)
         except Exception as e: logger.warning("set_leverage: %s", e)
 
-        # 3) 사이징
+        # 사이징
         qty, size_meta = _compute_size(symbol, entry_intent, sl, risk_scalar)
         side = "BUY" if direction == "long" else "SELL"
 
-        # 4) 집행 (LIMIT 우선 → TTL/reprice → MARKET 폴백)
+        # 집행 (LIMIT 우선 → TTL/reprice → MARKET 폴백)
         if ENTRY_MODE == "MARKET":
             entry_res = place_market_order(symbol, side, quantity=qty)
             brackets = {"take_profit": None, "stop_loss": None}
             try:
                 if BRACKETS_RESET_ON_FILL:
-                    brackets = _reset_brackets(symbol, side, tp, sl)
+                    b = _reset_brackets(symbol, side, tp, sl)
+                    if isinstance(b, dict) and b.get("skipped"):
+                        # 가시성 레이스 시 즉시 '요청 수량' 폴백
+                        brackets = place_bracket_orders(symbol, side, quantity=qty, take_profit=tp, stop_loss=sl)
+                        log_event("brackets.reset.fallback_qty", symbol=symbol, qty=float(qty), tp=float(tp), sl=float(sl))
+                    else:
+                        brackets = b
                 else:
                     brackets = place_bracket_orders(symbol, side, quantity=qty, take_profit=tp, stop_loss=sl)
             except Exception as e:
@@ -1690,7 +1951,25 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
             exec_res = _enter_limit_then_brackets(symbol, side, qty, desired_entry=entry_intent, tp=tp, sl=sl)
             mode = "LIMIT"
 
-        # 5) 엔트리 체결가 보정
+        # === ABORT_IF_NO_FILL: 미체결이면 저널에 open 행 쓰지 않고 종료 ===
+        filled_qty = 0.0
+        try:
+            filled_qty = float(exec_res.get("filled_qty", 0.0) or 0.0)
+        except Exception:
+            filled_qty = 0.0
+
+        if filled_qty <= 0.0:
+            try:
+                cancel_open_orders(symbol)
+            except Exception:
+                pass
+            log_event("entry.aborted_not_filled", symbol=symbol, mode=mode,
+                      entry_intent=float(entry_intent), tp=float(tp), sl=float(sl))
+            return {"symbol": symbol, "action": "hold", "direction": direction,
+                    "entry": entry_intent, "tp": tp, "sl": sl, "prob": prob,
+                    "risk_ok": False, "rr": rr, "reason": "entry_not_filled_no_journal"}
+
+        # 엔트리 체결가 보정
         entry_actual = float(exec_res.get("entry_price") or 0.0)
         if entry_actual <= 0:
             try:
@@ -1699,15 +1978,15 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
             except Exception:
                 entry_actual = entry_intent
 
-        # 6) EV 로깅(Ex-ante)
+        # EV 로깅(Ex-ante)
         try:
             ev_perc2 = _compute_ev_perc(prob_cal, direction, entry_intent, tp, sl)
-            ev_usd  = ev_perc2 * float(size_meta.get('notional', float(qty*entry_intent)))
+            ev_usd  = ev_perc2 * float(size_meta.get('notional', float(filled_qty*entry_intent)))
             row = {
                 "timestamp": _now_utc().isoformat(),
                 "symbol": symbol,
                 "side": "long" if side == "BUY" else "short",
-                "qty": f"{float(exec_res.get('filled_qty') or qty):.10f}",
+                "qty": f"{float(filled_qty):.10f}",
                 "entry": f"{float(entry_actual):.10f}",
                 "entry_intent": f"{float(entry_intent):.10f}",
                 "tp": f"{float(tp):.10f}",
@@ -1735,7 +2014,7 @@ def manage_trade(symbol: str) -> Dict[str, Any]:
                 "close_reason": "",
                 "size_mode": str(size_meta.get("size_mode","")),
                 "bal_asset": str(size_meta.get("bal_asset","")),
-                "notional": f"{float(size_meta.get('notional', float(qty*entry_intent))):.10f}",
+                "notional": f"{float(size_meta.get('notional', float(filled_qty*entry_intent))):.10f}",
                 "bal_pct": f"{float(size_meta.get('bal_pct', 0.0)):.6f}",
                 "ev_perc": f"{float(ev_perc2):.10f}",
                 "ev_usd":  f"{float(ev_usd):.10f}",
@@ -1776,16 +2055,16 @@ def _journal_append_open(row: Dict[str, Any]) -> None:
     row.setdefault("ev_ex_ante_perc", row.get("ev_perc",""))
     row.setdefault("ev_ex_ante_usd",  row.get("ev_usd",""))
     if "exit_ts" not in row: row["exit_ts"] = ""
-    if not os.path.exists(TRADES_CSV):
-        with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers); w.writeheader(); w.writerow(row); return
-    with open(TRADES_CSV, "r", encoding="utf-8") as f:
-        r = csv.DictReader(f); old_rows = list(r); old_headers = r.fieldnames or []
-    if set(old_headers) == set(headers):
-        with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers); w.writerow(row)
-    else:
-        old_rows.append(row); _rewrite_trades_csv(old_rows, pref_headers=headers)
+
+    # 파일락 범위에서 현재 파일을 읽고 행을 추가한 뒤 전체 재기록
+    with _lock_file(TRADES_CSV):
+        old_rows = []
+        if os.path.exists(TRADES_CSV):
+            with open(TRADES_CSV, "r", encoding="utf-8") as f:
+                r = csv.DictReader(f)
+                old_rows = list(r)
+        old_rows.append(row)
+        _rewrite_trades_csv(old_rows, pref_headers=headers)
 
 # === NEW: export to app.py ===
 def get_overview() -> Dict[str, Any]:
@@ -1795,6 +2074,74 @@ def get_overview() -> Dict[str, Any]:
     except Exception as e:
         logger.info("get_overview passthrough failed: %s", e)
         return {"balances": [], "positions": []}
+
+# --- Safe helpers appended: TP/SL race hardening and time-exit close ---
+def _position_qty_with_retry(symbol: str, attempts: int = 8, sleep_ms: int = 250) -> float:
+    from time import sleep
+    for _ in range(max(1, int(attempts))):
+        try:
+            pos = get_position(symbol) or {}
+            amt = float(pos.get("positionAmt") or pos.get("positionAmount") or 0.0)
+            q = abs(amt)
+        except Exception:
+            q = 0.0
+        if q > 1e-12:
+            return q
+        sleep(max(1, int(sleep_ms)) / 1000.0)
+    return 0.0
+
+def _reset_brackets(symbol: str, side: str, tp: float, sl: float) -> Dict[str, Any]:
+    """
+    기존 TP/SL(RO) 전부 취소 후, '현재 포지션 잔고' 전량 기준으로 브래킷(TP/SL) 1쌍만 재배치.
+    side: 엔트리 방향("BUY"/"SELL") 그대로 전달.
+    """
+    # 1) 기존 브래킷류 취소
+    try:
+        cancel_orders_by_type(symbol, ["TAKE_PROFIT", "TAKE_PROFIT_MARKET", "STOP", "STOP_MARKET"])
+        log_event("brackets.reset.cancelled", symbol=symbol)
+    except Exception as e:
+        logger.info("brackets cancel failed for %s: %s", symbol, e)
+
+    # 2) 현재 포지션 잔고 조회(재시도 포함)
+    qty = _position_qty_with_retry(symbol, attempts=8, sleep_ms=250)
+
+    if qty <= 1e-12:
+        # 관측성 강화: 재시도 후에도 포지션 미가시 → 상위에서 '요청 수량' 폴백을 선택할 수 있게 신호 반환
+        log_event("brackets.reset.skip", symbol=symbol, reason="no_position_after_retry")
+        return {"take_profit": None, "stop_loss": None, "skipped": True, "reason": "no_position_after_retry"}
+
+    # 3) 브래킷 1쌍 재배치
+    out = place_bracket_orders(symbol, side, qty, take_profit=float(tp), stop_loss=float(sl))
+    log_event("brackets.reset.placed", symbol=symbol, qty=float(qty), tp=float(tp), sl=float(sl))
+    return out if isinstance(out, dict) else {"raw": out}
+
+def _close_position_market(symbol: str) -> Optional[dict]:
+    try:
+        p = get_position(symbol) or {}
+        amt = float(p.get("positionAmt") or p.get("positionAmount") or 0.0)
+        if abs(amt) <= 1e-12:
+            return None
+        side = "SELL" if amt > 0 else "BUY"
+        try:
+            # 1차: 현 설정값 그대로
+            res = place_market_order(symbol, side, quantity=abs(amt), reduce_only=True)
+        except Exception as e1:
+            # 2차: 모드 의심 → position_side='BOTH' 강제
+            logger.info("time_exit primary close failed for %s: %s; retry with position_side=BOTH", symbol, e1)
+            try:
+                res = place_market_order(symbol, side, quantity=abs(amt), reduce_only=True, position_side_override="BOTH")
+            except Exception as e2:
+                logger.info("time_exit close failed for %s: %s", symbol, e2)
+                return None
+        try:
+            cancel_open_orders(symbol)
+        except Exception:
+            pass
+        log_event("time_exit", symbol=symbol, positionAmt=amt, side=side)
+        return res if isinstance(res, dict) else {"raw": res}
+    except Exception as e:
+        logger.info("time_exit close failed for %s: %s", symbol, e)
+        return None
 
 # Public exports
 __all__ = [
@@ -1806,3 +2153,6 @@ __all__ = [
     "preview_size",
     "journal_reset",
 ]
+
+
+
