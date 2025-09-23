@@ -474,6 +474,13 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     price_seq = compute_recent_price_sequence(ohlcv, n=10) if _df_ok(ohlcv) else [0.0] * 10
     atr5_series = compute_atr(ohlcv, window=14) if _df_ok(ohlcv) else None
     atr5 = float(atr5_series.iloc[-1]) if getattr(atr5_series, "size", 0) else 0.0
+        # --- (NEW) 15m ATR for TSFM base-tf=15m ---
+    try:
+        ohlcv15 = fetch_ohlcv(symbol, interval="15m", limit=200)
+        atr15_series = compute_atr(ohlcv15, window=14) if _df_ok(ohlcv15) else None
+        atr15 = float(atr15_series.iloc[-1]) if getattr(atr15_series, "size", 0) else 0.0
+    except Exception:
+        atr15 = 0.0
 
     sr5 = {
         "recent_high": float(ohlcv["high"].tail(50).max()) if _df_ok(ohlcv) else 0.0,
@@ -493,6 +500,7 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     entry = float(last.get("close", 0.0))
     extra_common = {
         "ATR_5m": float(atr5),
+        "ATR_15m": float(atr15),
         "relative_volume_5m": float(compute_relative_volume(ohlcv)) if _df_ok(ohlcv) else 1.0,
         "recent_high_5m": sr5["recent_high"],
         "recent_low_5m": sr5["recent_low"],
