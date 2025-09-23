@@ -1,0 +1,27 @@
+# cron.yaml
+cron:
+- description: "Auto trade every 5 minutes"
+  url: /tasks/trader
+  schedule: every 5 minutes
+  timezone: Asia/Seoul
+
+- description: "Maintain positions (BE trail / time barrier)"
+  url: /tasks/maintain
+  schedule: every 1 minutes
+  timezone: Asia/Seoul
+
+- description: "Calibrate probability curve (daily)"
+  url: /tasks/calibrate
+  schedule: every day 03:40
+  timezone: Asia/Seoul
+
+- description: "Journal checkpoint backup"
+  url: /tasks/journal_sync
+  schedule: every 10 minutes
+  timezone: Asia/Seoul
+
+# 'restore'는 수동 트리거 권장(자동 예약은 비활성 또는 아주 드물게)
+# - description: "Journal checkpoint restore (seldom; manual trigger preferred)"
+#   url: /tasks/journal_sync?mode=restore
+#   schedule: every 24 hours
+#   timezone: Asia/Seoul

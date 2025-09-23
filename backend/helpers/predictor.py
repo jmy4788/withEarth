@@ -1,0 +1,397 @@
+# helpers/predictor.py
+from __future__ import annotations
+"""
+helpers/predictor.py — Gemini schema gen + hardened JSON recovery (2025-08-20, KST)
+
+공개 API(변경 없음)
+- get_gemini_prediction(payload: dict, symbol: str = "") -> dict
+- should_predict(payload_or_df, min_vol_frac_env="MIN_VOL_FRAC") -> bool
+
+주요 개선
+- 스키마 강제 → JSON/plain → text→JSON, 3단계 복구 플로우 견고화
+- direction 정규화(buy/sell -> long/short), prob [0,1] 클램프, SR NaN 방어
+- 로깅/디버깅: payload_preview 최소화 + full payload 스냅샷 저장 유지
+"""
+
+from typing import Any, Dict, Optional, List, Union
+import base64, json, logging, os
+from datetime import datetime, timezone
+
+_GENAI_OK = True
+try:
+    from google import genai
+    from google.genai import types
+except Exception:
+    _GENAI_OK = False
+
+try:
+    from .utils import get_secret, LOG_DIR, log_event  # type: ignore
+except Exception:  # pragma: no cover
+    def get_secret(name: str) -> Optional[str]: return os.getenv(name)
+    LOG_DIR = os.path.join(os.getcwd(), "logs")
+    def log_event(*args, **kwargs): pass
+
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
+TEMPERATURE: float = float(os.getenv("G_TEMPERATURE", "0.0"))
+MAX_TOKENS: int = int(os.getenv("G_MAX_TOKENS", "512"))
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# ---------------- Debug I/O ----------------
+def _mk_debug_dir() -> str:
+    d = os.path.join(LOG_DIR, "payloads", datetime.now(tz=timezone.utc).strftime("%Y%m%d"))
+    os.makedirs(d, exist_ok=True); return d
+def _save_json(obj: Any, fname: str) -> None:
+    try:
+        path = os.path.join(_mk_debug_dir(), fname)
+        with open(path, "w", encoding="utf-8") as f: json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception as e: logger.info("save_json failed: %s", e)
+def _dump_debug(name: str, content: Any) -> None:
+    ts = datetime.now(tz=timezone.utc).strftime("%H%M%S")
+    try: _save_json(content, f"{ts}_{name}.json")
+    except Exception: pass
+
+# ---------------- Prompt & schema ----------------
+def _system_note() -> str:
+    return (
+        "You are a cautious crypto futures signal assistant.\n"
+        "Use ONLY numeric features from the provided JSON.\n"
+        "Return exactly ONE JSON object matching the schema.\n"
+        "Semantics:\n"
+        "- We provide explicit bracket levels: entry, and for each direction {long, short}, a TP and SL.\n"
+        "- If you choose 'direction' = long, 'prob' must be the probability that, within 'horizon_min' minutes,\n"
+        "  the LONG bracket's TP is reached BEFORE its SL. If you choose 'short', use the SHORT bracket.\n"
+        "- Use the provided bracket numbers EXACTLY; do not invent or renormalize TP/SL.\n"
+        "- Report 'prob' as a NUMBER in [0,1] with two decimal places when possible.\n"
+        "- Do not invent data; do not output text beyond JSON."
+    )
+
+def _user_intro(payload: Dict[str, Any]) -> str:
+    pair = payload.get("pair", "")
+    hz = payload.get("horizon_min", 30)
+    b = payload.get("bracket", {}) or {}
+    entry = b.get("entry", (payload.get("entry_5m") or {}).get("close", 0.0))
+    bl = b.get("long", {}) or {}
+    bs = b.get("short", {}) or {}
+    spread = (payload.get("extra") or {}).get("orderbook_spread", 0.0)
+    rsi = (payload.get("entry_5m") or {}).get("rsi", 50.0)
+    return (
+        f"Pair={pair}, horizon_min={hz}, spread_bps={spread}, rsi_5m={rsi}. "
+        f"Bracket: entry={entry}, long(tp={bl.get('tp',0.0)}, sl={bl.get('sl',0.0)}), short(tp={bs.get('tp',0.0)}, sl={bs.get('sl',0.0)}). "
+        "Return probability for the chosen direction's bracket."
+    )
+
+def _response_schema() -> "types.Schema":
+    # _GENAI_OK일 때만 사용됨
+    return types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "direction": types.Schema(type=types.Type.STRING, enum=["long","short","hold"]),
+            "prob": types.Schema(type=types.Type.NUMBER),
+            "reasoning": types.Schema(type=types.Type.STRING),
+            "support": types.Schema(type=types.Type.NUMBER),
+            "resistance": types.Schema(type=types.Type.NUMBER),
+        },
+        required=["direction","prob"],
+    )
+
+# ---------------- Helpers: JSON recovery & sanitation ----------------
+def _safe_json_extract(text: str) -> Optional[Dict[str, Any]]:
+    if not text: return None
+    start = text.find("{")
+    if start < 0: return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{": depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try: return json.loads(text[start:i+1])
+                except Exception: return None
+    return None
+
+def _parts_to_json(resp: Any) -> Optional[Dict[str, Any]]:
+    try:
+        cands = getattr(resp, "candidates", []) or (resp.get("candidates", []) if isinstance(resp, dict) else [])
+        for c in cands:
+            content = getattr(c, "content", None) or (c.get("content") if isinstance(c, dict) else None)
+            parts = getattr(content, "parts", None) or (content.get("parts", []) if isinstance(content, dict) else [])
+            for p in parts or []:
+                text = getattr(p, "text", None) if hasattr(p, "text") else (p.get("text") if isinstance(p, dict) else None)
+                if text and str(text).strip():
+                    obj = _safe_json_extract(str(text)); 
+                    if obj: return obj
+                idata = getattr(p, "inline_data", None) if hasattr(p, "inline_data") else (p.get("inline_data") if isinstance(p, dict) else None)
+                if idata:
+                    mime = getattr(idata, "mime_type", "") if hasattr(idata, "mime_type") else idata.get("mime_type","")
+                    data = getattr(idata, "data", b"") if hasattr(idata, "data") else idata.get("data","")
+                    if mime == "application/json" and data:
+                        try: return json.loads(base64.b64decode(data).decode("utf-8","ignore"))
+                        except Exception: pass
+        return None
+    except Exception:
+        return None
+
+def _coerce_direction(x: Any) -> str:
+    try:
+        s = str(x or "").strip().lower()
+    except Exception:
+        return "hold"
+    if s in ("long", "buy", "bull", "up"): return "long"
+    if s in ("short", "sell", "bear", "down"): return "short"
+    if s in ("hold", "flat", "neutral"): return "hold"
+    return "hold"
+
+def _sanitize_decision(d: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    out["direction"] = _coerce_direction(d.get("direction", "hold"))
+    # Accept prob in [0,1] and optionally prob_pct in [0,100]
+    p: float
+    try:
+        if d.get("prob_pct") is not None:
+            p = float(d.get("prob_pct", 0.0)) / 100.0
+        else:
+            p = float(d.get("prob", 0.5))
+            if p > 1.0 and p <= 100.0:
+                p = p / 100.0
+    except Exception:
+        p = 0.5
+    out["prob"] = max(0.0, min(1.0, float(p)))
+    out["reasoning"] = str(d.get("reasoning",""))[:800]
+    # SR 정리
+    for k in ("support","resistance"):
+        try:
+            v = d.get(k)
+            out[k] = float(v) if v is not None else 0.0
+        except Exception:
+            out[k] = 0.0
+    return out
+
+# ---------------- Client & configs ----------------
+def _get_client() -> Optional["genai.Client"]:
+    if not _GENAI_OK: return None
+    api_key = get_secret("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        logger.warning("GOOGLE_API_KEY not configured.")
+        return None
+    try:
+        return genai.Client(api_key=api_key)
+    except Exception as e:
+        logger.info("genai.Client init failed: %s", e)
+        return None
+
+def _contents(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [{"role": "user", "parts": [{"text": _user_intro(payload)}, {"text": "DATA_JSON:\n" + json.dumps(payload, ensure_ascii=False, separators=(",",":"))}]}]
+
+def _cfg_json_schema() -> "types.GenerateContentConfig":
+    # _GENAI_OK일 때만 호출됨
+    return types.GenerateContentConfig(
+        temperature=TEMPERATURE, max_output_tokens=MAX_TOKENS, top_p=0, top_k=1,
+        response_mime_type="application/json", response_schema=_response_schema(),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="NONE")),
+        system_instruction=_system_note(),
+    )
+
+def _cfg_json_plain() -> "types.GenerateContentConfig":
+    return types.GenerateContentConfig(
+        temperature=0, max_output_tokens=min(384, MAX_TOKENS), top_p=0, top_k=1,
+        response_mime_type="application/json",
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="NONE")),
+        system_instruction=_system_note(),
+    )
+
+def _cfg_text_plain() -> "types.GenerateContentConfig":
+    return types.GenerateContentConfig(
+        temperature=0, max_output_tokens=min(384, MAX_TOKENS), top_p=0, top_k=1,
+        response_mime_type="text/plain",
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="NONE")),
+        system_instruction=_system_note(),
+    )
+
+# ---------------- Generation strategies ----------------
+def _generate_with_schema(client: "genai.Client", payload: Dict[str, Any]) -> Dict[str, Any]:
+    resp = client.models.generate_content(model=MODEL, contents=_contents(payload), config=_cfg_json_schema())
+    raw = getattr(resp, "output_text", "") or ""
+    if raw.strip():
+        try: return json.loads(raw)
+        except Exception: pass
+    obj = _parts_to_json(resp); return obj or {}
+
+def _generate_json_plain(client: "genai.Client", payload: Dict[str, Any]) -> Dict[str, Any]:
+    resp = client.models.generate_content(model=MODEL, contents=_contents(payload), config=_cfg_json_plain())
+    raw = getattr(resp, "output_text", "") or ""
+    if raw.strip():
+        try: return json.loads(raw)
+        except Exception: pass
+    obj = _parts_to_json(resp); return obj or {}
+
+def _generate_text_then_parse(client: "genai.Client", prompt: str) -> Dict[str, Any]:
+    resp = client.models.generate_content(model=MODEL, contents=[{"role":"user","parts":[{"text": prompt}]}], config=_cfg_text_plain())
+    raw = getattr(resp, "output_text", "") or ""
+    obj = _safe_json_extract(raw); return obj or {}
+
+def _repair_via_model(client: "genai.Client", bad_json: Dict[str, Any]) -> Dict[str, Any]:
+    prm = (
+        "Repair this object to match the schema strictly and return JSON only.\n"
+        "Schema keys: direction∈{long,short,hold}, prob∈[0,1], support, resistance, reasoning.\n"
+        f"Object: {json.dumps(bad_json, ensure_ascii=False)}"
+    )
+    return _generate_text_then_parse(client, prm)
+
+# ---------- Public ----------
+def get_gemini_prediction(payload: Dict[str, Any], symbol: str = "") -> Dict[str, Any]:
+    """
+    입력 payload(수치형 특징만 사용)에 대해 {direction, prob, support, resistance, reasoning} 반환.
+    - 클라이언트 미가용/오류 시: {"direction":"hold","prob":0.5,"reasoning":"client_unavailable"} 폴백.
+    """
+    # 로그: 페이로드 프리뷰(핵심 키만)
+    try:
+        preview = {
+            "pair": payload.get("pair"),
+            "entry_5m": payload.get("entry_5m"),
+            "mtf_keys": sorted(list((payload.get("extra") or {}).keys()))[:8],
+        }
+        br = payload.get("brackets") or {}
+        if isinstance(br, dict):
+            preview["bracket_preview"] = {
+                "entry": br.get("entry"),
+                "long": {k: (br.get("long") or {}).get(k) for k in ("tp", "sl")},
+                "short": {k: (br.get("short") or {}).get(k) for k in ("tp", "sl")},
+            }
+        log_event("gemini.request",
+                  symbol=(symbol or payload.get("pair")),
+                  model=MODEL,
+                  payload_hint="payloads/YYYYMMDD/*_payload.json",
+                  payload_preview=preview)
+    except Exception:
+        pass
+
+    # 전체 페이로드 스냅샷(디버깅용)
+    _dump_debug(f"{symbol or 'unknown'}_payload", {"payload": payload, "model": MODEL})
+
+    client = _get_client()
+    if client is None:
+        decision = {"direction":"hold", "prob":0.5, "reasoning":"client_unavailable"}
+        _dump_debug(f"{symbol or 'unknown'}_decision", decision)
+        try:
+            log_event("gemini.response",
+                      symbol=(symbol or payload.get("pair")),
+                      direction=decision.get("direction"),
+                      prob=float(decision.get("prob",0.0)),
+                      support=None, resistance=None,
+                      entry=(payload.get("entry_5m") or {}).get("close"))
+        except Exception: pass
+        return decision
+
+    # 1) 스키마 강제
+    d: Dict[str, Any] = {}
+    try:
+        d = _generate_with_schema(client, payload)
+    except Exception as e:
+        logger.info("schema gen failed: %s", e)
+
+    # 2) JSON/plain
+    if not d:
+        try:
+            d = _generate_json_plain(client, payload)
+        except Exception as e:
+            logger.info("json/plain gen failed: %s", e)
+
+    # 3) text → JSON
+    if not d:
+        try:
+            mini = ("Return ONLY one JSON object with keys: direction, prob, support, resistance, reasoning.\n"
+                    "direction ∈ {long, short, hold}; prob ∈ [0,1].\n"
+                    f"DATA: {json.dumps(payload, ensure_ascii=False)}")
+            d = _generate_text_then_parse(client, mini)
+        except Exception as e:
+            logger.info("text/plain gen failed: %s", e)
+
+    # 4) 마지막 수리 시도
+    if not isinstance(d, dict) or "direction" not in d or "prob" not in d:
+        try:
+            d = _repair_via_model(client, d if isinstance(d, dict) else {"raw": str(d)})
+        except Exception as e:
+            logger.info("repair failed: %s", e)
+
+    decision = _sanitize_decision(d)
+
+    _dump_debug(f"{symbol or 'unknown'}_decision", decision)
+    try:
+        log_event("gemini.response",
+                symbol=(symbol or payload.get("pair")),
+                direction=decision.get("direction"),
+                prob=float(decision.get("prob", 0.0)),
+                support=decision.get("support"), resistance=decision.get("resistance"),
+                entry=(payload.get("entry_5m") or {}).get("close"),
+                reasoning=str(decision.get("reasoning",""))[:400])
+    except Exception:
+        pass
+    return decision
+
+# helpers/predictor.py — add below the existing functions
+def run_shadow_models(payload: Dict[str, Any], symbol: str = "") -> None:
+    """
+    환경변수 SHADOW_MODELS="gemini-2.5-flash,gemini-2.5-pro" 등으로 지정.
+    주 모델 결과에는 영향 없이, 섀도우 모델의 {direction, prob}만 로깅.
+    """
+    models = os.getenv("SHADOW_MODELS", "").strip()
+    if not models:
+        return
+    if not _GENAI_OK:
+        return
+    client = _get_client()
+    if client is None:
+        return
+    for m in [x.strip() for x in models.split(",") if x.strip()]:
+        try:
+            # 임시로 모델 명만 바꿔 호출
+            resp = client.models.generate_content(model=m, contents=_contents(payload), config=_cfg_json_plain())
+            obj = _parts_to_json(resp) or {}
+            dec = _sanitize_decision(obj if isinstance(obj, dict) else {})
+            log_event("gemini.shadow",
+                      symbol=(symbol or payload.get("pair")),
+                      model=m,
+                      direction=dec.get("direction"),
+                      prob=float(dec.get("prob", 0.0)))
+        except Exception as e:
+            logger.info("shadow model %s failed: %s", m, e)
+
+
+def should_predict(payload_or_df, *, min_vol_frac_env: str = "MIN_VOL_FRAC") -> bool:
+    """
+    변동성 기반 LLM 호출 여부. (signals.py에서 프리게이트로 사용)
+    - payload(dict): entry_5m.volatility 또는 ATR_5m/close 비율로 문턱 판정
+    - df(DataFrame): volatility 컬럼 기준 최근값 비교
+    """
+    try:
+        thr = float(os.getenv(min_vol_frac_env, "0.0005"))
+    except Exception:
+        thr = 0.0005
+    # dict
+    if isinstance(payload_or_df, dict):
+        try:
+            vol = float(payload_or_df.get("entry_5m", {}).get("volatility", 0.0))
+            if vol and vol > max(1e-8, thr): return True
+            close = float(payload_or_df.get("entry_5m", {}).get("close", 0.0))
+            atr5 = float(payload_or_df.get("extra", {}).get("ATR_5m", 0.0))
+            ratio = (atr5 / close) if (close and close > 0) else 0.0
+            return ratio > max(1e-8, thr)
+        except Exception:
+            return True
+    # dataframe
+    try:
+        import pandas as pd  # lazy
+        df = payload_or_df  # type: ignore
+        if df is None or len(df) == 0 or "volatility" not in df.columns: return True
+        last_vol = float(pd.to_numeric(df["volatility"], errors="coerce").iloc[-1])
+        return last_vol > max(1e-8, thr)
+    except Exception:
+        return True
+
+__all__ = ["get_gemini_prediction", "should_predict"]
