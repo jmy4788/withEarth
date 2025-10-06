@@ -1,5 +1,7 @@
 # main.py
 import os, time
+import logging
+from collections import OrderedDict
 from typing import List, Optional, Literal, Dict, Any
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
@@ -7,6 +9,8 @@ import numpy as np
 import pandas as pd
 import torch
 import timesfm  # from google-research/timesfm (torch)
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 
 API_KEY = os.getenv("TSFM2_API_KEY", "").strip()
 DEVICE = "cpu"  # Cloud Run CPU default
@@ -16,6 +20,7 @@ MAX_HORIZON = int(os.getenv("TSFM2_MAX_HORIZON", "512"))
 N_PATHS = int(os.getenv("TSFM2_MC_PATHS", "4000"))
 SEED = int(os.getenv("TSFM2_SEED", "42"))
 HF_REPO = os.getenv("TSFM2_HF_REPO", "google/timesfm-2.5-200m-pytorch")
+HF_REV = os.getenv("TSFM2_HF_REV", "").strip() or None
 PER_CORE_BATCH = int(os.getenv("TSFM2_PER_CORE_BATCH", "32"))
 
 class ForecastIn(BaseModel):
@@ -51,10 +56,42 @@ class ProbGateOut(BaseModel):
 
 app = FastAPI(title="TimesFM2 Cloud Run Service", version="1.0")
 
-# ---- Load model at startup
+# ---- Load model (lazy, prewarm-friendly)
 def load_tsfm():
-    model = timesfm.TimesFM_2p5_200M_torch()
-    model.load_checkpoint(hf_repo_id=HF_REPO)
+    logger = logging.getLogger("uvicorn")
+    logger.info(
+        "Loading TimesFM... HF_REPO=%s, HF_REV=%s", HF_REPO, HF_REV or "<latest>"
+    )
+    cls = timesfm.TimesFM_2p5_200M_torch
+    try:
+        if hasattr(cls, "from_pretrained"):
+            if HF_REV:
+                model = cls.from_pretrained(HF_REPO, revision=HF_REV)
+            else:
+                model = cls.from_pretrained(HF_REPO)
+        else:
+            raise AttributeError("from_pretrained not available")
+    except Exception as exc:
+        logger.warning(
+            "from_pretrained failed (%s); falling back to manual download", exc,
+            exc_info=True,
+        )
+        model = cls()
+        try:
+            path = hf_hub_download(
+                repo_id=HF_REPO,
+                filename="model.safetensors",
+                revision=HF_REV or None,
+            )
+        except Exception as download_exc:
+            logger.error("Failed to fetch checkpoint from hub: %s", download_exc, exc_info=True)
+            raise
+        module = getattr(model, 'model', model)
+        try:
+            _load_weights(module, path)
+        except Exception:
+            logger.exception("Failed to load checkpoint via fused loader")
+            raise
     fc = timesfm.ForecastConfig(
         max_context=MAX_CONTEXT,
         max_horizon=MAX_HORIZON,
@@ -68,9 +105,71 @@ def load_tsfm():
     model.compile(fc)
     return model
 
-TSFM = load_tsfm()
+
+def _load_weights(module, safetensors_path: str) -> None:
+    tensors = load_file(safetensors_path)
+    keys = tuple(tensors.keys())
+    needs_fuse = any(name.endswith('.attn.query.weight') for name in keys)
+    has_fused = any(name.endswith('.attn.qkv_proj.weight') for name in keys)
+    if needs_fuse and not has_fused:
+        fused: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        consumed = set()
+        for name in keys:
+            if name in consumed:
+                continue
+            if name.endswith('.attn.query.weight'):
+                base = name[:-len('.query.weight')]
+                key_weight = base + '.key.weight'
+                val_weight = base + '.value.weight'
+                try:
+                    q = tensors[name]
+                    k = tensors[key_weight]
+                    v = tensors[val_weight]
+                except KeyError as exc:
+                    raise KeyError(f"Expected keys {key_weight} and {val_weight} alongside {name}") from exc
+                fused[base + '.qkv_proj.weight'] = torch.cat([q, k, v], dim=0)
+                consumed.update({name, key_weight, val_weight})
+                q_bias_name = base + '.query.bias'
+                if q_bias_name in tensors:
+                    k_bias_name = base + '.key.bias'
+                    v_bias_name = base + '.value.bias'
+                    if k_bias_name not in tensors or v_bias_name not in tensors:
+                        raise KeyError(f"Missing bias tensor(s) needed to fuse {base}")
+                    fused[base + '.qkv_proj.bias'] = torch.cat(
+                        [tensors[q_bias_name], tensors[k_bias_name], tensors[v_bias_name]], dim=0
+                    )
+                    consumed.update({q_bias_name, k_bias_name, v_bias_name})
+                continue
+            if name.endswith((
+                '.attn.key.weight',
+                '.attn.value.weight',
+                '.attn.key.bias',
+                '.attn.value.bias',
+                '.attn.query.bias',
+            )):
+                consumed.add(name)
+                continue
+            fused[name] = tensors[name]
+        tensors = fused
+    module.load_state_dict(tensors, strict=True)
+    device = getattr(module, 'device', torch.device('cpu'))
+    module.to(device)
+    module.eval()
+
+
+TSFM = None
+_assets_ready = False
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+def ensure_assets():
+    global TSFM, _assets_ready
+    if _assets_ready and TSFM is not None:
+        return TSFM
+    if TSFM is None:
+        TSFM = load_tsfm()
+    _assets_ready = True
+    return TSFM
 
 # Precompute quantile names once to avoid per-request loops
 _QUANT_NAMES = [f"q{i}" for i in range(10)]
@@ -82,15 +181,17 @@ def _auth(x_api_key: Optional[str]):
 def _ensure_horizon(horizon_steps: int) -> int:
     if horizon_steps <= 0:
         raise HTTPException(400, "horizon_steps must be > 0")
-    max_supported = getattr(TSFM, "forecast_config", None)
+    model = ensure_assets()
+    max_supported = getattr(model, "forecast_config", None)
     if max_supported and horizon_steps > max_supported.max_horizon:
         raise HTTPException(400, f"horizon_steps must be <= {max_supported.max_horizon}")
     return horizon_steps
 
 def _point_forecast(closes: List[float], freq: int, horizon_steps: int, want_q=False):
+    model = ensure_assets()
     horizon = _ensure_horizon(horizon_steps)
     series = [np.array(closes, dtype=np.float32)]
-    point_arr, quant_arr = TSFM.forecast(horizon, series)
+    point_arr, quant_arr = model.forecast(horizon, series)
     point = point_arr[0].astype(float).tolist()
     quants = None
     if want_q and quant_arr is not None and quant_arr.ndim == 3:
@@ -151,9 +252,20 @@ def _first_passage_prob(direction: str, entry: float, tp: float, sl: float,
 
 @app.get("/health")
 def health():
-    cfg = getattr(TSFM, "forecast_config", None)
-    horizon = cfg.max_horizon if cfg else MAX_HORIZON
-    return {"status": "ok", "model": "timesfm-2.5-200m", "max_horizon": horizon}
+    return {
+        "ok": True,
+        "model_repo": HF_REPO,
+        "dt_default_sec": DT_DEFAULT_SEC,
+        "max_context": MAX_CONTEXT,
+        "max_horizon": MAX_HORIZON,
+        "n_paths": N_PATHS,
+        "server_time": int(time.time()),
+    }
+
+@app.get("/v1/prewarm")
+async def prewarm():
+    ensure_assets()
+    return {"ok": True}
 
 @app.post("/v1/forecast", response_model=ForecastOut)
 def v1_forecast(inp: ForecastIn, x_api_key: Optional[str] = Header(None)):

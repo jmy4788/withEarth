@@ -35,6 +35,10 @@ MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
 TEMPERATURE: float = float(os.getenv("G_TEMPERATURE", "0.0"))
 MAX_TOKENS: int = int(os.getenv("G_MAX_TOKENS", "512"))
 
+BASE_TF_MIN = int(os.getenv("TSFM2_BASE_TF_MIN", "5"))
+STRICT_15M_GATING = str(os.getenv("STRICT_15M_GATING", "true" if BASE_TF_MIN >= 15 else "false")).lower() in ("1", "true", "yes")
+USE_AUX_IN_DECISION = str(os.getenv("USE_AUX_IN_DECISION", "false")).lower() in ("1", "true", "yes")
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -363,35 +367,74 @@ def run_shadow_models(payload: Dict[str, Any], symbol: str = "") -> None:
             logger.info("shadow model %s failed: %s", m, e)
 
 
-def should_predict(payload_or_df, *, min_vol_frac_env: str = "MIN_VOL_FRAC") -> bool:
-    """
-    변동성 기반 LLM 호출 여부. (signals.py에서 프리게이트로 사용)
-    - payload(dict): entry_5m.volatility 또는 ATR_5m/close 비율로 문턱 판정
-    - df(DataFrame): volatility 컬럼 기준 최근값 비교
-    """
+
+
+def should_predict(
+    payload_or_df,
+    *,
+    min_vol_frac_env: str = "MIN_VOL_FRAC",
+    gating_tf_min: Optional[int] = None,
+    strict_15m: Optional[bool] = None,
+    use_aux: Optional[bool] = None,
+) -> bool:
+    """Volatility gate helper respecting base TF alignment."""
     try:
         thr = float(os.getenv(min_vol_frac_env, "0.0005"))
     except Exception:
         thr = 0.0005
-    # dict
+    threshold = max(1e-8, thr)
+    gate_tf = gating_tf_min if gating_tf_min is not None else BASE_TF_MIN
+    strict = STRICT_15M_GATING if strict_15m is None else bool(strict_15m)
+    allow_aux = USE_AUX_IN_DECISION if use_aux is None else bool(use_aux)
+
     if isinstance(payload_or_df, dict):
-        try:
-            vol = float(payload_or_df.get("entry_5m", {}).get("volatility", 0.0))
-            if vol and vol > max(1e-8, thr): return True
-            close = float(payload_or_df.get("entry_5m", {}).get("close", 0.0))
-            atr5 = float(payload_or_df.get("extra", {}).get("ATR_5m", 0.0))
-            ratio = (atr5 / close) if (close and close > 0) else 0.0
-            return ratio > max(1e-8, thr)
-        except Exception:
-            return True
-    # dataframe
+        data = payload_or_df
+        extra = data.get("extra") or {}
+        core = data.get("core_indicators") or {}
+        aux = data.get("aux_indicators") or {}
+
+        entry_core = float(core.get("close") or (data.get("entry_15m") or {}).get("close") or 0.0)
+        atr_core = float(extra.get("ATR_active") or core.get("atr") or extra.get("ATR_15m") or 0.0)
+        vol_core = float(core.get("volatility_smooth") or core.get("volatility") or extra.get("volatility_15m") or 0.0)
+
+        had_signal = False
+
+        if gate_tf >= 15 or strict:
+            if vol_core > threshold:
+                return True
+            if entry_core > 0 and atr_core > 0:
+                had_signal = True
+                if (atr_core / entry_core) > threshold:
+                    return True
+            if vol_core > 0:
+                had_signal = True
+            if strict:
+                return False if had_signal else True
+
+        if not strict or allow_aux:
+            vol_aux = float(aux.get("volatility_smooth") or aux.get("volatility") or (data.get("entry_5m") or {}).get("volatility") or 0.0)
+            if vol_aux > threshold:
+                return True
+            close_aux = float(aux.get("close") or (data.get("entry_5m") or {}).get("close") or 0.0)
+            atr_aux = float(extra.get("ATR_5m") or aux.get("atr") or 0.0)
+            if close_aux > 0 and atr_aux > 0:
+                had_signal = True
+                if (atr_aux / close_aux) > threshold:
+                    return True
+            if vol_aux > 0:
+                had_signal = True
+
+        return False if had_signal else True
+
     try:
         import pandas as pd  # lazy
         df = payload_or_df  # type: ignore
-        if df is None or len(df) == 0 or "volatility" not in df.columns: return True
+        if df is None or len(df) == 0 or "volatility" not in df.columns:
+            return True
         last_vol = float(pd.to_numeric(df["volatility"], errors="coerce").iloc[-1])
-        return last_vol > max(1e-8, thr)
+        return last_vol > threshold
     except Exception:
         return True
+
 
 __all__ = ["get_gemini_prediction", "should_predict"]

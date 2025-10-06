@@ -17,9 +17,10 @@ import os
 import random
 import string
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 # .env 로딩(있으면)
 try:
@@ -51,6 +52,7 @@ def _ensure_dir_writable(pref: str) -> Path:
 
 
 LOG_DIR: Path = _ensure_dir_writable(_LOG_DIR_ENV)
+NO_TRADE_LOG: Path = LOG_DIR / "no_trade.csv"
 
 
 # ---------------------------
@@ -283,6 +285,58 @@ def log_event(event: str, **fields) -> None:
     except Exception as e:
         logging.getLogger(__name__).info("log_event failed: %s", e)
 
+def log_no_trade(
+    symbol: str,
+    reasons: List[str] | str,
+    meta: Optional[Dict[str, Any]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Structured 'no trade' logging that never propagates exceptions."""
+    if isinstance(reasons, list):
+        rows = [str(r) for r in reasons]
+    else:
+        rows = [str(reasons)]
+    try:
+        ts_ms = int(time.time() * 1000)
+    except Exception:
+        ts_ms = 0
+    payload: Dict[str, Any] = {
+        "event": "no_trade",
+        "symbol": str(symbol),
+        "reasons": rows,
+        "ts_ms": ts_ms,
+    }
+    if meta:
+        for key, value in meta.items():
+            try:
+                payload[key] = value
+            except Exception:
+                continue
+    row: Dict[str, Any] = {
+        "ts": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "symbol": str(symbol),
+        "reasons": ";".join(rows),
+    }
+    for key, value in (meta or {}).items():
+        row[f"m_{key}"] = value
+    fieldnames = list(row.keys())
+    try:
+        NO_TRADE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        exists = NO_TRADE_LOG.exists()
+        with NO_TRADE_LOG.open("a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            if not exists:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as exc:
+        logging.getLogger(__name__).info("log_no_trade file_append_failed: %s payload=%r", exc, payload)
+    try:
+        target_logger = logger or logging.getLogger("event")
+        target_logger.info("[event] %s", json.dumps(payload, ensure_ascii=False, default=str))
+    except Exception as exc:
+        logging.getLogger(__name__).info("log_no_trade serialization_failed: %s payload=%r", exc, payload)
+
+
 __all__ = [
     "LOG_DIR",
     "get_secret",
@@ -294,4 +348,5 @@ __all__ = [
     "gcs_upload_file",
     "gcs_download_file",
     "log_event",
+    "log_no_trade",
 ]

@@ -1,73 +1,197 @@
-withEarth_V0 백엔드는 Binance USDS‑M 선물 거래를 자동화하는 Flask 기반 서비스입니다. 모델 예측(Gemini/TSFM), 리스크 게이트(RR/EV/ATR/스프레드/쿨다운/MTF/쇼크), HEDGE‑safe 주문, Kill Switch(회로차단), 저널링(GCS 백업 포함)을 제공합니다.
+# withEarth(Backend) — Crypto Futures Quant Backend (proposed README)
 
-**주요 변경점(2025-09) 요약**
-- Hedge 모드 안전화: LONG/SHORT 자동 지정(BOTH 방지), 주문 멱등키(`newClientOrderId`) 자동 주입, 시그니처 정규화+소폭 재시도.
-- Kill Switch: 일중 손실/연속 손실/누적 MDD 기준 자동 중지.
-- 정산 Plan B: 주문 히스토리 실패 시 사용자 체결 이력(user trades)으로 폴백하여 청산 탐색 안정화.
+> **Status**: Draft • 2025-09-24  
+> **Scope**: Back-end (Flask/Gunicorn on App Engine) + TSFM 2.x microservice (FastAPI on Cloud Run)  
 
-**구성**
-- 백엔드: Flask + Gunicorn (`backend/app.py`, WSGI `server`)
-- 헬퍼: 거래소/시그널/예측/유틸 (`backend/helpers/*`)
-- 도구: 저널 분석·교정 (`backend/tools/*`)
-- 프런트엔드(선택): `frontend/`
+This backend automates **Binance USDⓈ-M Futures** trading and risk control. It integrates
+a **probabilistic signal engine (TSFM 2.x)**, **Gemini (google-genai)** structured output,
+**journal & calibration**, and **kill switch** orchestration. The goal is to reach stable,
+scaled monthly PnL while keeping tail risk bounded.
 
-**디렉터리**
-- `backend/app.py`: 엔드포인트, 작업 크론, 로깅/메트릭, 캘리브레이션
-- `backend/helpers/binance_client.py`: 거래소 연동(주문/정산/포지션/필터)
-- `backend/helpers/signals.py`: 시그널 생성, 리스크 게이트, 주문/브래킷, 저널
-- `backend/helpers/predictor*.py`: 예측 백엔드(Gemini/TSFM)
-- `backend/helpers/utils.py`: Secret/GCS/로깅/이벤트
-- `backend/tools/*`: `calibrate_from_trades.py`, 분석 스크립트 등
+---
 
-**빠른 실행(로컬)**
-- 필수 키: `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `GOOGLE_API_KEY`
-- 권장: `EXECUTE_TRADES=false`로 시작해 시뮬레이션 확인
-- 명령:
-  - 가상환경: `python -m venv .venv` 후 활성화
-  - 의존성 설치: `pip install -r backend/requirements.txt`
-  - 환경변수 설정(예): `GOOGLE_API_KEY=...`, `BINANCE_API_KEY=...`, `BINANCE_API_SECRET=...`
-  - 서버 실행: `python backend/app.py` → 브라우저에서 `http://localhost:8080/health`
+## ✨ Highlights
 
-**배포(Google App Engine 표준)**
-- 작업 디렉터리: `backend/`
-- 명령:
-  - 배포: `gcloud app deploy app.yaml cron.yaml`
-- 스케줄: `backend/cron.yaml`에서 `/tasks/trader`, `/tasks/maintain`, `/tasks/journal_sync` 등 호출 주기 설정
+- **Predictor router**: TSFM2 (TimesFM-based), Gemini(JSON Mode), Chronos (local) routing
+- **Risk-first execution**: Hedge-safe order wiring (no `BOTH`), idempotent `newClientOrderId`
+- **Kill Switch**: Daily loss, max consecutive losses, and MDD tripwires
+- **Journal**: Local CSV + **GCS checkpointing** & restore
+- **Calibration**: Reliability curve from realized trades → calibrated `prob`
+- **Ops**: Cron-driven trader/maintainer tasks; lightweight metrics & logs
 
-**주요 엔드포인트**
-- 헬스체크: `/health`
-- 트레이더 크론: `/tasks/trader`
-- 유지/정리: `/tasks/maintain`, 저널: `/tasks/journal_sync`, `/tasks/journal_reset`
-- 개요/진단: `/api/overview`, `/api/trades`, `/api/orders/history`, `/api/logs`, `/api/metrics*`
+> **Patch note**: Recent patch moves **base TF to 15m** for TSFM2 and raises **Cloud Run memory**
+for the TSFM microservice. Make sure the **Dockerfile/env** and **schedules** are consistent
+(see _Deployment_).
 
-**핵심 기능**
-- Hedge‑safe 주문: HEDGE 모드에서 진입은 BUY→LONG, SELL→SHORT 자동 지정, 청산(RO)은 반대 사이드 자동 지정. `_safe_new_order`가 `newClientOrderId` 주입, snake/camel 정규화, 짧은 재시도 적용.
-- 리스크 Kill Switch: `MAX_DAILY_LOSS_USD`, `MAX_CONSEC_LOSSES`, `MAX_MDD_USD` 기준 초과 시 `manage_trade`/`maintain_positions`에서 즉시 중지.
-- 정산 Plan B(체결 폴백): 주문 히스토리로 TP/SL Filled 탐색 실패 시, 사용자 체결 이력에서 실현손익이 0이 아닌 최근 체결을 청산으로 간주.
-- EV/RR/ATR/스프레드/쿨다운/MTF/쇼크 게이트와 브래킷(TP/SL) 자동 관리.
-- 저널링: `logs/trades.csv`에 거래 기록, GCS 최신/일별 스냅샷 자동 백업.
+---
 
-**환경변수(핵심만)**
-- 실행/일반: `EXECUTE_TRADES`, `SYMBOLS`, `TZ`, `LOG_DIR`, `LOG_LEVEL`
-- 거래소/주문: `POSITION_MODE`(HEDGE 권장), `TP_ORDER_TYPE`, `SL_ORDER_TYPE`, `ENTRY_MODE`, `ENTRY_POST_ONLY`, `LIMIT_TTL_SEC`, `LIMIT_MAX_REPRICES`, `LIMIT_TTL_FALLBACK_TO_MARKET`, `FEE_MAKER_BPS`, `FEE_TAKER_BPS`, `MIN_TP_BPS_NET`
-- 리스크/게이트: `MIN_PROB`, `RR_MIN`, `MAX_SPREAD_BPS`, `HORIZON_MIN`, `TIME_BARRIER_ENABLED`, `MTF_ALIGN_ENABLED`, `SHOCK_BPS`, `SHOCK_ATR_MULT`, `ENTRY_COOLDOWN_MIN`, `MAX_DAILY_LOSS_USD`, `MAX_CONSEC_LOSSES`, `MAX_MDD_USD`
-- 예측/캘리브레이션: `GEMINI_MODEL`, `GOOGLE_API_KEY`, `USE_CALIBRATED_PROB`, `CALIB_MIN_SAMPLES`, `CALIB_BINS`, `PROB_CALIBRATION_PATH`
-- GCS 백업: `GCS_BUCKET`, `GCS_PREFIX`, `JOURNAL_SYNC_ON_START`
+## 🏗️ Architecture
 
-**Hedge 모드 동작 요약**
-- Before: `POSITION_SIDE=BOTH`가 주문에 실려 HEDGE 환경에서 거래소 거절/오작동 가능.
-- After: 진입/청산 맥락에 따라 `position_side`를 LONG/SHORT 자동 지정(ONEWAY는 BOTH 유지), `newClientOrderId`로 중복 방지.
+```
+App Engine (Flask/Gunicorn)                            Cloud Run (FastAPI)
+┌────────────────────────────┐                         ┌──────────────────────┐
+│ /tasks/trader              │  payload (features)     │  /v1/prob_gate       │
+│ /tasks/maintain            ├────────────────────────▶│  /v1/forecast        │
+│ /tasks/calibrate           │                         │  /health             │
+│ /tasks/journal_sync        │                         └──────────────────────┘
+│ /api/* (overview, logs…)   │
+└────────────────────────────┘
+   └─ helpers/
+      ├─ data_fetch.py (OHLCV/OB/indicators)
+      ├─ signals.py (sizing+RR+kill switch glue)
+      ├─ predictor_router.py (TSFM2 / Gemini / Chronos)
+      ├─ binance_client.py (orders/positions/filters)
+      ├─ tsfm_predictor.py, tsfm_remote_client.py
+      └─ utils.py (GCS, secrets, logging)
+```
 
-**저널(trades.csv)**
-- 위치: `LOG_DIR/trades.csv`
-- 주요 열: `timestamp,symbol,side,qty,entry,tp,sl,exit,pnl,status,id,...`
-- 백업: 최신/일별 GCS 스냅샷 자동 업로드(복구/트림 기능 포함).
+**Journaling**: `LOG_DIR/trades.csv` (+ GCS snapshots).  
+**Calibration**: `tools/retrain_calibration_from_journal.py` → `calibration_tsfm2.json`.
 
-**로컬 테스트 팁**
-- `EXECUTE_TRADES=false`로 API/게이트/시그널 흐름 점검 후 `true` 전환.
-- Kill Switch 값을 작은 숫자로 두고 동작 확인 후 운영치로 상향.
-- `POSITION_MODE=HEDGE` 설정 후 유지 태스크에서 포지션 모드/레버리지/마진 타입이 베스트에포트로 맞춰지는지 로그 확인.
+---
 
-**주의/면책**
-- 본 코드는 투자 조언이 아니며, 실거래 책임은 사용자에게 있습니다. 실서버 투입 전 테스트·리스크 한도 설정을 반드시 진행하세요.
+## 📦 Repository Map (key files)
+
+- `backend/app.py` – endpoints, cron tasks, metrics, calibration hooks
+- `backend/helpers/*` – exchange/predictor/signal utilities
+- `backend/cron.yaml` – App Engine Cron (trader/maintainer/calibrator/journal)
+- `TSFM_Cloud/` – TimesFM 2.x microservice (FastAPI + Uvicorn)
+- `backend/requirements.txt` – pinned: `binance-sdk-derivatives-trading-usds-futures==1.0.0`, `google-genai==1.28.0`
+
+---
+
+## 🔌 Dependencies
+
+- **Exchange**: `binance-sdk-derivatives-trading-usds-futures==1.0.0` (official modular SDK)  
+  See Binance USDⓈ-M **New Order** params (`positionSide`, `newClientOrderId`, etc.).
+- **LLM**: `google-genai==1.28.0` (new Gemini SDK) — use `from google import genai; client = genai.Client()`
+
+> Docs: Google GenAI SDK migration & usage; Binance USDⓈ-M Futures REST/SDK.  
+> See references at the bottom.
+
+---
+
+## ⚙️ Configuration (env)
+
+> **Never commit real secrets.** Prefer **Google Secret Manager** for production.
+
+Common:
+- `EXECUTE_TRADES` (`true|false`) — dry-run gate (set **false** locally)
+- `PREDICTOR_BACKEND` (`TSFM2|GEMINI|CHRONOS`)
+- `PROB_CALIBRATION_PATH` (default: `.../calibration_tsfm2.json`)
+- **Risk**: `MAX_DAILY_LOSS_USD`, `MAX_CONSEC_LOSSES`, `MAX_MDD_USD`
+- **Sizing**: `BASE_RISK_USD`, `VOL_SIZE_SCALING`, `VOL_SCALAR_MIN`, `VOL_SCALAR_MAX`
+
+TSFM2 (backend side):
+- `TSFM2_URL` — Cloud Run endpoint (e.g., `https://<service>-<hash>-<region>.run.app`)
+- `TSFM2_BASE_TF_MIN` — **`15`** (recent patch)
+- `AUX_TF_MINS` — additional TFs to fetch (comma-separated)
+
+TSFM_Cloud (Cloud Run container env):
+- `TSFM2_DT_SEC` — **`900`** (**15m**)  
+- `TSFM2_MC_PATHS` — `2000–4000` (MC paths)  
+- `TSFM2_MAX_CONTEXT`, `TSFM2_MAX_HORIZON` — context/horizon caps  
+- `TSFM2_API_KEY` — optional microservice auth
+
+---
+
+## 🚀 Deployment
+
+### App Engine (backend)
+```bash
+cd backend
+gcloud app deploy app.yaml cron.yaml
+```
+
+**Cron**: set trader to **every 15 minutes** to align with 15m base TF.
+
+### Cloud Run (TSFM_Cloud)
+Build & deploy:
+```bash
+cd TSFM_Cloud
+gcloud builds submit --tag gcr.io/$PROJECT/tsfm2:2025-09-24
+gcloud run deploy tsfm2   --image gcr.io/$PROJECT/tsfm2:2025-09-24   --region=asia-northeast3   --allow-unauthenticated   --memory=2Gi --cpu=2   --min-instances=1 --max-instances=1   --set-env-vars=TSFM2_DT_SEC=900,TSFM2_MC_PATHS=4000
+```
+
+> Memory/CPU limits are configured per-revision. Choose values that avoid OOM during MC sampling.
+
+---
+
+## 🔎 Health & Ops
+
+- **Health**: `GET /health` (backend), `GET /health` (TSFM_Cloud)
+- **Trader**: `GET /tasks/trader` (manual trigger OK)
+- **Metrics**: `GET /api/metrics*`
+- **Journaling**: `GET /api/trades`, `/tasks/journal_sync`
+- **Calibration** (daily or ad-hoc): `/tasks/calibrate` or via `tools/retrain_calibration_from_journal.py`
+
+---
+
+## 🧪 Local Dev Quickstart
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r backend/requirements.txt
+
+# Important: disable real trading
+export EXECUTE_TRADES=false
+
+# Run Flask app (dev)
+cd backend && python app.py
+# or: gunicorn -b :8080 -w 1 app:server
+```
+
+**TSFM_Cloud (local):**
+```bash
+cd TSFM_Cloud
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8081
+```
+
+---
+
+## 🧮 Calibration workflow
+
+1) Collect realized trades (`LOG_DIR/trades.csv`, GCS snapshots)  
+2) Run: `python backend/tools/retrain_calibration_from_journal.py`  
+3) Output reliability curve → `calibration_tsfm2.json`  
+4) Backend loads curve to **map raw prob → calibrated prob**
+
+---
+
+## 🛡️ Risk Controls (overview)
+
+- **Kill switch**: trip on daily loss, consecutive losses, or realized **MDD**
+- **Order hygiene**: `positionSide` in Hedge mode, **idempotent client IDs**, strict `tickSize/stepSize` rounding
+- **Cool-down**: time-barrier after exits; avoid late-night low-liquidity windows
+- **Notional caps**: balance-% sizing + volatility scalers
+
+---
+
+## 📚 References
+
+- **Gemini (google-genai)**: client usage and JSON Mode (Python) — official docs.  
+- **GenAI SDK migration** (from legacy `google.generativeai`).  
+- **Gemini API libraries (GA)**.  
+- **Binance USDⓈ-M Futures New Order API** (Hedge `positionSide`, `newClientOrderId`).  
+- **Cloud Run memory limits**.
+
+---
+
+## ⚠️ Security
+
+- Remove real keys from `.env` and rotate keys. Use **Secret Manager** for prod.
+- Restrict Cloud Run ingress (if API key-enabled). Enable audit logging.
+- Enforce IP allowlist for admin endpoints where feasible.
+
+---
+
+## 🗺️ Roadmap (abridged)
+
+- ✅ 15m base TF & Cloud Run memory bump (this patch)
+- 🔁 Converge TF source-of-truth across backend & TSFM_Cloud
+- 📈 Pre-trade EV threshold & post-trade MTTD dashboard
+- 🧪 Replay harness (N-day) to gate new configs before prod
+- 🔐 Secret Manager integration end-to-end
+- 🔍 Structured JSON logs + richer `/api/metrics`
 

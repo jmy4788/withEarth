@@ -9,6 +9,7 @@ from __future__ import annotations
 """
 
 import csv, glob, json, logging, os, time, math
+import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,7 @@ LOG_DIR_ENV = os.getenv("LOG_DIR", "./logs")
 DEFAULT_TMP_DIR = "/tmp/trading_bot"
 PAYLOAD_DIR_NAME = "payloads"
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip()
+TSFM_PREWARM_URL = os.getenv("TSFM_PREWARM_URL", "").strip()
 
 try:
     from flask_cors import CORS  # type: ignore
@@ -153,6 +155,16 @@ try:
 except Exception:
     def log_event(event: str, **fields): logger.info("[event]%s %s", event, fields)
     def gcs_enabled() -> bool: return False
+
+def keep_tsfm_warm() -> None:
+    if not TSFM_PREWARM_URL:
+        return
+    try:
+        resp = requests.get(TSFM_PREWARM_URL, timeout=(1.0, 3.0))
+        ok = 200 <= resp.status_code < 300
+        log_event("tsfm.prewarm", ok=bool(ok), status=resp.status_code)
+    except Exception as exc:
+        log_event("tsfm.prewarm", ok=False, error=str(exc))
 
 # --- small utils for API ---
 def _plainify(o):
@@ -422,6 +434,7 @@ def tasks_maintain():
         except Exception as e:
             r = {"action":"error","error":str(e)}
         results[sym] = r
+    keep_tsfm_warm()
     log_event("tasks.maintain", symbols=syms, n=len(syms))
     return jsonify({"status":"ok","results":results}), 200
 

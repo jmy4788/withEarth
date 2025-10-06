@@ -1,8 +1,8 @@
 # cron.yaml
 cron:
-- description: "Auto trade every 5 minutes"
+- description: "Auto trade every 15 minutes (align with 15m TF)"
   url: /tasks/trader
-  schedule: every 5 minutes
+  schedule: every 15 minutes
   timezone: Asia/Seoul
 
 - description: "Maintain positions (BE trail / time barrier)"

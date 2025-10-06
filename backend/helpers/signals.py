@@ -4,7 +4,7 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 import logging, os, uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
@@ -14,7 +14,7 @@ try:
     from .utils import (
         LOG_DIR, gcs_enabled, gcs_append_csv_row, log_event,
         gcs_list, gcs_download_text, GCS_PREFIX,
-        gcs_upload_file, gcs_download_file,
+        gcs_upload_file, gcs_download_file, log_no_trade,
     )  # type: ignore
 except Exception:  # pragma: no cover
     LOG_DIR = os.path.join(os.getcwd(), "logs")
@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover
     def gcs_upload_file(*args, **kwargs) -> bool: return False
     def gcs_download_file(*args, **kwargs) -> bool: return False
     def log_event(*args, **kwargs): pass
+    def log_no_trade(*args, **kwargs): pass
 
 # --- data & indicators ---
 try:
@@ -46,6 +47,27 @@ except Exception:
         from .predictor import get_gemini_prediction  # type: ignore
         return get_gemini_prediction(payload, symbol=symbol)
 from .predictor import should_predict  # type: ignore
+
+try:
+    from logic.gate_v2 import GateInputs, gate_decision
+except Exception:  # pragma: no cover
+    @dataclass(slots=True)
+    class GateInputs:
+        symbol: str
+        direction: str
+        prob: float
+        ev_perc: float
+        rr: float
+        rr_req: float
+        rsi_1h: float
+        rsi_4h: float
+
+    class _GateDecisionFallback:
+        ok: bool = True
+        reasons: list[str] = []
+
+    def gate_decision(inp: GateInputs):  # type: ignore
+        return _GateDecisionFallback()
 
 # --- Binance client wrapper ---
 try:
@@ -88,6 +110,36 @@ MIN_VOL_FRAC_ENV = float(os.getenv("MIN_VOL_FRAC", "0.0005"))
 
 HORIZON_MIN = int(os.getenv("HORIZON_MIN", "30"))
 TIME_BARRIER_ENABLED = str(os.getenv("TIME_BARRIER_ENABLED", "true")).lower() in ("1","true","yes")
+
+BASE_TF_MIN = int(os.getenv("TSFM2_BASE_TF_MIN", "5"))
+
+
+def _base_tf_min() -> int:
+    try:
+        raw = os.getenv("TSFM2_BASE_TF_MIN", str(BASE_TF_MIN))
+        return max(5, min(60, int(raw)))
+    except Exception:
+        return 5
+
+
+def _parse_tf_list(raw: Optional[str]) -> tuple[int, ...]:
+    if not raw:
+        return (5,)
+    parts = []
+    for seg in raw.replace(";", ",").split(","):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            parts.append(int(seg))
+        except ValueError:
+            continue
+    return tuple(parts) if parts else (5,)
+
+
+STRICT_15M_GATING = str(os.getenv("STRICT_15M_GATING", "true" if BASE_TF_MIN >= 15 else "false")).lower() in ("1","true","yes")
+USE_AUX_IN_DECISION = str(os.getenv("USE_AUX_IN_DECISION", "false")).lower() in ("1","true","yes")
+AUX_TF_MINS: tuple[int, ...] = _parse_tf_list(os.getenv("AUX_TF_MINS", "5"))
 
 ENTRY_MODE = os.getenv("ENTRY_MODE", "LIMIT").upper()  # MARKET | LIMIT
 LIMIT_TTL_SEC = float(os.getenv("LIMIT_TTL_SEC", "20"))
@@ -262,6 +314,47 @@ def _iso_to_ms(ts: str) -> Optional[int]:
 
 def _df_ok(df: Optional[pd.DataFrame]) -> bool:
     return isinstance(df, pd.DataFrame) and not df.empty and all(c in df.columns for c in ("timestamp","open","high","low","close","volume"))
+
+def _entry_from_payload(payload: Dict[str, Any]) -> float:
+    if _base_tf_min() >= 15:
+        e15 = (payload.get("entry_15m") or {}).get("close")
+        if e15:
+            try:
+                return float(e15)
+            except Exception:
+                pass
+    e5 = (payload.get("entry_5m") or {}).get("close")
+    try:
+        return float(e5 or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _atr_current(payload: Dict[str, Any], ohlcv_5m: pd.DataFrame, symbol: str) -> Tuple[float, float]:
+    extra = payload.get("extra") or {}
+    atr5 = float(extra.get("ATR_5m") or 0.0)
+    if atr5 <= 0 and _df_ok(ohlcv_5m):
+        try:
+            atr_series = compute_atr(ohlcv_5m, window=14)
+            if getattr(atr_series, "size", 0):
+                atr5 = float(atr_series.iloc[-1])
+        except Exception:
+            atr5 = 0.0
+    atr_use = atr5
+    if _base_tf_min() >= 15:
+        atr15 = float(extra.get("ATR_15m") or 0.0)
+        if atr15 <= 0:
+            try:
+                ohlcv15 = fetch_ohlcv(symbol, interval="15m", limit=200)
+                if _df_ok(ohlcv15):
+                    atr15_series = compute_atr(ohlcv15, window=14)
+                    if getattr(atr15_series, "size", 0):
+                        atr15 = float(atr15_series.iloc[-1])
+            except Exception:
+                atr15 = 0.0
+        if atr15 > 0:
+            atr_use = atr15
+    return atr_use, atr5
 
 def _ob_stats_to_dict(stats: Any) -> Dict[str, float]:
     try:
@@ -446,12 +539,31 @@ def _tp_sl_with_sr_clamp(direction: str, entry: float, atr5: float, sr_high: flo
 # Payload & signal
 # ---------------------------------
 def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[Dict[str, Any]]]:
+    base_tf = _base_tf_min()
     base = fetch_data(symbol, interval="5m", ohlcv_limit=200, orderbook_limit=50, include_orderbook=True)
     ohlcv = base.get("ohlcv") if isinstance(base.get("ohlcv"), pd.DataFrame) else pd.DataFrame()
     if not _df_ok(ohlcv):
         ohlcv = add_indicators(None)
     last = ohlcv.iloc[-1] if _df_ok(ohlcv) else pd.Series({})
     ob = base.get("orderbook") if isinstance(base, dict) else None
+
+    def _smooth(series: pd.Series, window: int = 6) -> float:
+        try:
+            tail = series.tail(window).dropna()
+            return float(tail.mean()) if len(tail) else 0.0
+        except Exception:
+            return 0.0
+
+    vol5_last = 0.0
+    vol5_smooth = 0.0
+    if _df_ok(ohlcv) and "volatility" in ohlcv:
+        try:
+            vol_series_5m = pd.to_numeric(ohlcv["volatility"], errors="coerce")
+            vol5_last = float(vol_series_5m.iloc[-1]) if len(vol_series_5m) else 0.0
+            vol5_smooth = _smooth(vol_series_5m)
+        except Exception:
+            vol5_last = 0.0
+            vol5_smooth = 0.0
 
     # --- MTF / extra ---
     mtf = fetch_mtf_raw(symbol)
@@ -474,13 +586,30 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     price_seq = compute_recent_price_sequence(ohlcv, n=10) if _df_ok(ohlcv) else [0.0] * 10
     atr5_series = compute_atr(ohlcv, window=14) if _df_ok(ohlcv) else None
     atr5 = float(atr5_series.iloc[-1]) if getattr(atr5_series, "size", 0) else 0.0
-        # --- (NEW) 15m ATR for TSFM base-tf=15m ---
+
+    entry_5m = float(last.get("close", 0.0))
+    entry_15m = 0.0
+    atr15 = 0.0
+    vol15 = 0.0
+    vol15_smooth = 0.0
     try:
         ohlcv15 = fetch_ohlcv(symbol, interval="15m", limit=200)
-        atr15_series = compute_atr(ohlcv15, window=14) if _df_ok(ohlcv15) else None
-        atr15 = float(atr15_series.iloc[-1]) if getattr(atr15_series, "size", 0) else 0.0
+        if _df_ok(ohlcv15):
+            entry_15m = float(ohlcv15["close"].iloc[-1])
+            atr15_series = compute_atr(ohlcv15, window=14)
+            if getattr(atr15_series, "size", 0):
+                atr15 = float(atr15_series.iloc[-1])
+            try:
+                ind15 = add_indicators(ohlcv15.copy())
+            except Exception:
+                ind15 = ohlcv15
+            if _df_ok(ind15) and "volatility" in ind15:
+                vol_series_15m = pd.to_numeric(ind15["volatility"], errors="coerce")
+                if len(vol_series_15m):
+                    vol15 = float(vol_series_15m.iloc[-1])
+                    vol15_smooth = _smooth(vol_series_15m)
     except Exception:
-        atr15 = 0.0
+        pass
 
     sr5 = {
         "recent_high": float(ohlcv["high"].tail(50).max()) if _df_ok(ohlcv) else 0.0,
@@ -497,10 +626,19 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     except Exception:
         funding_pct = 0.0
 
-    entry = float(last.get("close", 0.0))
+    entry = entry_15m if (base_tf >= 15 and entry_15m > 0) else entry_5m
+    atr_active = atr15 if (base_tf >= 15 and atr15 > 0) else atr5
+    atr_for_brackets = atr_active if atr_active > 0 else atr5
+    vol_active = vol15 if (base_tf >= 15 and vol15 > 0) else vol5_last
+
     extra_common = {
         "ATR_5m": float(atr5),
         "ATR_15m": float(atr15),
+        "ATR_active": float(atr_active),
+        "base_tf_min": int(base_tf),
+        "volatility_5m": float(vol5_last),
+        "volatility_15m": float(vol15),
+        "volatility_active": float(vol_active),
         "relative_volume_5m": float(compute_relative_volume(ohlcv)) if _df_ok(ohlcv) else 1.0,
         "recent_high_5m": sr5["recent_high"],
         "recent_low_5m": sr5["recent_low"],
@@ -510,11 +648,11 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
         "micro_dislocation_bps": float(ob_stats.get("micro_dislocation_bps", 0.0)),
         "funding_rate_pct": float(funding_pct),
     }
-    # Merge MTF-derived features into extra for downstream checks (e.g., RSI_1h/RSI_4h)
     extra_common.update(extra)
 
-    # ---- LLM용 브래킷 계산: tick 라운딩 + (선택) 표기 소수 고정 ----
-    # normalize_price_for_side: SELL=올림, BUY=내림 (tickSize 준수)
+    if STRICT_15M_GATING and base_tf < 15:
+        log_event("signal.tf_warning", symbol=symbol, base_tf=base_tf, strict=bool(STRICT_15M_GATING))
+
     def _llm_px(px: float, exit_side: str) -> float:
         v = normalize_price_for_side(symbol, float(px), side=exit_side)
         dec = os.getenv("LLM_PRICE_DECIMALS", "")
@@ -525,7 +663,6 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
                 pass
         return float(v)
 
-    # 동적 ATR 보정(현재/중앙값 비율로 fudge) — 실행 로직과 동일한 파라미터 사용
     k_tp_env = float(os.getenv("ATR_MULT_TP", str(ATR_MULT_TP)))
     k_sl_env = float(os.getenv("ATR_MULT_SL", str(ATR_MULT_SL)))
     k_tp, k_sl = k_tp_env, k_sl_env
@@ -545,12 +682,11 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     except Exception:
         k_tp, k_sl = k_tp_env, k_sl_env
 
-    # LLM 입력용: long/short 양방향 브래킷(정규화)
-    sr_high = float(extra_common["recent_high_5m"])  # type: ignore[index]
-    sr_low  = float(extra_common["recent_low_5m"])   # type: ignore[index]
+    sr_high = float(extra_common["recent_high_5m"])
+    sr_low = float(extra_common["recent_low_5m"])
 
     def _mk_bracket(direction: str) -> Dict[str, float]:
-        tp_raw, sl_raw = _tp_sl_with_sr_clamp(direction, entry, atr5, sr_high, sr_low,
+        tp_raw, sl_raw = _tp_sl_with_sr_clamp(direction, entry, atr_for_brackets, sr_high, sr_low,
                                               llm_support=None, llm_resistance=None,
                                               k_tp=k_tp, k_sl=k_sl)
         exit_side = "SELL" if direction == "long" else "BUY"
@@ -573,16 +709,15 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
 
     brackets = {
         "entry": float(entry),
-        "long": _mk_bracket("long") if entry > 0 and atr5 > 0 else {"tp": 0.0, "sl": 0.0},
-        "short": _mk_bracket("short") if entry > 0 and atr5 > 0 else {"tp": 0.0, "sl": 0.0},
+        "long": _mk_bracket("long") if entry > 0 and atr_for_brackets > 0 else {"tp": 0.0, "sl": 0.0},
+        "short": _mk_bracket("short") if entry > 0 and atr_for_brackets > 0 else {"tp": 0.0, "sl": 0.0},
     }
 
-    # legacy bracket for backward-compat with existing code paths
     legacy_bracket = {
         "entry": float(entry),
         "k_tp": float(k_tp),
         "k_sl": float(k_sl),
-        "atr": float(atr5),
+        "atr": float(atr_for_brackets),
         "sr_high": float(sr_high),
         "sr_low": float(sr_low),
         "long": {"tp": float((brackets.get("long") or {}).get("tp", 0.0)), "sl": float((brackets.get("long") or {}).get("sl", 0.0))},
@@ -592,9 +727,10 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
     payload = {
         "pair": symbol,
         "entry_5m": {
-            "close": float(last.get("close", 0.0)),
+            "close": float(entry_5m),
             "rsi": float(ohlcv["RSI"].iloc[-1]) if _df_ok(ohlcv) and "RSI" in ohlcv else 50.0,
-            "volatility": float(ohlcv["volatility"].iloc[-1]) if _df_ok(ohlcv) and "volatility" in ohlcv else 0.0,
+            "volatility": float(vol5_last),
+            "volatility_smooth": float(vol5_smooth),
             "sma20": float(ohlcv["SMA_20"].iloc[-1]) if _df_ok(ohlcv) and "SMA_20" in ohlcv else 0.0,
             "high": float(last.get("high", 0.0)),
             "low": float(last.get("low", 0.0)),
@@ -602,6 +738,7 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
             "volume": float(last.get("volume", 0.0)),
             "timestamp": str(last.get("timestamp", "")),
         },
+        "entry_15m": {"close": float(entry_15m)},
         "extra": extra_common,
         "times": base.get("times", {}),
         "price_sequence": price_seq,
@@ -609,14 +746,31 @@ def _build_payload(symbol: str) -> Tuple[Dict[str, Any], pd.DataFrame, Optional[
         "relative_volume": float(compute_relative_volume(ohlcv)) if _df_ok(ohlcv) else 1.0,
         "trend_filter": trend,
         "horizon_min": HORIZON_MIN,
-        # LLM이 사용할 결정적 수치 피처: 브래킷
         "brackets": brackets,
-        # keep legacy key for compatibility
         "bracket": legacy_bracket,
-        # informational
         "fees": {"maker_bps": float(FEE_MAKER_BPS), "taker_bps": float(FEE_TAKER_BPS)},
+        "core_indicators": {
+            "tf_min": int(base_tf),
+            "close": float(entry),
+            "atr": float(atr_active),
+            "volatility": float(vol15 if vol15 > 0 else vol_active),
+            "volatility_smooth": float(vol15_smooth if vol15_smooth > 0 else vol_active),
+        },
+        "aux_indicators": {
+            "tf_min": 5,
+            "close": float(entry_5m),
+            "atr": float(atr5),
+            "volatility": float(vol5_last),
+            "volatility_smooth": float(vol5_smooth),
+        },
+        "tf_meta": {
+            "base_tf_min": int(base_tf),
+            "aux_tf_mins": list(AUX_TF_MINS),
+            "strict_15m": bool(STRICT_15M_GATING),
+        },
     }
     return payload, ohlcv, ob
+
 
 def _spread_ok(spread_bps: float) -> bool:
     try:
@@ -968,32 +1122,79 @@ def journal_reset(
 # ---------------------------------# helpers/signals.py — replace this whole function# helpers/signals.py — generate_signal() REPLACE WHOLE FUNCTION
 def generate_signal(symbol: str) -> Optional[Dict[str, Any]]:
     payload, ohlcv, ob = _build_payload(symbol)
-    spread_bps_gate = float((payload.get("extra") or {}).get("orderbook_spread", 0.0))
-    proceed_basic = should_predict(payload, min_vol_frac_env="MIN_VOL_FRAC") and _spread_ok(spread_bps_gate)
-    # pre-gate diagnostics (observability): capture current vol/spread
-    vol_last = float((payload.get("entry_5m") or {}).get("volatility", 0.0))
-    spread_bps = float((payload.get("extra") or {}).get("orderbook_spread", 0.0))
+    extra = payload.get("extra") or {}
+    tf_meta = payload.get("tf_meta") or {}
+    core_indicators = payload.get("core_indicators") or {}
+    aux_indicators = payload.get("aux_indicators") or {}
+    gate_tf_min = int(tf_meta.get("base_tf_min", _base_tf_min()))
+    aux_tf_mins = tf_meta.get("aux_tf_mins") or list(AUX_TF_MINS)
+    strict_gate = bool(tf_meta.get("strict_15m", STRICT_15M_GATING))
+    spread_bps_gate = float(extra.get("orderbook_spread", 0.0))
+    proceed_basic = should_predict(
+        payload,
+        min_vol_frac_env="MIN_VOL_FRAC",
+        gating_tf_min=gate_tf_min,
+        strict_15m=strict_gate,
+        use_aux=USE_AUX_IN_DECISION,
+    ) and _spread_ok(spread_bps_gate)
+    vol_core = float(core_indicators.get("volatility_smooth") or core_indicators.get("volatility") or 0.0)
+    vol_aux = float(aux_indicators.get("volatility_smooth") or aux_indicators.get("volatility") or 0.0)
+    vol_display = vol_core if vol_core > 0 else vol_aux
+    spread_bps = float(extra.get("orderbook_spread") or 0.0)
     dir_hint, _ = _rule_backup(ohlcv, payload.get("trend_filter") or {})
-    atr5 = float((payload.get("extra") or {}).get("ATR_5m") or 0.0)
+    atr_use, atr5 = _atr_current(payload, ohlcv, symbol)
+    atr_for_shock = atr_use if atr_use > 0 else atr5
+    entry_raw = _entry_from_payload(payload)
+    entry_5m_close = float(aux_indicators.get("close") or (payload.get("entry_5m") or {}).get("close") or 0.0)
+    entry = entry_raw if entry_raw > 0 else entry_5m_close
+    br = payload.get("bracket") or {}
+
+    if strict_gate and gate_tf_min < 15:
+        log_event("signal.tf_mismatch", symbol=symbol, base_tf=gate_tf_min, strict=True)
+    log_event("signal.tf_meta", symbol=symbol, gate_tf_min=int(gate_tf_min), aux_tf_mins=list(aux_tf_mins), strict=bool(strict_gate))
+
+    def _record_hold(reasons: List[str], prob_val: float = 0.5, rr_val: float = 0.0,
+                     ev_val: float = 0.0, spread_val: float = spread_bps) -> None:
+        items = [str(r) for r in (reasons if isinstance(reasons, list) else [reasons])]
+        meta = {
+            "prob": float(prob_val),
+            "rr_net": float(rr_val),
+            "ev_perc": float(ev_val),
+            "spread_bps": float(spread_val),
+            "gate_tf_min": int(gate_tf_min),
+            "strict_15m": bool(strict_gate),
+        }
+        if aux_tf_mins:
+            meta["aux_tf_mins"] = list(aux_tf_mins)
+        try:
+            log_no_trade(symbol, items, meta, logger=logger)
+        except Exception:
+            pass
 
     cd_active, cd_left = _cooldown_active(symbol)
     if cd_active:
+        reason = f"pre_gate_cooldown({cd_left}m_left)"
+        _record_hold([reason])
+        hold_entry = entry if entry > 0 else entry_5m_close
         return {"symbol": symbol, "action":"hold","direction":"hold",
-                "entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
+                "entry": float(hold_entry),
                 "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,
-                "reason": f"pre_gate_cooldown({cd_left}m_left)"}
+                "reason": reason}
 
-    sg_long, bpsL, multL, _ = _shock_guard_block("long", ohlcv, atr5)
-    sg_short, bpsS, multS, _ = _shock_guard_block("short", ohlcv, atr5)
+    sg_long, bpsL, multL, _ = _shock_guard_block("long", ohlcv, atr_for_shock)
+    sg_short, bpsS, multS, _ = _shock_guard_block("short", ohlcv, atr_for_shock)
     if (sg_long or sg_short):
         candle_up = float(ohlcv.iloc[-1]["close"]) - float(ohlcv.iloc[-1]["open"]) > 0 if _df_ok(ohlcv) else False
         shock_dir = "long" if candle_up else "short"
         if not (dir_hint in ("long","short") and dir_hint == shock_dir):
             bps = max(bpsL, bpsS); mult = max(multL, multS)
+            reason = f"pre_gate_shock({bps:.1f}bps,{mult:.2f}ATR)"
+            _record_hold([reason])
+            hold_entry = entry if entry > 0 else entry_5m_close
             return {"symbol":symbol,"action":"hold","direction":"hold",
-                    "entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
+                    "entry": float(hold_entry),
                     "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,
-                    "reason": f"pre_gate_shock({bps:.1f}bps,{mult:.2f}ATR)"}
+                    "reason": reason}
 
     # ---- LLM or rule-backup path
     if not proceed_basic:
@@ -1003,11 +1204,13 @@ def generate_signal(symbol: str) -> Optional[Dict[str, Any]]:
             direction, prob_raw = direction_rb, float(prob_rb)
         else:
             reason = (
-                f"pre_gate_block(vol={vol_last:.6f}<{MIN_VOL_FRAC_ENV:.6f},"
+                f"pre_gate_block(vol={vol_display:.6f}<{MIN_VOL_FRAC_ENV:.6f},"
                 f"spread_bps={spread_bps:.2f}<=max({MAX_SPREAD_BPS:.2f}))"
             )
+            _record_hold([reason])
+            hold_entry = entry if entry > 0 else entry_5m_close
             return {"symbol":symbol,"action":"hold","direction":"hold",
-                    "entry": float((payload.get("entry_5m") or {}).get("close") or 0.0),
+                    "entry": float(hold_entry),
                     "tp":0.0,"sl":0.0,"prob":0.5,"risk_ok":False,"rr":0.0,"reason": reason}
         llm_support = None; llm_resistance = None
     else:
@@ -1030,14 +1233,15 @@ def generate_signal(symbol: str) -> Optional[Dict[str, Any]]:
     prob_cal = float(calibrate_prob(prob_raw)) if USE_CALIBRATED_PROB else float(prob_raw)
     prob = _quantize_prob(prob_cal)
 
-    entry = float((payload.get("entry_5m") or {}).get("close") or 0.0)
-    extra = payload.get("extra") or {}
-    br = payload.get("bracket") or {}
-    spread_bps = float(extra.get("orderbook_spread") or 0.0)
+    extra = payload.get("extra") or extra
+    br = payload.get("bracket") or br
+    spread_bps = float(extra.get("orderbook_spread") or spread_bps)
 
     if direction not in ("long","short") or entry <= 0:
         log_event("signal.decision", symbol=symbol, direction="hold", prob=prob, entry=entry, tp=0.0, sl=0.0, rr=0.0, risk_ok=False)
-        return {"symbol":symbol,"action":"hold","direction":"hold","entry":entry,"tp":0.0,"sl":0.0,"prob":prob,"risk_ok":False,"rr":0.0,"reason":"invalid_direction_or_entry"}
+        _record_hold(["invalid_direction_or_entry"], prob_val=prob)
+        hold_entry = entry if entry > 0 else entry_5m_close
+        return {"symbol":symbol,"action":"hold","direction":"hold","entry":float(hold_entry),"tp":0.0,"sl":0.0,"prob":prob,"risk_ok":False,"rr":0.0,"reason":"invalid_direction_or_entry"}
 
     # ---- dynamic ATR levels (tranq/turb) same as execution side
     k_tp_env = float(os.getenv("ATR_MULT_TP", str(ATR_MULT_TP)))
@@ -1062,8 +1266,9 @@ def generate_signal(symbol: str) -> Optional[Dict[str, Any]]:
 
     sr_high = float(extra.get("recent_high_5m") or 0.0)
     sr_low  = float(extra.get("recent_low_5m") or 0.0)
+    atr_for_levels = atr_use if atr_use > 0 else float(extra.get("ATR_5m") or 0.0)
     tp, sl = _tp_sl_with_sr_clamp(
-        direction, entry, float(extra.get("ATR_5m") or 0.0),
+        direction, entry, float(atr_for_levels),
         sr_high, sr_low, llm_support, llm_resistance,
         k_tp=k_tp, k_sl=k_sl
     )
@@ -1086,22 +1291,68 @@ def generate_signal(symbol: str) -> Optional[Dict[str, Any]]:
     r1h = float(extra.get("RSI_1h", 50.0))
     r4h = float(extra.get("RSI_4h", 50.0))
     mtf_ok, mtf_reason = _mtf_align_ok(direction, extra)
+    mtf_reason_detail = (
+        f"{mtf_reason}(r1h={r1h:.1f},r4h={r4h:.1f},long_min={MTF_RSI_LONG_MIN:.0f},short_max={MTF_RSI_SHORT_MAX:.0f})"
+        if mtf_reason else ""
+    )
+    pending_mtf_reason = mtf_reason_detail if (not mtf_ok and mtf_reason_detail) else None
 
     reasons: List[str] = []
-    if prob < MIN_PROB: reasons.append("prob_below_threshold")
-    if not _spread_ok(spread_bps): reasons.append(f"wide_spread({spread_bps:.2f}bps)")
-    if not mtf_ok:
-        reasons.append(f"{mtf_reason}(r1h={r1h:.1f},r4h={r4h:.1f},long_min={MTF_RSI_LONG_MIN:.0f},short_max={MTF_RSI_SHORT_MAX:.0f})")
-    sg_block, sg_bps, sg_mult, sg_reason = _shock_guard_block(direction, ohlcv, float(extra.get("ATR_5m") or 0.0))
-    if sg_block: reasons.append(sg_reason)
+    if prob < MIN_PROB:
+        reasons.append("prob_below_threshold")
+    if not _spread_ok(spread_bps):
+        reasons.append(f"wide_spread({spread_bps:.2f}bps)")
+    sg_block, sg_bps, sg_mult, sg_reason = _shock_guard_block(direction, ohlcv, atr_for_shock)
+    if sg_block and sg_reason not in reasons:
+        reasons.append(sg_reason)
     cd_active2, cd_left2 = _cooldown_active(symbol)
-    if cd_active2: reasons.append(f"entry_cooldown({cd_left2}m_left)")
-    if rr_net <= 0 or rr_net < rr_req: reasons.append(f"rr_net_below_min({rr_net:.2f}<{rr_req:.2f})")
+    if cd_active2:
+        reasons.append(f"entry_cooldown({cd_left2}m_left)")
+    if rr_net <= 0 or rr_net < rr_req:
+        reasons.append(f"rr_net_below_min({rr_net:.2f}<{rr_req:.2f})")
 
     # ---- EV gate
     ev_perc = _compute_ev_perc(prob, direction, entry, tp, sl)
     if ev_perc < EV_MIN_PERC:
         reasons.append(f"ev_below_threshold({ev_perc:.4f}<{EV_MIN_PERC:.4f})")
+
+    gate_ok = True
+    gate_reasons: List[str] = []
+    if direction in ("long", "short"):
+        try:
+            gate_inputs = GateInputs(
+                symbol=symbol,
+                direction=direction,
+                prob=float(prob),
+                ev_perc=float(ev_perc),
+                rr=float(rr_net),
+                rr_req=float(rr_req),
+                rsi_1h=float(r1h),
+                rsi_4h=float(r4h),
+            )
+            gate_result = gate_decision(gate_inputs)
+            gate_ok = gate_result.ok
+            gate_reasons = list(gate_result.reasons)
+            log_event(
+                "signal.gate_v2",
+                **asdict(gate_inputs),
+                gate_ok=gate_ok,
+                reasons=";".join(gate_reasons) if gate_reasons else "ok",
+            )
+            if gate_ok:
+                mtf_ok = True
+                pending_mtf_reason = None
+            else:
+                for reason in gate_reasons:
+                    if reason not in reasons:
+                        reasons.append(reason)
+                if any(reason.startswith("mtf_rsi_mismatch") for reason in gate_reasons):
+                    if mtf_reason_detail and mtf_reason_detail not in reasons:
+                        reasons.append(mtf_reason_detail)
+        except Exception as exc:
+            logger.info("gate_v2 evaluation failed: %s", exc)
+    if pending_mtf_reason and pending_mtf_reason not in reasons:
+        reasons.append(pending_mtf_reason)
 
     # ---- Economic viability gate (expected fees + 2*spread + buffer)
     meta_tp: Dict[str, float] = {"tp_delta_bps": 0.0, "tp_threshold_bps": 0.0, "fee_roundtrip_bps": 0.0}
@@ -1159,12 +1410,15 @@ def generate_signal(symbol: str) -> Optional[Dict[str, Any]]:
     # gate log with MTF numeric fields (observability)
     log_event("signal.gate", symbol=symbol, direction=direction, prob=float(prob), spread_bps=float(spread_bps),
               rr=float(rr_net), rr_req=float(rr_req), rr_mode=RR_GATE_MODE, ev_perc=float(ev_perc),
-              rsi_1h=float(r1h), rsi_4h=float(r4h),
-              reasons=";".join(reasons) if reasons else "ok")
+              rsi_1h=float(r1h), rsi_4h=float(r4h), gate_tf_min=int(gate_tf_min), strict_15m=bool(strict_gate),
+              aux_tf_mins=list(aux_tf_mins), reasons=";".join(reasons) if reasons else "ok")
+
+    if not risk_ok:
+        _record_hold(reasons if reasons else ["risk_filters"], prob, rr_net, ev_perc, spread_bps)
 
     telemetry = {
         "spread_bps": float(spread_bps),
-        "atr_now": float(extra.get("ATR_5m") or 0.0),
+        "atr_now": float(extra.get("ATR_active") or atr_use or atr5),
         "funding_pct": float(extra.get("funding_rate_pct") or 0.0),
         "maker_prob_est": _estimate_p_maker_from_journal(),
         "rr_gate_mode": RR_GATE_MODE,
@@ -1179,6 +1433,11 @@ def generate_signal(symbol: str) -> Optional[Dict[str, Any]]:
         "tp_delta_bps": float(meta_tp.get("tp_delta_bps", 0.0)),
         "tp_threshold_bps": float(meta_tp.get("tp_threshold_bps", 0.0)),
         "fee_roundtrip_bps": float(meta_tp.get("fee_roundtrip_bps", 0.0)),
+        "gate_tf_min": int(gate_tf_min),
+        "strict_15m_gating": bool(strict_gate),
+        "aux_tf_mins": list(aux_tf_mins),
+        "gate_v2_ok": bool(gate_ok),
+        "gate_v2_reasons": ";".join(gate_reasons) if gate_reasons else "ok",
     }
 
     out = {
